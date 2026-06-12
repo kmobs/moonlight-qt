@@ -807,7 +807,7 @@ Flickable {
 
                         stepSize: pyroWave ? 5000 : 500
                         from : pyroWave ? 5000 : 500
-                        to: pyroWave ? 3000000 : (StreamingPreferences.unlockBitrate ? 500000 : 150000)
+                        to: pyroWave ? 2500000 : (StreamingPreferences.unlockBitrate ? 900000 : 150000)
 
                         snapMode: "SnapOnRelease"
                         width: Math.min(bitrateDesc.implicitWidth, parent.width - (resetBitrateButton.visible ? resetBitrateButton.width + parent.spacing : 0))
