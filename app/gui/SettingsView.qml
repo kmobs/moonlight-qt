@@ -684,7 +684,7 @@ Flickable {
 
                         stepSize: 500
                         from : 500
-                        to: StreamingPreferences.unlockBitrate ? 500000 : 150000
+                        to: StreamingPreferences.unlockBitrate ? 900000 : 150000
 
                         snapMode: "SnapOnRelease"
                         width: Math.min(bitrateDesc.implicitWidth, parent.width - (resetBitrateButton.visible ? resetBitrateButton.width + parent.spacing : 0))
