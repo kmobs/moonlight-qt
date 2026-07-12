@@ -23,6 +23,11 @@ typedef struct _VIDEO_STATS {
     uint64_t totalDecodeTimeUs;                // high-res (1us)
     uint64_t totalPacerTimeUs;                 // high-res (1us)
     uint64_t totalRenderTimeUs;                // high-res (1us)
+    uint64_t totalFrameIntervalUs;             // high-res (1us)
+    uint64_t totalSquaredFrameIntervalUs;      // high-res (1us^2)
+    uint32_t frameIntervalSamples;
+    uint32_t minFrameIntervalUs;               // high-res (1us)
+    uint32_t maxFrameIntervalUs;               // high-res (1us)
     uint32_t lastRtt;                          // low-res from enet (1ms)
     uint32_t lastRttVariance;                  // low-res from enet (1ms)
     double totalFps;                           // high-res
@@ -43,6 +48,10 @@ typedef struct _DECODER_PARAMETERS {
     int frameRate;
     bool enableVsync;
     bool enableFramePacing;
+    bool enableVrr;
+    bool enableVrrTearing;
+    int vrrCushionUs;
+    bool enableOsScheduledVrr;
     bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 

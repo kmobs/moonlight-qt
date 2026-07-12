@@ -139,6 +139,13 @@ private:
 
 class IFFmpegRenderer : public Overlay::IOverlayRenderer {
 public:
+    enum class PresentationMode {
+        Immediate,
+        FixedVsync,
+        VrrCadence,
+        Auto,
+    };
+
     enum class RendererType {
         Unknown,
         Vulkan,
@@ -193,6 +200,20 @@ public:
         // Don't wait by default
     }
 
+    // Called by the pacer in VrrCadence mode the moment a frame is committed
+    // to presentation - potentially a full render lead before renderFrame().
+    // Renderers whose rendering has significant GPU-side cost may submit that
+    // work here so the hardware renders during the pacer's sleep to render
+    // start; waitToRender()/renderFrame() for the same frame must then skip
+    // the already-done work and pay only the residual completion wait and the
+    // present itself. The frame pointer stays valid through the matching
+    // renderFrame() call. A serialized submit-fence-present chain that fits
+    // in the render lead doesn't need this (see d3d11va); a chain that
+    // exceeds the content's frame interval can't keep cadence without it.
+    virtual void prepareFrameForPresent(AVFrame*) {
+        // No early preparation by default - renderFrame() does all the work
+    }
+
     // Called on the same thread as renderFrame() during destruction of the renderer
     virtual void cleanupRenderContext() {
         // Nothing
@@ -216,6 +237,128 @@ public:
     virtual int getRendererAttributes() {
         // No special attributes by default
         return 0;
+    }
+
+    virtual PresentationMode getPresentationMode() {
+        // Most renderers leave presentation policy to the Pacer inputs.
+        return PresentationMode::Auto;
+    }
+
+    virtual const char* getPresentationModeFallbackReason() {
+        // Non-null if getPresentationMode() didn't pick VrrCadence and wants to
+        // explain why (e.g. surfaced in the on-screen debug overlay).
+        return nullptr;
+    }
+
+    virtual uint64_t popPresentAlignmentWaitUs() {
+        // Time renderFrame() spent idling for the display's blanking gap
+        // before presenting (VRR phase alignment) rather than doing actual
+        // render work. Cleared on read. Pacer subtracts this from measured
+        // render time so alignment slack doesn't inflate its render-lead
+        // estimate.
+        return 0;
+    }
+
+    virtual void setPresentTargetUs(uint64_t, bool, uint64_t, bool, bool) {
+        // The cadence pacer's intended present instant for the next
+        // renderFrame() call. Renderers that phase-align their presents must
+        // hold the flip until this time even if the display is already in
+        // its blanking gap - releasing early re-scatters the present phase
+        // the pacer just computed.
+        //
+        // The first bool is the pacer's catch-up flag: true means
+        // presentation is running behind frame delivery and this present is
+        // draining that backlog.
+        //
+        // The second bool asks for a vsync-latched present: drop the tearing
+        // flag so the flip latches at the display's next vblank instead of
+        // executing immediately. The pacer requests this while the measured
+        // content cadence runs above the panel's tear-free flip ceiling,
+        // where tearing-allowed presents can only choose where tears land -
+        // classic vblank-latched presentation is tear-free and metronomic
+        // there, and reads clearly smoother (user-validated at 116-on-120).
+        // The alignment budget is moot for latched presents.
+        //
+        // The third bool reports that the pacer is running its near-ceiling
+        // buffered mode (content just below the flip ceiling, presents
+        // re-timed behind a deliberate standing buffer). Presentation
+        // mechanics are identical to ordinary tearing presents; renderers
+        // only use it to label diagnostics/overlay state.
+        //
+        // The uint64_t argument is the blank-alignment budget in
+        // microseconds: how long past the target the renderer may stall
+        // waiting for the display's blanking gap before presenting anyway.
+        // The pacer sizes it from the measured content cadence and render
+        // time so the wait can never starve the next frame's render. It is
+        // generous when content runs below the display's max refresh (a
+        // mid-scan present there is a needless guaranteed tear, and a run of
+        // torn flips can knock the driver out of VRR flip-following into a
+        // fixed-cadence raster that keeps tearing for minutes), and near
+        // zero for catch-up presents with no cadence slack, where waiting
+        // would compound lateness into dropped frames.
+    }
+
+    virtual uint32_t popMidScanTearCount() {
+        // Number of presents since the last call that went out mid-scan
+        // with the tear landing in the VISIBLE MIDDLE of the frame -
+        // renderers that know the beam position should exclude tears
+        // pinned within a few percent of the top/bottom edges, which read
+        // as invisible. Cleared on read. The cadence pacer aggregates this
+        // into a tear-rate signal to self-calibrate where perceptually
+        // tear-free free-run pacing is achievable on this display/driver
+        // stack, instead of hardcoding per-panel rate limits.
+        return 0;
+    }
+
+    virtual bool isVrrRasterLockUncertain() {
+        // True while the renderer cannot demonstrate that the panel is in
+        // VRR flip-following (extended blanking, waiting on our flips). A
+        // mid-scan present proves the raster is free-running; a present
+        // that only caught the blank after a measurable chase implies it;
+        // and one instant hit is NOT proof of re-lock (a free-running
+        // raster's own trailing blank catches presents by luck). The
+        // cadence pacer grants presents a full-scanout re-anchor budget
+        // while this is true - which costs nothing when the panel is
+        // actually locked, since the budget is only spent if a chase is
+        // needed.
+        return false;
+    }
+
+    virtual uint64_t getLastPresentUs() {
+        // Timestamp of the most recent Present() call (the true flip instant
+        // for renderers that fence GPU completion beforehand), or 0 if
+        // unknown. The cadence pacer clamps successive present targets
+        // against this rather than renderFrame()'s return time, which runs
+        // later by the alignment wait and Present overhead.
+        return 0;
+    }
+
+    virtual bool arePresentsVsyncLatched() {
+        // True when every present latches at a display vblank regardless of
+        // the pacer's tearing preference (e.g. a FIFO swapchain with no
+        // tearing-capable present path in use). Two pacer policies hinge on
+        // this: the tearing preference is meaningless (honoring it would
+        // strip the latch fallback and flip-spacing slack for zero latency
+        // benefit), and under VRR flip-following the display does NOT
+        // enforce spacing on latched presents - the "vblank" happens the
+        // moment the present arrives - so floor-spaced catch-up bursts scan
+        // out at the panel's max refresh and read as the refresh readout
+        // spiking far above the content rate.
+        return false;
+    }
+
+    static const char* getPresentationModeName(PresentationMode mode) {
+        switch (mode) {
+        case PresentationMode::Immediate:
+            return "Immediate";
+        case PresentationMode::FixedVsync:
+            return "FixedVsync";
+        case PresentationMode::VrrCadence:
+            return "VrrCadence";
+        case PresentationMode::Auto:
+        default:
+            return "Auto";
+        }
     }
 
     virtual int getDecoderColorspace() {

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "renderer.h"
+#include "pacer/vrrpresenter.h"
+#include "pmswapchain.h"
 
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
@@ -24,8 +26,16 @@ public:
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo) override;
     virtual int getRendererAttributes() override;
+    virtual PresentationMode getPresentationMode() override;
+    virtual const char* getPresentationModeFallbackReason() override;
+    virtual uint64_t popPresentAlignmentWaitUs() override;
+    virtual void setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered) override;
+    virtual uint64_t getLastPresentUs() override;
+    virtual uint32_t popMidScanTearCount() override;
+    virtual bool isVrrRasterLockUncertain() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
+    virtual void waitToRender() override;
 
     enum PixelShaders {
         GENERIC_YUV_420,
@@ -44,6 +54,12 @@ private:
     bool setupSwapchainDependentResources();
     bool setupVideoTexture(AVHWFramesContext* framesContext); // for !m_BindDecoderOutputTextures
     bool setupTexturePoolViews(AVHWFramesContext* framesContext); // for m_BindDecoderOutputTextures
+    bool createVideoTextureSRV(ID3D11Resource* texture,
+                               D3D11_SRV_DIMENSION viewDimension,
+                               UINT arraySlice,
+                               DXGI_FORMAT srvFormat,
+                               UINT planeSlice,
+                               Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& srv);
     void renderOverlay(Overlay::OverlayType type);
     bool createOverlayVertexBuffer(Overlay::OverlayType type, int width, int height, Microsoft::WRL::ComPtr<ID3D11Buffer>& newVertexBuffer);
     void bindColorConversion(bool frameChanged, AVFrame* frame);
@@ -56,6 +72,11 @@ private:
                                ID3D11Device5* dev1, ID3D11Device5* dev2,
                                Microsoft::WRL::ComPtr<ID3D11Fence>& dev1Fence,
                                Microsoft::WRL::ComPtr<ID3D11Fence>& dev2Fence);
+    bool queryTearingSupport(HRESULT* result = nullptr);
+    void resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAIN_DESC1* swapChainDesc);
+    void logPresentationMode(SDL_Window* window, const DXGI_SWAP_CHAIN_DESC1* swapChainDesc, int outputIndex, const char* fallbackReason);
+    void refreshOutput();
+    bool signalAndUnlockForPresent();
 
     int m_DecoderSelectionPass;
     int m_DevicesWithFL11Support;
@@ -74,6 +95,43 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> m_RenderDeviceContext, m_DecodeDeviceContext;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_RenderSharedTextureArray;
     Microsoft::WRL::ComPtr<IDXGISwapChain4> m_SwapChain;
+    Microsoft::WRL::ComPtr<IDXGIOutput> m_Output;
+
+    // Executes the cadence pacer's per-present intent (target hold, blank
+    // alignment, latch bookkeeping) and owns the display scanline source.
+    // Renderer-agnostic; this class only supplies GPU fencing, the Present
+    // call, and display attach notifications.
+    VrrPresenter m_VrrPresenter;
+
+    // "Smoothest VRR (OS-scheduled presentation)" setting (env override:
+    // MOONLIGHT_COMP_SWAPCHAIN): the Windows 11 composition swapchain
+    // replaces the DXGI swapchain AND the VrrPresenter's target
+    // hold/scanline alignment - the pacer's targets are handed to the OS as
+    // per-present target times instead. m_SwapChain is null in this mode.
+    PmSwapchain m_PmSwapchain;
+    bool m_UsePmSwapchain;
+    uint64_t m_PmTargetUs;
+
+    Microsoft::WRL::ComPtr<ID3D11Fence> m_PresentReadyFence;
+    uint64_t m_PresentReadyFenceValue;
+    HANDLE m_PresentReadyFenceEvent;
+    bool m_PresentReadyFenceFailed;
+
+    // Render-phase accounting: the pacer's "render time" is opaque (CPU
+    // submission + a GPU fence wait that covers the frame's decode tail,
+    // the decoder-texture copy, and the draw). Split it so a log window
+    // shows WHERE the milliseconds go.
+    uint64_t m_RenderPhaseSubmitTotalUs;
+    uint64_t m_RenderPhaseGpuWaitTotalUs;
+    uint32_t m_RenderPhaseSamples;
+    uint64_t m_RenderPhaseLastLogUs;
+    // Per-window minima: a high gpu-wait MIN means the GPU is sustained-slow
+    // (downclocked/underpowered - the whole no-load frame costs more), while a
+    // low min with a high avg means intermittent contention. This is the
+    // multi-stream-degradation discriminator (see the phase log in renderFrame).
+    uint64_t m_RenderPhaseSubmitMinUs;
+    uint64_t m_RenderPhaseGpuWaitMinUs;
+    HANDLE m_FrameLatencyWaitableObject;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_RenderTargetView;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_VideoBlendState;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_OverlayBlendState;
@@ -93,6 +151,15 @@ private:
     AVColorTransferCharacteristic m_LastColorTrc;
 
     bool m_AllowTearing;
+    PresentationMode m_PresentationMode;
+    const char* m_PresentationModeFallbackReason;
+    bool m_TearingSupport;
+    // Whether this instance holds the process-wide VRR power/QoS request
+    // (see acquireVrrPowerState() in the .cpp). Tracked per-instance so the
+    // destructor releases it exactly once even if initialize() is ever
+    // called again on the same object.
+    bool m_HoldingVrrPowerRequest;
+    int m_OutputIndex;
 
     std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, PixelShaders::_COUNT> m_VideoPixelShaders;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_VideoVertexBuffer;

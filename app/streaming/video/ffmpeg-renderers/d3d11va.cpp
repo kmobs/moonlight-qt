@@ -55,6 +55,68 @@ static const std::array<const char*, D3D11VARenderer::PixelShaders::_COUNT> k_Vi
     "d3d11_y410_pixel.fxc",
 };
 
+// Process-wide power/QoS requests for VRR cadence pacing. VRR cadence fences
+// GPU completion before every present and schedules against a fixed content
+// interval (see the SetGPUThreadPriority(7) comment in initialize()), so it
+// is far more sensitive to the process being deprioritized than ordinary
+// vsync presentation, which just rides the next compositor tick regardless.
+// Two things measurably hurt it that Windows will otherwise do on its own:
+//
+//  - Execution-speed throttling (aka Efficiency Mode / EcoQoS), which
+//    Windows applies more readily on battery. Measured 2026-07-08 on a
+//    Radeon 890M laptop: the per-frame CPU submission phase roughly doubled
+//    (0.4ms -> 0.8ms) on battery with no change in GPU work, consistent with
+//    the process being quietly throttled - and that alone was enough to
+//    start dropping frames at a content rate that ran perfectly on AC.
+//  - System/display sleep. A streaming session driven purely by a game
+//    controller doesn't reset Windows' idle timer the way keyboard/mouse
+//    input does, so a long controller-only session can let the system sleep
+//    or the display turn off under an still-active stream.
+//
+// Refcounted (not a plain set/clear pair) because this is genuinely
+// process-wide OS state while D3D11VARenderer instances are not: a
+// capability-probe renderer and the real stream renderer can be transiently
+// alive at once, and both requesting/releasing independently must not let
+// one instance's teardown cancel another's still-active request.
+static volatile LONG s_VrrPowerRequests = 0;
+
+static void acquireVrrPowerState()
+{
+    if (InterlockedIncrement(&s_VrrPowerRequests) != 1) {
+        // Another instance already holds the request.
+        return;
+    }
+
+    PROCESS_POWER_THROTTLING_STATE throttlingState = {};
+    throttlingState.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttlingState.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttlingState.StateMask = 0; // 0 = opt OUT of throttling for this control
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &throttlingState, sizeof(throttlingState));
+
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "VRR cadence pacing: requested full-performance power state and disabled system/display sleep");
+}
+
+static void releaseVrrPowerState()
+{
+    if (InterlockedDecrement(&s_VrrPowerRequests) != 0) {
+        // Another instance still holds the request.
+        return;
+    }
+
+    PROCESS_POWER_THROTTLING_STATE throttlingState = {};
+    throttlingState.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttlingState.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttlingState.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED; // opt back IN (system default)
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                          &throttlingState, sizeof(throttlingState));
+
+    SetThreadExecutionState(ES_CONTINUOUS);
+}
+
 D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
     : IFFmpegRenderer(RendererType::D3D11VA),
       m_DecoderSelectionPass(decoderSelectionPass),
@@ -62,6 +124,23 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_DevicesWithCodecSupport(0),
       m_LastColorTrc(AVCOL_TRC_UNSPECIFIED),
       m_AllowTearing(false),
+      m_PresentationMode(PresentationMode::Auto),
+      m_PresentationModeFallbackReason(nullptr),
+      m_TearingSupport(false),
+      m_HoldingVrrPowerRequest(false),
+      m_OutputIndex(-1),
+      m_PresentReadyFenceValue(0),
+      m_PresentReadyFenceEvent(nullptr),
+      m_PresentReadyFenceFailed(false),
+      m_RenderPhaseSubmitTotalUs(0),
+      m_RenderPhaseGpuWaitTotalUs(0),
+      m_RenderPhaseSamples(0),
+      m_RenderPhaseLastLogUs(0),
+      m_RenderPhaseSubmitMinUs(UINT64_MAX),
+      m_RenderPhaseGpuWaitMinUs(UINT64_MAX),
+      m_FrameLatencyWaitableObject(nullptr),
+      m_UsePmSwapchain(false),
+      m_PmTargetUs(0),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr)
 {
@@ -73,6 +152,11 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
 D3D11VARenderer::~D3D11VARenderer()
 {
     DwmEnableMMCSS(FALSE);
+
+    if (m_HoldingVrrPowerRequest) {
+        releaseVrrPowerState();
+        m_HoldingVrrPowerRequest = false;
+    }
 
     SDL_DestroyMutex(m_ContextLock);
 
@@ -111,7 +195,16 @@ D3D11VARenderer::~D3D11VARenderer()
     m_RenderD2RFence.Reset();
     m_RenderR2DFence.Reset();
 
+    m_PresentReadyFence.Reset();
+    if (m_PresentReadyFenceEvent != nullptr) {
+        CloseHandle(m_PresentReadyFenceEvent);
+        m_PresentReadyFenceEvent = nullptr;
+    }
     m_RenderTargetView.Reset();
+    if (m_FrameLatencyWaitableObject != nullptr) {
+        CloseHandle(m_FrameLatencyWaitableObject);
+        m_FrameLatencyWaitableObject = nullptr;
+    }
     m_SwapChain.Reset();
 
     m_RenderSharedTextureArray.Reset();
@@ -244,6 +337,279 @@ Exit:
     }
 
     return success;
+}
+
+bool D3D11VARenderer::queryTearingSupport(HRESULT* result)
+{
+    BOOL allowTearing = FALSE;
+    HRESULT hr = m_Factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                &allowTearing,
+                                                sizeof(allowTearing));
+
+    if (result != nullptr) {
+        *result = hr;
+    }
+
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "IDXGIFactory::CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING) failed: %x",
+                     hr);
+        return false;
+    }
+
+    return allowTearing == TRUE;
+}
+
+void D3D11VARenderer::resolvePresentationMode(SDL_Window* window, DXGI_SWAP_CHAIN_DESC1* swapChainDesc)
+{
+    const bool envDisableVrr = qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_VRR") != 0;
+    const bool forceVrr = qEnvironmentVariableIntValue("MOONLIGHT_FORCE_VRR") != 0 && !envDisableVrr;
+    const bool disableVrr = envDisableVrr || (!m_DecoderParams.enableVrr && !forceVrr);
+    const Uint32 windowFlags = SDL_GetWindowFlags(window);
+    const bool fullscreenExclusive = (windowFlags & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN;
+    const int displayFps = StreamUtils::getDisplayRefreshRate(window);
+    const bool withinDisplayHz = m_DecoderParams.frameRate <= displayFps;
+    HRESULT tearingHr = S_OK;
+
+    m_TearingSupport = queryTearingSupport(&tearingHr);
+    m_AllowTearing = false;
+
+    const char* fallbackReason = nullptr;
+
+    if (disableVrr && m_DecoderParams.enableVsync) {
+        m_PresentationMode = PresentationMode::FixedVsync;
+        fallbackReason = envDisableVrr ?
+            "MOONLIGHT_DISABLE_VRR is set" :
+            "VRR is disabled in settings";
+    }
+    else if (!m_TearingSupport) {
+        m_PresentationMode = m_DecoderParams.enableVsync ?
+            PresentationMode::FixedVsync :
+            PresentationMode::Immediate;
+        fallbackReason = SUCCEEDED(tearingHr) ?
+            "DXGI_FEATURE_PRESENT_ALLOW_TEARING is not supported" :
+            "DXGI tearing support query failed";
+    }
+    else if (forceVrr) {
+        m_PresentationMode = PresentationMode::VrrCadence;
+        swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        m_AllowTearing = true;
+        fallbackReason = "MOONLIGHT_FORCE_VRR is set";
+    }
+    else if (!m_DecoderParams.enableVsync) {
+        m_PresentationMode = PresentationMode::Immediate;
+        swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        m_AllowTearing = true;
+        // Session force-disables V-sync when the stream FPS exceeds the
+        // display's current refresh rate, so surface that possibility - a
+        // panel quietly dropping to 60Hz (power saving) makes VRR appear
+        // "broken" with no other visible signal.
+        fallbackReason = withinDisplayHz ?
+            "V-sync is disabled" :
+            "V-sync auto-disabled: stream FPS exceeds display refresh rate";
+    }
+    else if (fullscreenExclusive && !forceVrr) {
+        m_PresentationMode = PresentationMode::FixedVsync;
+        fallbackReason = "exclusive fullscreen does not use windowed DXGI tearing";
+    }
+    else if (!withinDisplayHz && !forceVrr) {
+        m_PresentationMode = PresentationMode::FixedVsync;
+        fallbackReason = "stream FPS exceeds display refresh rate";
+    }
+    else {
+        // VrrCadence handles content above the panel's tear-free flip
+        // ceiling dynamically: while the measured cadence runs above it,
+        // the pacer requests vsync-latched presents (no tearing flag, flips
+        // latch tear-free at each vblank - classic fixed-vsync feel), and
+        // the moment content falls back below the ceiling, tearing presents
+        // with true VRR pacing resume. No static stream-FPS cutoff needed.
+        m_PresentationMode = PresentationMode::VrrCadence;
+        swapChainDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        m_AllowTearing = true;
+    }
+
+    m_PresentationModeFallbackReason = fallbackReason;
+
+    logPresentationMode(window, swapChainDesc, m_OutputIndex, fallbackReason);
+}
+
+void D3D11VARenderer::logPresentationMode(SDL_Window* window,
+                                          const DXGI_SWAP_CHAIN_DESC1* swapChainDesc,
+                                          int outputIndex,
+                                          const char* fallbackReason)
+{
+    const bool presentationLog = qEnvironmentVariableIntValue("MOONLIGHT_PRESENTATION_MODE_LOG") != 0;
+    const Uint32 windowFlags = SDL_GetWindowFlags(window);
+    const char* windowMode;
+
+    if ((windowFlags & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN) {
+        windowMode = "exclusive-fullscreen";
+    }
+    else if (windowFlags & SDL_WINDOW_FULLSCREEN_DESKTOP) {
+        windowMode = "borderless";
+    }
+    else {
+        windowMode = "windowed";
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "D3D11VA presentation: mode=%s tearing=%d tearing-flag=%d display=%d Hz stream=%d FPS window=%s swapchain-format=%d buffers=%u alpha=%u swapchain-flags=0x%x present-flags=0x%x",
+                getPresentationModeName(m_PresentationMode),
+                m_TearingSupport,
+                m_AllowTearing,
+                StreamUtils::getDisplayRefreshRate(window),
+                m_DecoderParams.frameRate,
+                windowMode,
+                swapChainDesc->Format,
+                swapChainDesc->BufferCount,
+                swapChainDesc->AlphaMode,
+                m_AllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0,
+                m_AllowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+
+    if (fallbackReason != nullptr &&
+            (m_PresentationMode != PresentationMode::VrrCadence || presentationLog)) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "D3D11VA presentation note: %s",
+                    fallbackReason);
+    }
+
+    if (!presentationLog) {
+        return;
+    }
+
+    ComPtr<IDXGIAdapter1> adapter;
+    HRESULT hr = m_Factory->EnumAdapters1(m_AdapterIndex, &adapter);
+    if (SUCCEEDED(hr)) {
+        DXGI_ADAPTER_DESC1 adapterDesc;
+        if (SUCCEEDED(adapter->GetDesc1(&adapterDesc))) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11VA presentation adapter: index=%d name=%S vendor=%x device=%x",
+                        m_AdapterIndex,
+                        adapterDesc.Description,
+                        adapterDesc.VendorId,
+                        adapterDesc.DeviceId);
+        }
+
+        ComPtr<IDXGIOutput> output;
+        if (outputIndex >= 0 && SUCCEEDED(adapter->EnumOutputs(outputIndex, &output))) {
+            DXGI_OUTPUT_DESC outputDesc;
+            if (SUCCEEDED(output->GetDesc(&outputDesc))) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "D3D11VA presentation output: index=%d name=%S desktop=(%ld,%ld)-(%ld,%ld)",
+                            outputIndex,
+                            outputDesc.DeviceName,
+                            outputDesc.DesktopCoordinates.left,
+                            outputDesc.DesktopCoordinates.top,
+                            outputDesc.DesktopCoordinates.right,
+                            outputDesc.DesktopCoordinates.bottom);
+            }
+        }
+    }
+}
+
+void D3D11VARenderer::refreshOutput()
+{
+    m_Output.Reset();
+    m_VrrPresenter.detachDisplay();
+
+    if (m_OutputIndex < 0) {
+        return;
+    }
+
+    ComPtr<IDXGIAdapter1> adapter;
+    if (FAILED(m_Factory->EnumAdapters1(m_AdapterIndex, &adapter))) {
+        return;
+    }
+
+    if (FAILED(adapter->EnumOutputs(m_OutputIndex, &m_Output))) {
+        return;
+    }
+
+    DXGI_OUTPUT_DESC outputDesc;
+    if (FAILED(m_Output->GetDesc(&outputDesc))) {
+        return;
+    }
+
+    // Hand the presenter the scanout geometry/timing it needs to estimate
+    // the beam's time-to-blank from a raw scanline number.
+    // Scanlines follow the panel's native orientation, not the rotated
+    // desktop.
+    uint32_t activeScanLines;
+    if (outputDesc.Rotation == DXGI_MODE_ROTATION_ROTATE90 ||
+            outputDesc.Rotation == DXGI_MODE_ROTATION_ROTATE270) {
+        activeScanLines = (uint32_t)qMax(0L, outputDesc.DesktopCoordinates.right -
+                                             outputDesc.DesktopCoordinates.left);
+    }
+    else {
+        activeScanLines = (uint32_t)qMax(0L, outputDesc.DesktopCoordinates.bottom -
+                                             outputDesc.DesktopCoordinates.top);
+    }
+
+    // Under VRR the line clock stays at the max refresh rate's speed and only
+    // the blanking gap stretches, so the current mode's refresh rate gives the
+    // scanout duration regardless of the instantaneous refresh interval.
+    int displayFps = StreamUtils::getDisplayRefreshRate(m_DecoderParams.window);
+    uint64_t scanoutPeriodUs = displayFps > 0 ? 1000000ULL / displayFps : 0;
+
+    m_VrrPresenter.attachDisplay(outputDesc.DeviceName, activeScanLines,
+                                 scanoutPeriodUs);
+}
+
+bool D3D11VARenderer::signalAndUnlockForPresent()
+{
+    // Present() doesn't flip at the instant we call it; the flip executes only
+    // once all queued GPU work for the back buffer has completed. Measured on
+    // the Ally X: ~2.4ms average Present-to-screen lag (PresentMon
+    // MsUntilDisplayed), which is wider than the entire blanking window when
+    // the stream FPS runs near the display's max refresh - so aligning the
+    // Present() call to the blank is aligning the wrong instant, and the flip
+    // itself still tears. Fence the end of our rendering and wait for the GPU
+    // BEFORE the target-hold and scanline alignment, so Present() becomes the
+    // true flip instant.
+    //
+    // Critically, the wait happens on a fence event with the context lock
+    // RELEASED: decode shares this device on AMD APUs, so a blocking wait
+    // under the lock stalls the decoder for milliseconds every frame (the
+    // mistake that sank the first version of this fix).
+    if (m_PresentReadyFence == nullptr && !m_PresentReadyFenceFailed) {
+        HRESULT hr = m_RenderDevice->CreateFence(0, D3D11_FENCE_FLAG_NONE,
+                                                 IID_PPV_ARGS(&m_PresentReadyFence));
+        if (SUCCEEDED(hr)) {
+            m_PresentReadyFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+
+        if (FAILED(hr) || m_PresentReadyFenceEvent == nullptr) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "No present-ready fence available (%x); presents will lag GPU completion",
+                        hr);
+            m_PresentReadyFence.Reset();
+            m_PresentReadyFenceFailed = true;
+        }
+    }
+
+    if (m_PresentReadyFence == nullptr) {
+        return false;
+    }
+
+    uint64_t fenceValue = ++m_PresentReadyFenceValue;
+    if (FAILED(m_RenderDeviceContext->Signal(m_PresentReadyFence.Get(), fenceValue))) {
+        m_PresentReadyFenceFailed = true;
+        m_PresentReadyFence.Reset();
+        return false;
+    }
+
+    m_RenderDeviceContext->Flush();
+
+    if (m_DecodeDevice == m_RenderDevice) {
+        unlockContext(this);
+    }
+
+    if (SUCCEEDED(m_PresentReadyFence->SetEventOnCompletion(fenceValue, m_PresentReadyFenceEvent))) {
+        // Bounded so a wedged GPU can't hang the pacing thread forever
+        WaitForSingleObject(m_PresentReadyFenceEvent, 50);
+    }
+
+    return true;
 }
 
 bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound)
@@ -387,6 +753,15 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
                             "Avoiding texture sharing on known broken GPU vendor");
                 separateDevices = false;
             }
+            // AMD is deliberately NOT excluded here. An earlier revision
+            // forced shared devices on AMD, which put decode and render on
+            // one immediate context - the pre-present GPU fence then waited
+            // behind the next frame's decode, inflating measured render
+            // times from 3-4ms to 11-13ms under sustained load (Radeon
+            // 890M, measured 2026-07-06; separate devices reclaimed ~2ms
+            // and halved jitter drops with no decode side effects).
+            // D3D11VA_FORCE_SEPARATE_DEVICES=0 restores sharing if an AMD
+            // driver misbehaves.
         }
     }
 
@@ -406,12 +781,11 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
         // significant performance impact of the extra copy. See:
         // https://github.com/moonlight-stream/moonlight-qt/issues/1304
         //
-        // Also bind SRVs when using separate decoding and rendering
-        // devices as this improves render times by about 2x on my
-        // Ryzen 3300U system. The fences we use between decoding
-        // and rendering contexts should hopefully avoid any of the
-        // synchronization issues we've seen between decoder and SRVs.
-        m_BindDecoderOutputTextures = adapterDesc.VendorId == 0x8086 || separateDevices;
+        // Binding shared decoder texture arrays directly can fail on some
+        // AMD Main10 paths even when separate decode/render devices are
+        // available. Keep the direct-bind optimization limited to Intel by
+        // default and use the safer copy path elsewhere.
+        m_BindDecoderOutputTextures = adapterDesc.VendorId == 0x8086;
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -430,6 +804,14 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
     else {
         // Remember that we found a device with support for decoding this codec
         m_DevicesWithCodecSupport++;
+    }
+
+    if (adapterDesc.VendorId == 0x1002 &&
+            (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_10BIT) &&
+            qEnvironmentVariableIntValue("D3D11VA_AMD_10BIT_DISABLED")) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Avoiding D3D11VA on AMD 10-bit video because D3D11VA_AMD_10BIT_DISABLED is set.");
+        goto Exit;
     }
 
     success = true;
@@ -492,6 +874,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                      SDL_GetError());
         return false;
     }
+    m_OutputIndex = outputIndex;
 
     hr = CreateDXGIFactory2(
         m_DebugLayer ? DXGI_CREATE_FACTORY_DEBUG : 0,
@@ -503,6 +886,8 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                      hr);
         return false;
     }
+
+    refreshOutput();
 
     // First try the adapter corresponding to the display where our window resides.
     // This will let us avoid a copy if the display GPU has the required decoder.
@@ -529,6 +914,33 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         }
     }
 
+    // Multi-stream-degradation diagnostic (2026-07-08): report the ACTUAL
+    // adapter the render device landed on. m_AdapterIndex is only the
+    // SDL-preferred index (from SDL_DXGIGetOutputInfo); createDeviceByAdapterIndex
+    // can silently fall back to another GPU without updating it. If a follow-up
+    // stream lands on a different adapter than the first - e.g. a stale SDL DXGI
+    // enumeration hands back a second-best output - decode->render becomes a
+    // cross-adapter copy and render cost balloons. Log it once per stream so
+    // stream 1 and stream 2 can be diffed at a glance.
+    {
+        ComPtr<IDXGIDevice> renderDxgiDevice;
+        ComPtr<IDXGIAdapter> renderAdapter;
+        DXGI_ADAPTER_DESC renderAdapterDesc = {};
+        if (SUCCEEDED(m_RenderDevice.As(&renderDxgiDevice)) &&
+                SUCCEEDED(renderDxgiDevice->GetAdapter(&renderAdapter)) &&
+                SUCCEEDED(renderAdapter->GetDesc(&renderAdapterDesc))) {
+            char adapterName[256] = "unknown";
+            WideCharToMultiByte(CP_UTF8, 0, renderAdapterDesc.Description, -1,
+                                adapterName, sizeof(adapterName), nullptr, nullptr);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "D3D11VA device: render adapter '%s' (SDL-preferred index %d), %llu MB dedicated, %s decode/render devices",
+                        adapterName,
+                        m_AdapterIndex,
+                        (unsigned long long)(renderAdapterDesc.DedicatedVideoMemory / (1024ULL * 1024ULL)),
+                        m_DecodeDevice == m_RenderDevice ? "shared" : "separate");
+        }
+    }
+
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
     swapChainDesc.Stereo = FALSE;
     swapChainDesc.SampleDesc.Count = 1;
@@ -536,7 +948,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swapChainDesc.Scaling = DXGI_SCALING_STRETCH;
     swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     swapChainDesc.Flags = 0;
 
     // 3 front buffers (default GetMaximumFrameLatency() count)
@@ -551,7 +963,9 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     // intuitively we must avoid it to reduce latency. If we set our max
     // frame latency to 1 on thedevice, our SyncInterval 0 Present() calls
     // will block on DWM (acting like SyncInterval 1) rather than doing
-    // the non-blocking present we expect.
+    // the non-blocking present we expect. This also defeats VRR: DWM ends up
+    // throttling every present to its own cadence regardless of the tearing
+    // flag, so the display never actually leaves fixed-rate refresh.
     //
     // NB: 3 total buffers seems sufficient on NVIDIA hardware but
     // causes performance issues (buffer starvation) on AMD GPUs.
@@ -567,42 +981,46 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         swapChainDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
     }
     else {
-        swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        swapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
 
-    // Use DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING with flip mode for non-vsync case, if possible.
-    // NOTE: This is only possible in windowed or borderless windowed mode.
-    if (!params->enableVsync) {
-        BOOL allowTearing = FALSE;
-        hr = m_Factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                                            &allowTearing,
-                                            sizeof(allowTearing));
-        if (SUCCEEDED(hr)) {
-            if (allowTearing) {
-                // Use flip discard with allow tearing mode if possible.
-                swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-                m_AllowTearing = true;
-            }
-            else {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "OS/GPU doesn't support DXGI_FEATURE_PRESENT_ALLOW_TEARING");
-            }
-        }
-        else {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "IDXGIFactory::CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING) failed: %x",
-                         hr);
-            // Non-fatal
+    resolvePresentationMode(params->window, &swapChainDesc);
+
+    if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // Ask the driver to prioritize this device's GPU submissions. VRR
+        // cadence pacing fences GPU completion before every present, so
+        // the frame's GPU work gates the flip instant directly and any
+        // queueing behind DWM or other clients costs pacing slack
+        // (measured 2026-07-06: the whole per-frame chain is ~3.5ms at
+        // full clocks, so priority - not throughput - is what matters).
+        // Only this mode justifies maximum priority; the other
+        // presentation modes present on a vsync cadence that hides
+        // ordinary queueing. Best-effort: drivers may clamp or ignore it,
+        // and under HAGS it can be a no-op.
+        ComPtr<IDXGIDevice> dxgiDevice;
+        if (SUCCEEDED(m_RenderDevice.As(&dxgiDevice))) {
+            HRESULT prioHr = dxgiDevice->SetGPUThreadPriority(7);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "SetGPUThreadPriority(7) for VRR cadence pacing: %s (%x)",
+                        SUCCEEDED(prioHr) ? "accepted" : "rejected",
+                        prioHr);
         }
 
-        // DXVA2 may let us take over for FSE V-sync off cases. However, if we don't have DXGI_FEATURE_PRESENT_ALLOW_TEARING
-        // then we should not attempt to do this unless there's no other option (HDR, DXVA2 failed in pass 1, etc).
-        if (!m_AllowTearing && m_DecoderSelectionPass == 0 && !(params->videoFormat & VIDEO_FORMAT_MASK_10BIT) &&
-                (SDL_GetWindowFlags(params->window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Defaulting to DXVA2 for FSE without DXGI_FEATURE_PRESENT_ALLOW_TEARING support");
-            return false;
-        }
+        // See acquireVrrPowerState() above: VRR cadence pacing needs the
+        // process running at full speed and the system awake for as long as
+        // this renderer is streaming.
+        acquireVrrPowerState();
+        m_HoldingVrrPowerRequest = true;
+    }
+
+    // DXVA2 may let us take over for FSE V-sync off cases. However, if we don't have DXGI_FEATURE_PRESENT_ALLOW_TEARING
+    // then we should not attempt to do this unless there's no other option (HDR, DXVA2 failed in pass 1, etc).
+    if (m_PresentationMode == PresentationMode::Immediate && !m_AllowTearing &&
+            m_DecoderSelectionPass == 0 && !(params->videoFormat & VIDEO_FORMAT_MASK_10BIT) &&
+            (SDL_GetWindowFlags(params->window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Defaulting to DXVA2 for FSE without DXGI_FEATURE_PRESENT_ALLOW_TEARING support");
+        return false;
     }
 
     SDL_SysWMinfo info;
@@ -610,29 +1028,61 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
     SDL_GetWindowWMInfo(params->window, &info);
     SDL_assert(info.subsystem == SDL_SYSWM_WINDOWS);
 
-    // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
-    // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
-    ComPtr<IDXGISwapChain1> swapChain;
-    hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
-                                           info.info.win.window,
-                                           &swapChainDesc,
-                                           nullptr,
-                                           nullptr,
-                                           &swapChain);
-
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGIFactory::CreateSwapChainForHwnd() failed: %x",
-                     hr);
-        return false;
+    // Composition swapchain with OS-scheduled target-time presents in
+    // place of the DXGI swapchain + VrrPresenter execution. Driven by the
+    // "Smoothest VRR" setting; MOONLIGHT_COMP_SWAPCHAIN overrides both
+    // ways. Only meaningful when the cadence pacer is producing targets.
+    bool useCompSwapchain = m_DecoderParams.enableOsScheduledVrr;
+    if (Utils::getEnvironmentVariableOverride("MOONLIGHT_COMP_SWAPCHAIN", &useCompSwapchain)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Using MOONLIGHT_COMP_SWAPCHAIN to override OS-scheduled VRR setting: %d",
+                    useCompSwapchain);
+    }
+    if (useCompSwapchain) {
+        if (m_PresentationMode != PresentationMode::VrrCadence) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "OS-scheduled VRR unavailable: presentation mode is not VRR cadence");
+        }
+        else if (m_PmSwapchain.initialize(m_RenderDevice.Get(),
+                                          info.info.win.window,
+                                          m_DisplayWidth, m_DisplayHeight,
+                                          swapChainDesc.Format)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Using composition swapchain: pacer targets become OS present "
+                        "target times (no app-side hold/alignment)");
+            m_UsePmSwapchain = true;
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Composition swapchain unavailable; falling back to DXGI swapchain");
+        }
     }
 
-    hr = swapChain.As(&m_SwapChain);
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "IDXGISwapChain::QueryInterface(IDXGISwapChain4) failed: %x",
-                     hr);
-        return false;
+    // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
+    // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
+    if (!m_UsePmSwapchain) {
+        ComPtr<IDXGISwapChain1> swapChain;
+        hr = m_Factory->CreateSwapChainForHwnd(m_RenderDevice.Get(),
+                                               info.info.win.window,
+                                               &swapChainDesc,
+                                               nullptr,
+                                               nullptr,
+                                               &swapChain);
+
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGIFactory::CreateSwapChainForHwnd() failed: %x",
+                         hr);
+            return false;
+        }
+
+        hr = swapChain.As(&m_SwapChain);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGISwapChain::QueryInterface(IDXGISwapChain4) failed: %x",
+                         hr);
+            return false;
+        }
     }
 
     // Disable Alt+Enter, PrintScreen, and window message snooping. This makes
@@ -739,8 +1189,39 @@ bool D3D11VARenderer::prepareDecoderContextInGetFormat(AVCodecContext *context, 
     return true;
 }
 
+void D3D11VARenderer::waitToRender()
+{
+    if (m_FrameLatencyWaitableObject != nullptr) {
+        WaitForSingleObjectEx(m_FrameLatencyWaitableObject, 1000, FALSE);
+    }
+}
+
 void D3D11VARenderer::renderFrame(AVFrame* frame)
 {
+    uint64_t renderEntryUs = LiGetMicroseconds();
+
+    // Composition swapchain: pick a presentation buffer BEFORE taking the
+    // context lock - the availability wait must not stall the decoder on
+    // shared-device systems. The wait is surfaced via
+    // popPresentAlignmentWaitUs() so the pacer doesn't count it as render
+    // work.
+    ID3D11RenderTargetView* renderTarget;
+    if (m_UsePmSwapchain) {
+        renderTarget = m_PmSwapchain.acquireBuffer();
+        if (renderTarget == nullptr) {
+            if (m_PmSwapchain.isLost()) {
+                SDL_Event event;
+                event.type = SDL_RENDER_DEVICE_RESET;
+                SDL_PushEvent(&event);
+            }
+            // Otherwise all buffers are still queued; drop this frame.
+            return;
+        }
+    }
+    else {
+        renderTarget = m_RenderTargetView.Get();
+    }
+
     // Acquire the context lock for rendering to prevent concurrent
     // access from inside FFmpeg's decoding code
     if (m_DecodeDevice == m_RenderDevice) {
@@ -749,11 +1230,11 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
 
     // Clear the back buffer
     const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    m_RenderDeviceContext->ClearRenderTargetView(m_RenderTargetView.Get(), clearColor);
+    m_RenderDeviceContext->ClearRenderTargetView(renderTarget, clearColor);
 
     // Bind the back buffer. This needs to be done each time,
     // because the render target view will be unbound by Present().
-    m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
+    m_RenderDeviceContext->OMSetRenderTargets(1, &renderTarget, nullptr);
 
     // Render our video frame with the aspect-ratio adjusted viewport
     renderVideo(frame);
@@ -763,49 +1244,176 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         renderOverlay((Overlay::OverlayType)i);
     }
 
-    UINT flags;
-
-    if (m_AllowTearing) {
-        SDL_assert(!m_DecoderParams.enableVsync);
-
-        // If tearing is allowed, use DXGI_PRESENT_ALLOW_TEARING with syncInterval 0.
-        // It is not valid to use any other syncInterval values in tearing mode.
-        flags = DXGI_PRESENT_ALLOW_TEARING;
-    }
-    else {
-        // Otherwise, we'll submit as fast as possible and DWM will discard excess
-        // frames for us. If frame pacing is also enabled or we're in full-screen,
-        // our Vsync source will keep us in sync with VBlank.
-        flags = 0;
-    }
-
     HRESULT hr;
 
     if (frame->color_trc != m_LastColorTrc) {
         if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
             // Switch to Rec 2020 PQ (SMPTE ST 2084) colorspace for HDR10 rendering
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
-                             hr);
+            if (m_UsePmSwapchain) {
+                m_PmSwapchain.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, true);
+            }
+            else {
+                hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                if (FAILED(hr)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                 "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) failed: %x",
+                                 hr);
+                }
             }
         }
         else {
             // Restore default sRGB colorspace
-            hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
-                             hr);
+            if (m_UsePmSwapchain) {
+                m_PmSwapchain.setColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, false);
+            }
+            else {
+                hr = m_SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                if (FAILED(hr)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                 "IDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) failed: %x",
+                                 hr);
+                }
             }
         }
 
         m_LastColorTrc = frame->color_trc;
     }
 
-    // Present according to the decoder parameters
+    if (m_UsePmSwapchain) {
+        // Submit the queued GPU work now: a PM Present has no DXGI-style
+        // implicit flush, and an unflushed frame never becomes "ready" to
+        // display. The OS then gates the flip on GPU completion plus the
+        // pacer's target time - no app-side hold or scanline alignment.
+        m_RenderDeviceContext->Flush();
+
+        if (m_DecodeDevice == m_RenderDevice) {
+            unlockContext(this);
+        }
+
+        bool presented = m_PmSwapchain.present(m_PmTargetUs);
+
+        // Report the expected flip instant (not this deliberately-early
+        // present call) so the pacer's flip-spacing floor stays truthful.
+        m_VrrPresenter.notePresent(m_PmSwapchain.lastExpectedFlipUs());
+
+        if (!presented) {
+            SDL_Event event;
+            event.type = SDL_RENDER_DEVICE_RESET;
+            SDL_PushEvent(&event);
+        }
+        return;
+    }
+
+    bool vsyncLatch = false;
+
+    if (m_PresentationMode == PresentationMode::VrrCadence &&
+            qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") == 0) {
+        // Fence the GPU and wait for render completion with the context
+        // lock dropped, so Present() below is the true flip instant and the
+        // decoder isn't stalled while we wait. The presenter then executes
+        // the pacer's intent: hold to the target instant, then align to the
+        // blanking gap or record a vsync-latched present.
+        //
+        // Phase accounting: everything from renderFrame entry to here was
+        // CPU submission; the fence wait inside signalAndUnlockForPresent
+        // is GPU latency (the frame's decode tail on the decode device,
+        // the decoder-texture copy, and the draw). The pacer sees only the
+        // sum, and the two halves call for entirely different
+        // optimizations, so log the split.
+        uint64_t submitDoneUs = LiGetMicroseconds();
+        bool unlocked = signalAndUnlockForPresent();
+        uint64_t gpuDoneUs = LiGetMicroseconds();
+        m_RenderPhaseSubmitTotalUs += submitDoneUs - renderEntryUs;
+        m_RenderPhaseGpuWaitTotalUs += gpuDoneUs - submitDoneUs;
+        if (submitDoneUs - renderEntryUs < m_RenderPhaseSubmitMinUs) {
+            m_RenderPhaseSubmitMinUs = submitDoneUs - renderEntryUs;
+        }
+        if (gpuDoneUs - submitDoneUs < m_RenderPhaseGpuWaitMinUs) {
+            m_RenderPhaseGpuWaitMinUs = gpuDoneUs - submitDoneUs;
+        }
+        m_RenderPhaseSamples++;
+        // Multi-stream-degradation diagnostic (2026-07-08): 5s window so a
+        // short test stream still emits a line; per-window MINIMA (a high
+        // gpu-wait min = the GPU is sustained-slow/downclocked - even a
+        // no-contention frame costs more; a low min with a high avg =
+        // intermittent contention); shared-vs-separate device state (the
+        // eb911054 split); and the process's LOCAL video-memory footprint (a
+        // per-stream climb across stream 1 -> 2 -> 3 = a leaked device/surface
+        // pool from the prior stream, vs a flat footprint with a high gpu-wait
+        // = the GPU simply running at a lower clock).
+        if (gpuDoneUs - m_RenderPhaseLastLogUs > 5000000ULL) {
+            if (m_RenderPhaseLastLogUs != 0 && m_RenderPhaseSamples > 0) {
+                double vramMb = -1.0;
+                ComPtr<IDXGIAdapter1> diagAdapter;
+                if (m_Factory != nullptr &&
+                        SUCCEEDED(m_Factory->EnumAdapters1(m_AdapterIndex, &diagAdapter))) {
+                    ComPtr<IDXGIAdapter3> diagAdapter3;
+                    DXGI_QUERY_VIDEO_MEMORY_INFO memInfo = {};
+                    if (SUCCEEDED(diagAdapter.As(&diagAdapter3)) &&
+                            SUCCEEDED(diagAdapter3->QueryVideoMemoryInfo(
+                                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo))) {
+                        vramMb = memInfo.CurrentUsage / (1024.0 * 1024.0);
+                    }
+                }
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "D3D11 render phases: cpu-submit avg %.2f (min %.2f) ms, gpu-wait avg %.2f (min %.2f) ms over %u frames, %s devices, process VRAM %.0f MB",
+                            m_RenderPhaseSubmitTotalUs / 1000.0 / m_RenderPhaseSamples,
+                            m_RenderPhaseSubmitMinUs / 1000.0,
+                            m_RenderPhaseGpuWaitTotalUs / 1000.0 / m_RenderPhaseSamples,
+                            m_RenderPhaseGpuWaitMinUs / 1000.0,
+                            m_RenderPhaseSamples,
+                            m_DecodeDevice == m_RenderDevice ? "shared" : "separate",
+                            vramMb);
+            }
+            m_RenderPhaseSubmitTotalUs = 0;
+            m_RenderPhaseGpuWaitTotalUs = 0;
+            m_RenderPhaseSubmitMinUs = UINT64_MAX;
+            m_RenderPhaseGpuWaitMinUs = UINT64_MAX;
+            m_RenderPhaseSamples = 0;
+            m_RenderPhaseLastLogUs = gpuDoneUs;
+        }
+        if (!unlocked && m_DecodeDevice == m_RenderDevice) {
+            // No fence support: still drop the lock for the waits below.
+            unlockContext(this);
+        }
+
+        vsyncLatch = m_VrrPresenter.prepareToPresent();
+
+        // Reacquire the lock for Present(). Any lock delay from an in-flight
+        // decode submission lands after alignment and only shifts us deeper
+        // into (extended) blanking, which is safe.
+        if (m_DecodeDevice == m_RenderDevice) {
+            lockContext(this);
+        }
+    }
+    else if (m_PresentationMode == PresentationMode::VrrCadence) {
+        m_VrrPresenter.prepareToPresentClassic();
+    }
+
+    UINT flags;
+    if (m_AllowTearing && !vsyncLatch) {
+        SDL_assert(m_PresentationMode == PresentationMode::Immediate ||
+                   m_PresentationMode == PresentationMode::VrrCadence);
+        flags = DXGI_PRESENT_ALLOW_TEARING;
+    }
+    else {
+        // Without DXGI_PRESENT_ALLOW_TEARING, a SyncInterval-0 present on a
+        // flip-model swapchain queues the frame to latch tear-free at the
+        // display's next vblank (replacing any not-yet-shown predecessor) -
+        // exactly what a vsync-latched present wants.
+        flags = 0;
+    }
+
+    // Present according to the selected presentation mode
+    uint64_t presentCallStartUs = LiGetMicroseconds();
+    m_VrrPresenter.notePresent(presentCallStartUs);
     hr = m_SwapChain->Present(0, flags);
+    if (m_PresentationMode == PresentationMode::VrrCadence) {
+        // Separate retire-queue backpressure inside Present() from render
+        // work - see VrrPresenter::notePresentDuration().
+        m_VrrPresenter.notePresentDuration(
+            LiGetMicroseconds() - presentCallStartUs);
+    }
 
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
@@ -1227,6 +1835,7 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
         if (adapterIndex != m_AdapterIndex) {
             return false;
         }
+        m_OutputIndex = outputIndex;
 
         // If an adapter was added or removed, we can't trust that our
         // old indexes are still valid for comparison.
@@ -1234,11 +1843,19 @@ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
             return false;
         }
 
+        refreshOutput();
+
         // We've handled this state change
         stateInfo->stateChangeFlags &= ~WINDOW_STATE_CHANGE_DISPLAY;
     }
 
     if (stateInfo->stateChangeFlags & WINDOW_STATE_CHANGE_SIZE) {
+        // The composition swapchain's buffer ring and DComp tree are
+        // size-dependent; recreate the whole renderer on resize.
+        if (m_UsePmSwapchain) {
+            return false;
+        }
+
         // Resize our swapchain and reconstruct size-dependent resources
 
         DXGI_SWAP_CHAIN_DESC1 swapchainDesc;
@@ -1466,7 +2083,7 @@ int D3D11VARenderer::getRendererAttributes()
     // This renderer supports HDR
     attributes |= RENDERER_ATTRIBUTE_HDR_SUPPORT;
 
-    // This renderer requires frame pacing to synchronize with VBlank when we're in full-screen.
+    // This renderer requires frame pacing to synchronize with VBlank when we're in full-screen
     // In windowed mode, we will render as fast we can and DWM will grab whatever is latest at the
     // time unless the user opts for pacing. We will use pacing in full-screen mode and normal DWM
     // sequencing in full-screen desktop mode to behave similarly to the DXVA2 renderer.
@@ -1475,6 +2092,81 @@ int D3D11VARenderer::getRendererAttributes()
     }
 
     return attributes;
+}
+
+IFFmpegRenderer::PresentationMode D3D11VARenderer::getPresentationMode()
+{
+    return m_PresentationMode;
+}
+
+const char* D3D11VARenderer::getPresentationModeFallbackReason()
+{
+    // Surface VrrCadence's live per-frame sub-state in the overlay: presents
+    // switch between tearing+blank-aligned (true VRR pacing, content below
+    // the panel's tear-free flip ceiling) and vsync-latched (content at or
+    // above it) - the mode label alone can't show that, which made the
+    // dynamic switching look inert.
+    if (m_PresentationMode == PresentationMode::VrrCadence &&
+            m_PresentationModeFallbackReason == nullptr) {
+        if (m_UsePmSwapchain) {
+            return "composition swapchain (OS-scheduled presents)";
+        }
+        if (m_VrrPresenter.lastPresentLatched()) {
+            return "vsync-latched: content at the panel's VRR ceiling";
+        }
+        return m_VrrPresenter.lastPresentBuffered() ?
+            "true VRR pacing (near-ceiling buffer)" :
+            "true VRR pacing";
+    }
+
+    return m_PresentationModeFallbackReason;
+}
+
+uint64_t D3D11VARenderer::popPresentAlignmentWaitUs()
+{
+    if (m_UsePmSwapchain) {
+        // No alignment waits exist in this mode; the analogous
+        // non-render idle time is waiting for a presentation buffer.
+        return m_PmSwapchain.popAcquireWaitUs();
+    }
+
+    return m_VrrPresenter.popAlignmentWaitUs();
+}
+
+void D3D11VARenderer::setPresentTargetUs(uint64_t targetUs, bool catchUp, uint64_t alignBudgetUs, bool vsyncLatch, bool nearBuffered)
+{
+    // In composition swapchain mode the target goes to the OS as a present
+    // target time; the align budget/latch/buffer flags describe app-side
+    // execution mechanics that don't exist there.
+    m_PmTargetUs = targetUs;
+
+    m_VrrPresenter.setPresentTarget(targetUs, catchUp, alignBudgetUs,
+                                    vsyncLatch, nearBuffered);
+}
+
+uint64_t D3D11VARenderer::getLastPresentUs()
+{
+    return m_VrrPresenter.lastPresentUs();
+}
+
+uint32_t D3D11VARenderer::popMidScanTearCount()
+{
+    if (m_UsePmSwapchain) {
+        // PM presents never tear; the pacer's tear probe stays quiet.
+        return 0;
+    }
+
+    return m_VrrPresenter.popMidScanTearCount();
+}
+
+bool D3D11VARenderer::isVrrRasterLockUncertain()
+{
+    if (m_UsePmSwapchain) {
+        // No raster-lock rituals to trigger; the OS owns flip execution.
+        return false;
+    }
+
+    return m_VrrPresenter.isRasterLockUncertain();
 }
 
 int D3D11VARenderer::getDecoderCapabilities()
@@ -1698,6 +2390,22 @@ bool D3D11VARenderer::setupSwapchainDependentResources()
 {
     HRESULT hr;
 
+    // The composition swapchain path acquires a per-frame render target
+    // from its own buffer ring; only the viewport applies here.
+    if (m_UsePmSwapchain) {
+        D3D11_VIEWPORT viewport;
+
+        viewport.TopLeftX = 0;
+        viewport.TopLeftY = 0;
+        viewport.Width = m_DisplayWidth;
+        viewport.Height = m_DisplayHeight;
+        viewport.MinDepth = 0;
+        viewport.MaxDepth = 1;
+
+        m_RenderDeviceContext->RSSetViewports(1, &viewport);
+        return true;
+    }
+
     // Create our render target view
     {
         ComPtr<ID3D11Resource> backBufferResource;
@@ -1811,6 +2519,81 @@ std::vector<DXGI_FORMAT> D3D11VARenderer::getVideoTextureSRVFormats()
     }
 }
 
+bool D3D11VARenderer::createVideoTextureSRV(ID3D11Resource* texture,
+                                            D3D11_SRV_DIMENSION viewDimension,
+                                            UINT arraySlice,
+                                            DXGI_FORMAT srvFormat,
+                                            UINT planeSlice,
+                                            ComPtr<ID3D11ShaderResourceView>& srv)
+{
+    HRESULT hr;
+
+    if (m_TextureFormat == DXGI_FORMAT_NV12 ||
+            m_TextureFormat == DXGI_FORMAT_P010 ||
+            m_TextureFormat == DXGI_FORMAT_P016) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC1 srvDesc = {};
+        srvDesc.Format = srvFormat;
+        srvDesc.ViewDimension = viewDimension;
+
+        if (viewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) {
+            srvDesc.Texture2DArray.MostDetailedMip = 0;
+            srvDesc.Texture2DArray.MipLevels = 1;
+            srvDesc.Texture2DArray.FirstArraySlice = arraySlice;
+            srvDesc.Texture2DArray.ArraySize = 1;
+            srvDesc.Texture2DArray.PlaneSlice = planeSlice;
+        }
+        else {
+            SDL_assert(viewDimension == D3D11_SRV_DIMENSION_TEXTURE2D);
+            srvDesc.Texture2D.MostDetailedMip = 0;
+            srvDesc.Texture2D.MipLevels = 1;
+            srvDesc.Texture2D.PlaneSlice = planeSlice;
+        }
+
+        ComPtr<ID3D11ShaderResourceView1> srv1;
+        hr = m_RenderDevice->CreateShaderResourceView1(texture, &srvDesc, &srv1);
+        if (SUCCEEDED(hr)) {
+            hr = srv1.As(&srv);
+        }
+    }
+    else {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = srvFormat;
+        srvDesc.ViewDimension = viewDimension;
+
+        if (viewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) {
+            srvDesc.Texture2DArray.MostDetailedMip = 0;
+            srvDesc.Texture2DArray.MipLevels = 1;
+            srvDesc.Texture2DArray.FirstArraySlice = arraySlice;
+            srvDesc.Texture2DArray.ArraySize = 1;
+        }
+        else {
+            SDL_assert(viewDimension == D3D11_SRV_DIMENSION_TEXTURE2D);
+            srvDesc.Texture2D.MostDetailedMip = 0;
+            srvDesc.Texture2D.MipLevels = 1;
+        }
+
+        hr = m_RenderDevice->CreateShaderResourceView(texture, &srvDesc, &srv);
+    }
+
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "ID3D11Device::CreateShaderResourceView%s() failed: %x resource-format=%u srv-format=%u plane=%u view=%u array-slice=%u video-format=0x%x",
+                     (m_TextureFormat == DXGI_FORMAT_NV12 ||
+                      m_TextureFormat == DXGI_FORMAT_P010 ||
+                      m_TextureFormat == DXGI_FORMAT_P016) ? "1" : "",
+                     hr,
+                     m_TextureFormat,
+                     srvFormat,
+                     planeSlice,
+                     viewDimension,
+                     arraySlice,
+                     m_DecoderParams.videoFormat);
+        return false;
+    }
+
+    return true;
+}
+
 bool D3D11VARenderer::setupVideoTexture(AVHWFramesContext* framesContext)
 {
     SDL_assert(!m_BindDecoderOutputTextures);
@@ -1841,21 +2624,16 @@ bool D3D11VARenderer::setupVideoTexture(AVHWFramesContext* framesContext)
     // We will only have one set of SRVs
     m_VideoTextureResourceViews.resize(1);
 
-    // Create SRVs for the texture
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-    srvDesc.Texture2D.MipLevels = 1;
     size_t srvIndex = 0;
     for (DXGI_FORMAT srvFormat : getVideoTextureSRVFormats()) {
         SDL_assert(srvIndex < m_VideoTextureResourceViews[0].size());
 
-        srvDesc.Format = srvFormat;
-        hr = m_RenderDevice->CreateShaderResourceView(m_VideoTexture.Get(), &srvDesc, &m_VideoTextureResourceViews[0][srvIndex]);
-        if (FAILED(hr)) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "ID3D11Device::CreateShaderResourceView() failed: %x",
-                         hr);
+        if (!createVideoTextureSRV(m_VideoTexture.Get(),
+                                   D3D11_SRV_DIMENSION_TEXTURE2D,
+                                   0,
+                                   srvFormat,
+                                   (UINT)srvIndex,
+                                   m_VideoTextureResourceViews[0][srvIndex])) {
             return false;
         }
 
@@ -1871,35 +2649,23 @@ bool D3D11VARenderer::setupTexturePoolViews(AVHWFramesContext* framesContext)
 
     SDL_assert(m_BindDecoderOutputTextures);
 
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-    srvDesc.Texture2DArray.MostDetailedMip = 0;
-    srvDesc.Texture2DArray.MipLevels = 1;
-    srvDesc.Texture2DArray.ArraySize = 1;
-
     m_VideoTextureResourceViews.resize(framesContext->initial_pool_size);
 
     // Create luminance and chrominance SRVs for each texture in the pool
     for (int i = 0; i < framesContext->initial_pool_size; i++) {
-        HRESULT hr;
-
         // Our rendering logic depends on the texture index working to map into our SRV array
         SDL_assert(i == d3d11vaFramesContext->texture_infos[i].index);
-
-        srvDesc.Texture2DArray.FirstArraySlice = d3d11vaFramesContext->texture_infos[i].index;
 
         size_t srvIndex = 0;
         for (DXGI_FORMAT srvFormat : getVideoTextureSRVFormats()) {
             SDL_assert(srvIndex < m_VideoTextureResourceViews[i].size());
 
-            srvDesc.Format = srvFormat;
-            hr = m_RenderDevice->CreateShaderResourceView(m_RenderSharedTextureArray.Get(),
-                                                          &srvDesc,
-                                                          &m_VideoTextureResourceViews[i][srvIndex]);
-            if (FAILED(hr)) {
-                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                             "ID3D11Device::CreateShaderResourceView() failed: %x",
-                             hr);
+            if (!createVideoTextureSRV(m_RenderSharedTextureArray.Get(),
+                                       D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                                       d3d11vaFramesContext->texture_infos[i].index,
+                                       srvFormat,
+                                       (UINT)srvIndex,
+                                       m_VideoTextureResourceViews[i][srvIndex])) {
                 return false;
             }
 
