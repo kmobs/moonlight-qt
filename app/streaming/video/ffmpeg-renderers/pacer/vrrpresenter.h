@@ -106,10 +106,9 @@ public:
 
 private:
     uint64_t holdUntilPresentTarget();
-    bool waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
+    void waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
                                            uint64_t latePastTargetUs = 0,
-                                           bool catchUpPresent = false,
-                                           bool rescueOnMiss = false);
+                                           bool catchUpPresent = false);
     void logAlignStatsIfDue(uint64_t nowUs);
 
 #ifdef Q_OS_WIN32
@@ -131,9 +130,7 @@ private:
     uint32_t m_AlignHits;
     uint32_t m_AlignGiveUps;
     uint32_t m_AlignSkips;
-    uint32_t m_AlignQueryFailures;
     uint32_t m_AlignVsyncLatches;
-    uint32_t m_AlignRescueLatches;
     uint64_t m_AlignWaitTotalUs;
     uint64_t m_AlignBudgetTotalUs;
     uint64_t m_AlignStatsStartUs;

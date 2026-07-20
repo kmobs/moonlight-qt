@@ -622,12 +622,12 @@ Flickable {
                             //    (refresh - refresh^2/3600, the Blur Busters
                             //    formula; 120Hz -> 116 FPS, 144Hz -> 138).
                             //    The highest rate adaptive sync can follow,
-                            //    with the client using an adaptive timing
-                            //    reserve to decouple delivery jitter.
+                            //    with the client absorbing delivery jitter in
+                            //    a ~1-frame pacing buffer.
                             //  - "Low-latency VRR": ~5/6 of max refresh
                             //    (120Hz -> 100 FPS, 144Hz -> 120). Leaves
                             //    enough per-frame slack that pacing needs only
-                            //    a minimal timing reserve - the lowest-latency
+                            //    a minimal standing buffer - the lowest-latency
                             //    tear-free operating point, at fewer frames.
                             var vrrDone = false
                             for (var vrrDisplayIndex = 0; !vrrDone; vrrDisplayIndex++) {
@@ -672,10 +672,11 @@ Flickable {
                             lastIndexValue = currentIndex
                         }
 
-                        // Switch only between the fastest display's native
-                        // maximum and its VRR-optimized cap. Toggling VRR
-                        // must preserve any other FPS selection the user made.
-                        function toggleVrrFps(enableVrr) {
+                        // Select the VRR-optimized frame rate entry for the
+                        // fastest VRR-capable display, using the same
+                        // Blur Busters cap formula reinitialize() uses to
+                        // build the list (refresh - refresh^2/3600).
+                        function selectVrrFps() {
                             var bestRefreshRate = 0
                             for (var displayIndex = 0; ; displayIndex++) {
                                 var refreshRate = SystemProperties.getRefreshRate(displayIndex)
@@ -693,24 +694,8 @@ Flickable {
                             }
 
                             var vrrFps = Math.floor(bestRefreshRate - bestRefreshRate * bestRefreshRate / 3600)
-                            var selectedFps = StreamingPreferences.fps
-                            var targetFps
-
-                            if (enableVrr) {
-                                if (selectedFps !== bestRefreshRate) {
-                                    return
-                                }
-                                targetFps = vrrFps
-                            }
-                            else {
-                                if (selectedFps !== vrrFps) {
-                                    return
-                                }
-                                targetFps = bestRefreshRate
-                            }
-
                             for (var i = 0; i < fpsListModel.count; i++) {
-                                if (!fpsListModel.get(i).is_custom && parseInt(fpsListModel.get(i).video_fps) === targetFps) {
+                                if (!fpsListModel.get(i).is_custom && parseInt(fpsListModel.get(i).video_fps) === vrrFps) {
                                     currentIndex = i
                                     updateBitrateForSelection()
                                     break
@@ -804,12 +789,12 @@ Flickable {
                     }
                 }
 
-                Column {
+                Row {
                     width: parent.width
-                    spacing: 5
+                    spacing: 10
 
                     Column {
-                        width: parent.width
+                        width: (parent.width - parent.spacing) / 2
                         spacing: 5
 
                         Label {
@@ -896,7 +881,6 @@ Flickable {
                             }
 
                             id: windowModeComboBox
-                            width: parent.width
                             visible: SystemProperties.hasDesktopEnvironment
                             enabled: !SystemProperties.rendererAlwaysFullScreen && !StreamingPreferences.enableVrr
                             hoverEnabled: true
@@ -977,7 +961,7 @@ Flickable {
 
                     GroupBox {
                         id: vrrSettingsGroupBox
-                        width: parent.width
+                        width: (parent.width - parent.spacing) / 2
                         padding: 12
                         title: "<font color=\"skyblue\">" + qsTr("Variable Refresh Rate (VRR)") + "</font>"
                         font.pointSize: 12
@@ -1000,36 +984,54 @@ Flickable {
                                 // ::onToggled only fires for user interaction, so the
                                 // saved FPS selection isn't overridden on settings load
                                 onToggled: {
-                                    // Rebuild the list so native refresh rates are
-                                    // available again when VRR is disabled, and
-                                    // removed when it is enabled.
-                                    fpsComboBox.reinitialize()
-                                    fpsComboBox.toggleVrrFps(checked)
+                                    if (checked) {
+                                        fpsComboBox.selectVrrFps()
+                                    }
                                 }
                                 ToolTip.delay: 1000
                                 ToolTip.timeout: 5000
                                 ToolTip.visible: hovered
-                                ToolTip.text: qsTr("Paces each frame to your display's variable refresh rate (G-Sync, FreeSync) for smooth, tear-free streaming at lower latency than fixed V-Sync.\nWhen the maximum frame rate is selected, enabling VRR uses the recommended VRR frame rate for your display and forces borderless windowed mode while streaming.\nVRR pacing is latency-sensitive, so while streaming it asks Windows to run at full CPU/GPU performance and keeps your system and display from sleeping. This uses more power than standard V-Sync, so expect reduced battery life on a laptop.")
+                                ToolTip.text: qsTr("Paces each frame to your display's variable refresh rate (G-Sync, FreeSync) for smooth, tear-free streaming at lower latency than fixed V-Sync.\nEnabling VRR selects the recommended VRR frame rate for your display and forces borderless windowed mode while streaming.\nVRR pacing is latency-sensitive, so while streaming it asks Windows to run at full CPU/GPU performance and keeps your system and display from sleeping. This uses more power than standard V-Sync, so expect reduced battery life on a laptop.")
+                            }
+
+                            CheckBox {
+                                id: vrrTearingCheck
+                                width: parent.width
+                                hoverEnabled: true
+                                text: qsTr("Low-latency VRR (allow tearing)")
+                                font.pointSize: 12
+                                enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
+                                checked: StreamingPreferences.vrrTearing
+                                onCheckedChanged: {
+                                    StreamingPreferences.vrrTearing = checked
+                                }
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("When the stream FPS runs above your display's tear-free VRR range, present frames immediately for the lowest latency instead of latching them to vsync. May show visible tearing.\nHas no effect at FPS values within the VRR range, where VRR is always tear-free and low-latency.")
                             }
 
                             Label {
                                 width: parent.width
                                 id: vrrCushionTitle
-                                text: qsTr("VRR adaptation policy")
+                                text: qsTr("VRR pacing buffer")
                                 font.pointSize: 12
                                 wrapMode: Text.Wrap
                             }
 
                             AutoResizingComboBox {
-                                // Map both canonical and legacy stored values once the model exists.
+                                // ignore setting the index at first, and actually set it when the component is loaded
                                 Component.onCompleted: {
                                     var savedCushion = StreamingPreferences.vrrCushionUs
-                                    currentIndex = savedCushion > 0 && savedCushion <= 3000 ? 0 :
-                                                   (savedCushion >= 5500 ? 2 : 1)
-                                    // Loading should display the legacy value's
-                                    // policy without emitting a user action and
-                                    // silently rewriting it as Balanced.
-                                    recalculateWidth()
+                                    currentIndex = 1
+                                    for (var i = 0; i < vrrCushionListModel.count; i++) {
+                                        var thisCushion = vrrCushionListModel.get(i).val;
+                                        if (savedCushion === thisCushion) {
+                                            currentIndex = i
+                                            break
+                                        }
+                                    }
+                                    activated(currentIndex)
                                 }
 
                                 id: vrrCushionComboBox
@@ -1039,7 +1041,7 @@ Flickable {
                                 model: ListModel {
                                     id: vrrCushionListModel
                                     ListElement {
-                                        text: qsTr("Favor latency")
+                                        text: qsTr("Lowest latency")
                                         val: 2500
                                     }
                                     ListElement {
@@ -1047,7 +1049,7 @@ Flickable {
                                         val: 4500
                                     }
                                     ListElement {
-                                        text: qsTr("Favor smoothness")
+                                        text: qsTr("Smoothest")
                                         val: 6000
                                     }
                                 }
@@ -1057,9 +1059,9 @@ Flickable {
                                 }
 
                                 ToolTip.delay: 1000
-                                ToolTip.timeout: 12000
-                                ToolTip.visible: (hovered || activeFocus) && !popup.visible
-                                ToolTip.text: qsTr("Moonlight continuously learns the timing reserve needed by this display and streaming path. Changing this policy preserves the raw calibration but changes the protection applied to it. Favor latency keeps a small cushion, waits for stronger evidence before adding protection, and removes excess reserve quickly. Favor smoothness retains more protection and removes it cautiously. Balanced uses nearly all calibrated protection near the display ceiling, where timing slack is smallest, then sheds reserve and recovers quickly at lower frame rates. Controller-added queue latency is capped to one source frame.")
+                                ToolTip.timeout: 5000
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("How long frames may wait in a small buffer that absorbs network and game hiccups during VRR streaming. A larger buffer prevents tearing and stutter when the stream is unsteady; a smaller one shaves a few milliseconds of latency but tears more during hiccups.\nBecause a VRR display refreshes the moment each frame is presented, this buffer replaces the wait for the next fixed vsync tick - so total latency stays comparable to ordinary V-Sync even at the Smoothest setting.")
                             }
 
                             CheckBox {

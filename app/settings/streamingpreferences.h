@@ -124,6 +124,7 @@ public:
     Q_PROPERTY(bool absoluteTouchMode MEMBER absoluteTouchMode NOTIFY absoluteTouchModeChanged)
     Q_PROPERTY(bool framePacing MEMBER framePacing NOTIFY framePacingChanged)
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
+    Q_PROPERTY(bool vrrTearing MEMBER vrrTearing NOTIFY vrrTearingChanged)
     Q_PROPERTY(int vrrCushionUs MEMBER vrrCushionUs NOTIFY vrrCushionUsChanged)
     Q_PROPERTY(bool osScheduledVrr MEMBER osScheduledVrr NOTIFY osScheduledVrrChanged)
     Q_PROPERTY(bool connectionWarnings MEMBER connectionWarnings NOTIFY connectionWarningsChanged)
@@ -168,6 +169,7 @@ public:
     bool absoluteTouchMode;
     bool framePacing;
     bool enableVrr;
+    bool vrrTearing;
     int vrrCushionUs;
     bool osScheduledVrr;
     bool connectionWarnings;
@@ -217,6 +219,7 @@ signals:
     void windowModeChanged();
     void framePacingChanged();
     void enableVrrChanged();
+    void vrrTearingChanged();
     void vrrCushionUsChanged();
     void osScheduledVrrChanged();
     void connectionWarningsChanged();
@@ -241,3 +244,4 @@ private:
 
     QQmlEngine* m_QmlEngine;
 };
+

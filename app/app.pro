@@ -269,7 +269,6 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/pacer.h \
         streaming/video/ffmpeg-renderers/pacer/highressleep.h \
         streaming/video/ffmpeg-renderers/pacer/vrrcadence.h \
-        streaming/video/ffmpeg-renderers/pacer/vrrqueueage.h \
         streaming/video/ffmpeg-renderers/pacer/vrrpresenter.h
 }
 libva {

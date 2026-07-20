@@ -29,9 +29,7 @@ VrrPresenter::VrrPresenter() :
     m_AlignHits(0),
     m_AlignGiveUps(0),
     m_AlignSkips(0),
-    m_AlignQueryFailures(0),
     m_AlignVsyncLatches(0),
-    m_AlignRescueLatches(0),
     m_AlignWaitTotalUs(0),
     m_AlignBudgetTotalUs(0),
     m_AlignStatsStartUs(0),
@@ -85,14 +83,12 @@ void VrrPresenter::attachDisplay(const wchar_t* gdiDeviceName,
     // graphics APIs' own output objects (IDXGIOutput::GetRasterStatus doesn't
     // exist; that's D3D9-only), and the query is display-level, so it serves
     // any rendering API presenting to this output.
-    if (gdiDeviceName != nullptr && gdiDeviceName[0] != L'\0') {
-        D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openAdapter = {};
-        wcsncpy_s(openAdapter.DeviceName, gdiDeviceName, _TRUNCATE);
-        if (D3DKMTOpenAdapterFromGdiDisplayName(&openAdapter) == 0 /* STATUS_SUCCESS */) {
-            m_KmtAdapter = openAdapter.hAdapter;
-            m_KmtVidPnSourceId = openAdapter.VidPnSourceId;
-            m_KmtAdapterValid = true;
-        }
+    D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openAdapter = {};
+    wcsncpy_s(openAdapter.DeviceName, gdiDeviceName, _TRUNCATE);
+    if (D3DKMTOpenAdapterFromGdiDisplayName(&openAdapter) == 0 /* STATUS_SUCCESS */) {
+        m_KmtAdapter = openAdapter.hAdapter;
+        m_KmtVidPnSourceId = openAdapter.VidPnSourceId;
+        m_KmtAdapterValid = true;
     }
 #else
     Q_UNUSED(gdiDeviceName);
@@ -115,31 +111,6 @@ void VrrPresenter::detachDisplay()
 
     m_ActiveScanLines = 0;
     m_ScanoutPeriodUs = 0;
-    m_LastPresentAlignmentWaitUs = 0;
-    m_PresentTargetUs = 0;
-    m_PresentAlignBudgetUs = 0;
-    m_PresentVsyncLatch = false;
-    m_LastPresentLatched = false;
-    m_PresentNearBuffered = false;
-    m_LastPresentBuffered = false;
-    m_PresentCatchUp = false;
-    m_LastPresentUs = 0;
-    m_AlignInstantStreak = 0;
-    m_AlignHits = 0;
-    m_AlignGiveUps = 0;
-    m_AlignSkips = 0;
-    m_AlignQueryFailures = 0;
-    m_AlignVsyncLatches = 0;
-    m_AlignRescueLatches = 0;
-    m_AlignWaitTotalUs = 0;
-    m_AlignBudgetTotalUs = 0;
-    m_AlignStatsStartUs = 0;
-    m_TearForensicHead = 0;
-    m_TearForensicCount = 0;
-    m_MidScanSinceQuery = 0;
-    m_PresentBaseCurMinUs = UINT64_MAX;
-    m_PresentBasePrevMinUs = UINT64_MAX;
-    m_PresentBaseCount = 0;
 }
 
 void VrrPresenter::setPresentTarget(uint64_t targetUs, bool catchUp,
@@ -159,11 +130,6 @@ void VrrPresenter::setPresentTarget(uint64_t targetUs, bool catchUp,
 
 uint64_t VrrPresenter::popAlignmentWaitUs()
 {
-    // Pacer samples render completion before calling this method, so defer
-    // diagnostic formatting until here: safely after Present(), and outside
-    // the render-time estimate that drives the next frame's lead margin.
-    logAlignStatsIfDue(LiGetMicroseconds());
-
     uint64_t waitUs = m_LastPresentAlignmentWaitUs;
     m_LastPresentAlignmentWaitUs = 0;
 
@@ -217,9 +183,8 @@ bool VrrPresenter::prepareToPresent()
     m_PresentAlignBudgetUs = 0;
     bool vsyncLatch = m_PresentVsyncLatch;
     m_PresentVsyncLatch = false;
-    bool nearBuffered = m_PresentNearBuffered;
     m_LastPresentLatched = vsyncLatch;
-    m_LastPresentBuffered = nearBuffered && !vsyncLatch;
+    m_LastPresentBuffered = m_PresentNearBuffered && !vsyncLatch;
     m_PresentNearBuffered = false;
     bool catchUpPresent = m_PresentCatchUp;
     m_PresentCatchUp = false;
@@ -231,24 +196,11 @@ bool VrrPresenter::prepareToPresent()
         // flip-following, so the re-anchor must start re-armed.
         m_AlignInstantStreak = 0;
         m_AlignVsyncLatches++;
+        logAlignStatsIfDue(LiGetMicroseconds());
     }
     else {
-        // When true VRR has real headroom, an isolated on-time blank miss is
-        // cheaper to latch once than to emit a visible tear and lose raster
-        // lock. Do not rescue late/catch-up or near-ceiling presents: latching
-        // those would turn overload into repeated fixed-vsync judder. The
-        // pacer's tear-rate fallback handles a chronic near-ceiling failure.
-        uint64_t rescueLateLimitUs = m_ScanoutPeriodUs != 0 ?
-            m_ScanoutPeriodUs * 30 / 1000 : 250;
-        bool rescueOnMiss = !nearBuffered && !catchUpPresent &&
-            latePastTargetUs <= rescueLateLimitUs;
-        bool aligned = waitForVBlankBeforeTearingPresent(
-            alignBudgetUs, latePastTargetUs, catchUpPresent, rescueOnMiss);
-        if (!aligned && rescueOnMiss) {
-            vsyncLatch = true;
-            m_LastPresentLatched = true;
-            m_LastPresentBuffered = false;
-        }
+        waitForVBlankBeforeTearingPresent(alignBudgetUs, latePastTargetUs,
+                                          catchUpPresent);
     }
 
     return vsyncLatch;
@@ -300,16 +252,10 @@ uint64_t VrrPresenter::holdUntilPresentTarget()
     }
 
     m_LastPresentAlignmentWaitUs += nowUs - startUs;
-    // A high-resolution sleep can still wake late under load. Report that
-    // overshoot so rescue gating and tear forensics don't label a late frame
-    // as an on-time blank miss.
-    return nowUs > targetUs ? nowUs - targetUs : 0;
+    return 0;
 }
 
-bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
-                                                     uint64_t latePastTargetUs,
-                                                     bool catchUpPresent,
-                                                     bool rescueOnMiss)
+void VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs, uint64_t latePastTargetUs, bool catchUpPresent)
 {
 #ifdef Q_OS_WIN32
     // VRR only changes how long the panel is willing to extend its blanking
@@ -330,7 +276,7 @@ bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
     // unlike WaitForVBlank, it's a plain non-blocking query, so we can poll it
     // in a tightly bounded loop instead of risking an open-ended block.
     if (!m_KmtAdapterValid || qEnvironmentVariableIntValue("MOONLIGHT_DISABLE_SCANLINE_ALIGN")) {
-        return true;
+        return;
     }
 
     // The wait bound is the pacer's per-present budget, sized from the
@@ -371,15 +317,10 @@ bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
     const bool classicPresent =
         qEnvironmentVariableIntValue("MOONLIGHT_VRR_CLASSIC_PRESENT") != 0;
     bool reachedBlank = false;
-    bool queryFailed = false;
     bool spunOut = false;
     uint32_t entryScanPct = 255;
     for (;;) {
-        if (D3DKMTGetScanLine(&getScanLine) != 0 /* STATUS_SUCCESS */) {
-            queryFailed = true;
-            break;
-        }
-        if (getScanLine.InVerticalBlank) {
+        if (D3DKMTGetScanLine(&getScanLine) != 0 /* STATUS_SUCCESS */ || getScanLine.InVerticalBlank) {
             reachedBlank = true;
             break;
         }
@@ -449,26 +390,15 @@ bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
     // since the wide budget is only spent when a chase is needed.
     uint64_t instantHitUs = m_ScanoutPeriodUs != 0 ?
         m_ScanoutPeriodUs * 60 / 1000 : 500;  // 500us on the reference panel
-    if (queryFailed || !reachedBlank || waitedUs > instantHitUs) {
+    if (!reachedBlank || waitedUs > instantHitUs) {
         m_AlignInstantStreak = 0;
     }
     else if (m_AlignInstantStreak < ALIGN_LOCK_STREAK) {
         m_AlignInstantStreak++;
     }
 
-    if (queryFailed) {
-        // Unknown is not an in-blank hit and not proof of a visible tear.
-        // Keep raster lock uncertain, but do not turn a telemetry outage into
-        // recurring fixed-vsync latency by treating it as a proven miss.
-        m_AlignQueryFailures++;
-    }
-    else if (reachedBlank) {
+    if (reachedBlank) {
         m_AlignHits++;
-    }
-    else if (rescueOnMiss) {
-        // This present will go out without ALLOW_TEARING and latch at the
-        // next vblank. It is a measured avoided tear, not a tear sample.
-        m_AlignRescueLatches++;
     }
     else {
         // Tear-position-aware count for the pacer's tear-rate probe: a
@@ -481,7 +411,7 @@ bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
         uint32_t exitScanPct = m_ActiveScanLines != 0 ?
             (uint32_t)((uint64_t)getScanLine.ScanLine * 100 / m_ActiveScanLines) :
             50;
-        if (exitScanPct >= 6 && exitScanPct <= 95) {
+        if (exitScanPct >= 6 && exitScanPct <= 90) {
             m_MidScanSinceQuery++;
         }
 
@@ -501,14 +431,8 @@ bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
         // still find the beam mid-scan).
         TearForensicSample& s = m_TearForensics[m_TearForensicHead];
         s.lateUs = (uint32_t)qMin(latePastTargetUs, (uint64_t)9999999);
-        // Include this alignment wait in the flip-to-flip gap. startUs is
-        // alignment entry, while the actual Present() follows this function;
-        // omitting waitedUs made wide re-anchors look artificially compressed
-        // in the forensic output.
-        uint64_t presentReadyUs = startUs + waitedUs;
-        s.gapUs = (m_LastPresentUs != 0 && presentReadyUs > m_LastPresentUs) ?
-            (uint32_t)qMin(presentReadyUs - m_LastPresentUs,
-                           (uint64_t)9999999) : 0;
+        s.gapUs = (m_LastPresentUs != 0 && startUs > m_LastPresentUs) ?
+            (uint32_t)qMin(startUs - m_LastPresentUs, (uint64_t)9999999) : 0;
         s.entryScanPct = entryScanPct;
         s.budgetUs = (uint32_t)maxWaitUs;
         s.catchUp = catchUpPresent;
@@ -521,42 +445,30 @@ bool VrrPresenter::waitForVBlankBeforeTearingPresent(uint64_t alignBudgetUs,
     m_AlignWaitTotalUs += waitedUs;
     m_AlignBudgetTotalUs += maxWaitUs;
 
-    return reachedBlank || queryFailed;
+    logAlignStatsIfDue(startUs + waitedUs);
 #else
     Q_UNUSED(alignBudgetUs);
     Q_UNUSED(latePastTargetUs);
     Q_UNUSED(catchUpPresent);
-    Q_UNUSED(rescueOnMiss);
-    return true;
 #endif
 }
 
 void VrrPresenter::logAlignStatsIfDue(uint64_t nowUs)
 {
-    uint32_t samples = m_AlignHits + m_AlignGiveUps + m_AlignSkips +
-        m_AlignQueryFailures + m_AlignVsyncLatches + m_AlignRescueLatches;
-    if (samples == 0) {
-        return;
-    }
-
     if (m_AlignStatsStartUs == 0) {
         m_AlignStatsStartUs = nowUs;
     }
     else if (nowUs - m_AlignStatsStartUs >= 10000000) {
-        uint32_t midScanPresents = m_AlignGiveUps + m_AlignSkips;
-        uint32_t attempted = m_AlignHits + midScanPresents +
-            m_AlignRescueLatches;
-        uint32_t total = attempted + m_AlignQueryFailures;
+        uint32_t attempted = m_AlignHits + m_AlignGiveUps;
+        uint32_t total = attempted + m_AlignSkips;
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "VRR scanline align: %u in-blank, %u mid-scan presents (%.1f%%), %u misses rescued tear-free, avg wait %.2f ms, avg budget %.2f ms, %u low-budget misses, %u scanline-query failures, %u policy-latched",
+                    "VRR scanline align: %u in-blank, %u mid-scan tears (%.1f%%), avg wait %.2f ms, avg budget %.2f ms, %u skipped-late, %u vsync-latched",
                     m_AlignHits,
-                    midScanPresents,
-                    attempted != 0 ? midScanPresents * 100.0 / attempted : 0.0,
-                    m_AlignRescueLatches,
-                    total != 0 ? (m_AlignWaitTotalUs / 1000.0) / total : 0.0,
+                    m_AlignGiveUps,
+                    attempted != 0 ? m_AlignGiveUps * 100.0 / attempted : 0.0,
+                    attempted != 0 ? (m_AlignWaitTotalUs / 1000.0) / attempted : 0.0,
                     total != 0 ? (m_AlignBudgetTotalUs / 1000.0) / total : 0.0,
                     m_AlignSkips,
-                    m_AlignQueryFailures,
                     m_AlignVsyncLatches);
 
         // Per-tear attribution for the window's mid-scan presents. Sample
@@ -597,9 +509,7 @@ void VrrPresenter::logAlignStatsIfDue(uint64_t nowUs)
         m_AlignHits = 0;
         m_AlignGiveUps = 0;
         m_AlignSkips = 0;
-        m_AlignQueryFailures = 0;
         m_AlignVsyncLatches = 0;
-        m_AlignRescueLatches = 0;
         m_AlignWaitTotalUs = 0;
         m_AlignBudgetTotalUs = 0;
         m_AlignStatsStartUs = nowUs;
