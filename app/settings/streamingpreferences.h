@@ -60,6 +60,13 @@ public:
     };
     Q_ENUM(UIDisplayMode)
 
+    enum UIMode
+    {
+        UI_CLASSIC,
+        UI_TV
+    };
+    Q_ENUM(UIMode)
+
     // New entries must go at the end of the enum
     // to avoid renumbering existing entries (which
     // would affect existing user preferences).
@@ -141,6 +148,7 @@ public:
     Q_PROPERTY(WindowMode windowMode MEMBER windowMode NOTIFY windowModeChanged)
     Q_PROPERTY(WindowMode recommendedFullScreenMode MEMBER recommendedFullScreenMode CONSTANT)
     Q_PROPERTY(UIDisplayMode uiDisplayMode MEMBER uiDisplayMode NOTIFY uiDisplayModeChanged)
+    Q_PROPERTY(UIMode uiMode MEMBER uiMode NOTIFY uiModeChanged)
     Q_PROPERTY(bool swapMouseButtons MEMBER swapMouseButtons NOTIFY mouseButtonsChanged)
     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
     Q_PROPERTY(bool backgroundGamepad MEMBER backgroundGamepad NOTIFY backgroundGamepadChanged)
@@ -193,6 +201,7 @@ public:
     WindowMode windowMode;
     WindowMode recommendedFullScreenMode;
     UIDisplayMode uiDisplayMode;
+    UIMode uiMode;
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
 
@@ -216,6 +225,7 @@ signals:
     void enableYUV444Changed();
     void videoDecoderSelectionChanged();
     void uiDisplayModeChanged();
+    void uiModeChanged();
     void windowModeChanged();
     void framePacingChanged();
     void enableVrrChanged();

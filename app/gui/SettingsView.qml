@@ -1464,6 +1464,49 @@ Flickable {
                     }
                 }
 
+                Label {
+                    width: parent.width
+                    id: uiModeTitle
+                    text: qsTr("User interface mode")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                }
+
+                AutoResizingComboBox {
+                    Component.onCompleted: {
+                        var savedUIMode = StreamingPreferences.uiMode
+                        currentIndex = 0
+                        for (var i = 0; i < uiModeListModel.count; i++) {
+                            var listUiMode = uiModeListModel.get(i).val;
+                            if (savedUIMode === listUiMode) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+
+                        activated(currentIndex)
+                    }
+
+                    id: uiModeComboBox
+                    textRole: "text"
+                    model: ListModel {
+                        id: uiModeListModel
+                        ListElement {
+                            text: qsTr("Classic")
+                            val: StreamingPreferences.UI_CLASSIC
+                        }
+                        ListElement {
+                            text: qsTr("TV Mode")
+                            val: StreamingPreferences.UI_TV
+                        }
+                    }
+
+                    // ::onActivated must be used, as it only listens for when the index is changed by a human
+                    onActivated : {
+                        StreamingPreferences.uiMode = uiModeListModel.get(currentIndex).val
+                    }
+                }
+
                 CheckBox {
                     id: connectionWarningsCheck
                     width: parent.width

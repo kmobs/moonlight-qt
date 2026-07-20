@@ -18,6 +18,14 @@ ApplicationWindow {
     // a retranslate() because AppView breaks for some reason.
     property bool clearOnBack: false
 
+    function isTvMode() {
+        return StreamingPreferences.uiMode === StreamingPreferences.UI_TV
+    }
+
+    function isTvModeView(item) {
+        return item && item.tvModeView === true
+    }
+
     id: window
     width: 1280
     height: 600
@@ -111,6 +119,40 @@ ApplicationWindow {
         anchors.fill: parent
         focus: true
 
+        pushEnter: Transition {
+            NumberAnimation {
+                property: "opacity"
+                from: window.isTvMode() ? 0.0 : 1.0
+                to: 1.0
+                duration: window.isTvMode() ? 240 : 0
+                easing.type: Easing.OutCubic
+            }
+            NumberAnimation {
+                property: "scale"
+                from: window.isTvMode() ? 0.975 : 1.0
+                to: 1.0
+                duration: window.isTvMode() ? 240 : 0
+                easing.type: Easing.OutCubic
+            }
+        }
+
+        popExit: Transition {
+            NumberAnimation {
+                property: "opacity"
+                from: 1.0
+                to: window.isTvMode() ? 0.0 : 1.0
+                duration: window.isTvMode() ? 170 : 0
+                easing.type: Easing.InCubic
+            }
+            NumberAnimation {
+                property: "scale"
+                from: 1.0
+                to: window.isTvMode() ? 1.015 : 1.0
+                duration: window.isTvMode() ? 170 : 0
+                easing.type: Easing.InCubic
+            }
+        }
+
         Component.onCompleted: {
             // Perform our early initialization before constructing
             // the initial view and pushing it to the StackView
@@ -144,14 +186,24 @@ ApplicationWindow {
         }
 
         Keys.onMenuPressed: {
-            settingsButton.clicked()
+            if (window.isTvModeView(currentItem) && currentItem.toggleTvOverlay) {
+                currentItem.toggleTvOverlay()
+            }
+            else {
+                settingsButton.clicked()
+            }
         }
 
         // This is a keypress we've reserved for letting the
         // SdlGamepadKeyNavigation object tell us to show settings
         // when Menu is consumed by a focused control.
         Keys.onHangupPressed: {
-            settingsButton.clicked()
+            if (window.isTvModeView(currentItem) && currentItem.toggleTvOverlay) {
+                currentItem.toggleTvOverlay()
+            }
+            else {
+                settingsButton.clicked()
+            }
         }
     }
 
@@ -236,6 +288,7 @@ ApplicationWindow {
     header: ToolBar {
         id: toolBar
         height: 60
+        visible: !window.isTvModeView(stackView.currentItem)
         anchors.topMargin: 5
         anchors.bottomMargin: 5
 
