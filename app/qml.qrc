@@ -21,6 +21,7 @@
         <file>gui/CliPair.qml</file>
         <file>gui/TVTheme.qml</file>
         <file>gui/TVTopOverlay.qml</file>
+        <file>gui/TVHintBar.qml</file>
         <file>gui/TVPcView.qml</file>
         <file>gui/TVAppView.qml</file>
     </qresource>

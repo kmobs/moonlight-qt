@@ -16,8 +16,8 @@ CenteredGridView {
     id: pcGrid
     focus: true
     activeFocusOnTab: true
-    topMargin: 120
-    bottomMargin: 30
+    topMargin: 220
+    bottomMargin: 110
     cellWidth: 520
     cellHeight: 290
     objectName: qsTr("TV Hosts")
@@ -102,21 +102,57 @@ CenteredGridView {
         color: tvTheme.heroOverlay
     }
 
-    Column {
+    Rectangle {
         x: 42
-        y: 28
-        spacing: 6
+        y: 98
+        width: parent.width - 84
+        height: 96
+        radius: 18
+        color: "#1D2C42"
+        border.width: 1
+        border.color: "#4E6A88"
 
-        Label {
-            text: qsTr("Choose a Host")
-            font.pointSize: 30
-            font.bold: true
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: 17
+            color: "#223450"
+            opacity: 0.95
         }
 
-        Label {
-            text: qsTr("Select your gaming PC to open its app library")
-            color: tvTheme.mutedText
-            font.pointSize: 13
+        Image {
+            anchors.left: parent.left
+            anchors.leftMargin: 20
+            anchors.verticalCenter: parent.verticalCenter
+            source: "qrc:/res/desktop_windows-48px.svg"
+            sourceSize.width: 60
+            sourceSize.height: 60
+            opacity: 0.95
+        }
+
+        Column {
+            anchors.left: parent.left
+            anchors.leftMargin: 96
+            anchors.right: parent.right
+            anchors.rightMargin: 20
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 4
+
+            Label {
+                text: qsTr("Choose a Host")
+                font.pointSize: 26
+                font.bold: true
+                elide: Text.ElideRight
+                width: parent.width
+            }
+
+            Label {
+                text: qsTr("Select your gaming PC to open its library and launch with the controller.")
+                color: tvTheme.mutedText
+                font.pointSize: 13
+                elide: Text.ElideRight
+                width: parent.width
+            }
         }
     }
 
@@ -169,6 +205,19 @@ CenteredGridView {
             wrapMode: Text.Wrap
             width: Math.min(parent.parent.width * 0.7, 940)
         }
+    }
+
+    TVHintBar {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: 42
+        anchors.rightMargin: 42
+        anchors.bottomMargin: 18
+        primaryLabel: qsTr("Connect")
+        secondaryLabel: qsTr("Back")
+        tertiaryLabel: qsTr("Add PC")
+        menuLabel: qsTr("Settings")
     }
 
     model: computerModel

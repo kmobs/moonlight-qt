@@ -18,8 +18,8 @@ CenteredGridView {
     id: appGrid
     focus: true
     activeFocusOnTab: true
-    topMargin: 190
-    bottomMargin: 36
+    topMargin: 270
+    bottomMargin: 110
     cellWidth: 380
     cellHeight: 440
     objectName: qsTr("Library")
@@ -105,23 +105,78 @@ CenteredGridView {
         }
     }
 
-    Column {
+    Rectangle {
         x: 42
-        y: 26
-        spacing: 6
+        y: 94
+        width: parent.width - 84
+        height: 154
+        radius: 20
+        color: "#19263B"
+        border.width: 1
+        border.color: "#4E6A88"
 
-        Label {
-            text: appGrid.currentItem && appGrid.currentItem.appName ? appGrid.currentItem.appName : qsTr("Your Games")
-            font.pointSize: 32
-            font.bold: true
-            width: Math.min(appGrid.width - 84, 900)
-            elide: Text.ElideRight
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: 19
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: "#1B2B44" }
+                GradientStop { position: 1.0; color: "#0E1728" }
+            }
         }
 
-        Label {
-            text: qsTr("Browse with your controller and press A to launch")
-            color: tvTheme.mutedText
-            font.pointSize: 13
+        Image {
+            id: heroArt
+            anchors.left: parent.left
+            anchors.leftMargin: 18
+            anchors.verticalCenter: parent.verticalCenter
+            width: 95
+            height: 126
+            source: heroSource
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            opacity: 0.95
+        }
+
+        Rectangle {
+            anchors.left: heroArt.right
+            anchors.leftMargin: 18
+            anchors.top: parent.top
+            anchors.topMargin: 18
+            anchors.right: parent.right
+            anchors.rightMargin: 18
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 18
+            color: "transparent"
+
+            Column {
+                anchors.fill: parent
+                spacing: 8
+
+                Label {
+                    text: appGrid.currentItem && appGrid.currentItem.appName ? appGrid.currentItem.appName : qsTr("Your Games")
+                    font.pointSize: 28
+                    font.bold: true
+                    width: parent.width
+                    elide: Text.ElideRight
+                }
+
+                Label {
+                    text: appGrid.count > 0 ? qsTr("%1 games available on this host").arg(appGrid.count) : qsTr("No apps are available on this host")
+                    color: tvTheme.mutedText
+                    font.pointSize: 13
+                    width: parent.width
+                    elide: Text.ElideRight
+                }
+
+                Label {
+                    text: qsTr("Use the D-pad to browse, A to launch, and Menu for overlay actions.")
+                    color: "#D8E3F5"
+                    font.pointSize: 12
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                }
+            }
         }
     }
 
@@ -145,6 +200,19 @@ CenteredGridView {
         onHelpRequested: {
             Qt.openUrlExternally("https://github.com/moonlight-stream/moonlight-docs/wiki/Setup-Guide")
         }
+    }
+
+    TVHintBar {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: 42
+        anchors.rightMargin: 42
+        anchors.bottomMargin: 18
+        primaryLabel: qsTr("Launch")
+        secondaryLabel: qsTr("Back")
+        tertiaryLabel: qsTr("Details")
+        menuLabel: qsTr("Settings")
     }
 
     model: appModel

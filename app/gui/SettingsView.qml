@@ -37,6 +37,15 @@ Flickable {
         return false
     }
 
+    function switchUiMode() {
+        var targetView = StreamingPreferences.uiMode === StreamingPreferences.UI_TV ? "qrc:/gui/TVPcView.qml"
+                                                                                    : "qrc:/gui/PcView.qml"
+
+        stackView.pop(null)
+        var component = Qt.createComponent(targetView)
+        stackView.replace(stackView.currentItem, component.createObject(stackView), StackView.Immediate)
+    }
+
     NumberAnimation on contentY {
         id: autoScrollAnimation
         duration: 100
@@ -1483,8 +1492,6 @@ Flickable {
                                 break
                             }
                         }
-
-                        activated(currentIndex)
                     }
 
                     id: uiModeComboBox
@@ -1504,6 +1511,7 @@ Flickable {
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
                         StreamingPreferences.uiMode = uiModeListModel.get(currentIndex).val
+                        switchUiMode()
                     }
                 }
 
