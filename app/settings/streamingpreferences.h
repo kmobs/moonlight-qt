@@ -254,4 +254,3 @@ private:
 
     QQmlEngine* m_QmlEngine;
 };
-

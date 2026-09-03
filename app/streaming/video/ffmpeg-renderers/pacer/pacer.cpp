@@ -305,6 +305,9 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
+        // There is one VRR queue policy. The flag remains in the session
+        // config only so older captures replay under the policy they ran.
+        config.allowAdditionalQueuedFrame = false;
 
         if (!enableVsync) {
             fallbackReason = VrrFallbackReason::IneffectiveVsync;
@@ -339,7 +342,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream",
+                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout)",
                                     m_DisplayFps, m_MaxVideoFps);
                         return true;
                     }

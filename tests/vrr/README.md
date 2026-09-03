@@ -25,12 +25,17 @@ learning for every integer rate from 30 through 116 FPS on a 120 Hz-quantized
 capture clock, a continuous one-FPS-per-second sweep in both directions,
 isolated hitch rejection, rapid 30 FPS cutscene transitions, high-rate
 recovery, and smooth projected targets from mixed 8.33/16.67 ms timestamp
-intervals.
+intervals in the explicit smoothness mode. It also verifies that low-latency
+mode counts only p99-minus-p50 render-tail insurance and readiness against a
+half-scanout budget, while stable render work remains outside that ceiling.
 
 `tst_vrrpacingworker` supplies a fake frame presenter and a test-owned
 `LiGetMicroseconds()` epoch. It verifies the bounded worker queue,
 drop accounting, minimize/restore discard and fresh-frame behavior, deferred
 AVFrame lifetime, presenter eligibility rejection, display-period spacing,
+two-source-period low-latency staleness and the opt-in additional smoothness
+period, including regression coverage that ordinary one-period worker
+occupancy does not manufacture a content drop,
 native submission timing across pre-submit work and blocking
 returns, clean-close trace accounting, explicit window-state rebase
 provenance, and the minimal prepare/present/cancel contract. D3D11 completes
@@ -75,6 +80,7 @@ controller parameter set, controller call duration and learned-model state,
 stale-check age, render/target wait boundaries, both spacing-floor checks,
 correction-wait boundaries, explicit worker-requested rebase cause, and
 terminal time. Header-resolved schema-5 extensions also record the native
+queue policy, render baseline, render-tail insurance, pacing-latency budget,
 presentation backend/result, signed `GetLastPresentCount()` and
 `GetFrameStatistics()` results, the exact DXGI Present sync interval/flags,
 the renderer's VRR eligibility snapshot, desktop monitor count, the startup
@@ -90,6 +96,11 @@ before-state, native-call, and GPU-ready observations remain opt-in because
 they can perturb the renderer; the essential post-Present submission/latch
 queries are collected in both modes, while their extra timing brackets remain
 deep-only.
+
+New captures use `controller.pacing_latency_budget_divisor=2`. A value of zero
+is a replay-only compatibility mode that disables the baseline/tail ceiling;
+older schema-5 headers missing this field resolve to zero and keep their
+captured absolute render-lead ceiling. Production defaults never select zero.
 
 `MOONLIGHT_VRR_ALIGN=1` adds observation-only Windows raster sampling to a
 deep trace. It opens the GDI display's D3DKMT source once per display epoch and
@@ -580,7 +591,7 @@ silently joining observations from two display timelines. An explicit external
 rebase starts a new epoch, discards its ambiguous cached before-state anchor,
 and begins again with post-Present evidence.
 The readiness gate compares all numeric and boolean decision fields
-and all schema-5 learned-state counters after every `decision_valid` worker
+and all schema-5 learned-state values and counters after every `decision_valid` worker
 row. Producer-side queue/suspension terminal rows
 carry zero controller diagnostics so tracing never reads worker-owned learned
 state concurrently.
@@ -636,9 +647,53 @@ timeline for that display; controller/cadence results remain available:
 .\vrr\release\vrrreplay.exe capture.vrrtrace --display-hz 120 --stream-fps 116
 ```
 
+There is one VRR queue policy. It is a jitter buffer anchored to the sender
+timestamps (`controller.timestamp_playout_enabled`): every frame targets its
+RTP time mapped into the local clock plus a playout delay plus the render
+lead. The delay is self-calibrated per source-rate band
+(`controller.playout_delay_adaptive`): each band, the fitted source rate
+divided by `playout_band_width_hz`, keeps a reservoir of frame lateness
+against the mapped sender clock, excluding pairs that span a host stall, and
+targets the `playout_delay_percentile_per_mille` lateness (p99.9) plus
+`playout_delay_margin_us`. A band starts at `playout_delay_start_us` (6 ms),
+rises at most `playout_delay_attack_us` per frame, releases at most
+`playout_delay_release_us` per frame and only after
+`playout_delay_release_samples`, and is clamped between 1 and 8 ms. The former
+"smoothness" option, one extra source interval of queue age and one extra
+source period of render-lead budget, was retired: on a render-bound client it
+deepened the standing backlog and saturated the worker without reducing
+hitches. Captures made under it still replay with that budget through
+`additional_queued_frame` and `pacing_latency_queue_mode_extra`, which the
+production policy sets to zero. A band unused for `playout_band_stale_us` re-converges from the
+start value; a cadence change therefore starts high at the discontinuity
+where nobody can see the step. The lateness statistic does not depend on the
+delay chosen, so there is no feedback loop. With `playout_delay_adaptive`
+off, `controller.source_playout_delay_us` is the fixed delay. The applied
+delay is recorded per frame as `playout_delay_us`. The mapping offset is the windowed minimum of
+decode-complete minus RTP time (`playout_offset_window_us`), slewed at most
+`playout_offset_slew_us` per frame so clock drift is followed without moving
+one frame relative to its neighbours. No learned readiness reserve is applied
+or reported, and a late or early frame never re-anchors the clock: a frame
+later than the delay clamps to "now" and the next frame returns to its own
+slot. All resolved values are captured in schema 5, so exact replay and
+candidate sweeps use the production policy without inferring it from the
+queue-mode flag. Note that a `--set` or config scenario is treated as
+customized and does not inherit the session policy: a smoothness sweep must
+set `controller.timestamp_playout_enabled=1` explicitly alongside the delay.
+The adaptive readiness parameters remain available for replaying older
+captures and for explicit experiments.
+
 The replay is intentionally a fixed-recorded-admission model: it preserves the
 session's actual queue admission/drop and presentation lifecycle while using
-the real arrival timestamps and exogenous renderer costs. This makes
+the real arrival timestamps and exogenous renderer costs. One lifecycle instant
+is re-derived rather than copied: the candidate's decision time follows the
+worker-occupancy model (`decision_time_model`), which places it at the
+simulated previous submission plus the recorded post-submission gap whenever
+the recorded worker was still busy when the frame arrived, and at the recorded
+instant otherwise. Copying the recorded instant verbatim clamped every
+candidate that presented earlier than the recording to a stale "now" and
+manufactured spacing errors that the live worker would not produce. The
+unchanged reference policy still reproduces the recorded instant exactly. This makes
 timing-policy A/B results deterministic and permits an exact unchanged-policy
 baseline. A controller change that also changes decoder backpressure, queue
 admission, present-mode cost, or host/network latency still needs a live
@@ -697,15 +752,52 @@ duration, but
 the flag is the operator's assertion that the complete model is calibrated;
 it cannot turn an assumption into a measurement.
 
-The latch protection window is also display-rate-scaled. The
-`controller.latch_enter_headroom_period_*` numerator/denominator pairs define
-the entry window in physical display periods, and the corresponding
-`latch_exit_*` pair defines its hysteresis. The absolute
-`latch_*_headroom_us` values remain minimum floors. Current defaults protect
-cadences with less than three display periods of spare headroom and exit at
-3.25 periods, so the same policy boundary scales across 60, 120, 144, and
-165 Hz instead of naming stream FPS values. Older schema-5 traces that predate
-these columns replay with the captured absolute-only semantics.
+The latch protection window defaults to a narrow absolute-headroom policy:
+enter below 225 us and exit at 400 us. Headroom already excludes one physical
+display period and the controller's learned spacing guard. At 120 Hz, 115 FPS
+starts adaptive with roughly 263 us of headroom while the proven near-ceiling
+116 FPS path remains latched at roughly 188 us. The wider exit threshold keeps
+small cadence or guard fluctuations from bouncing a borderline stream between
+the two modes.
+
+At 120 Hz, the former three-period default latched the useful 30--116 FPS
+range. With the narrow absolute default, 30 through 115 FPS initially take the
+adaptive path; only the near-ceiling 116 FPS recommendation remains latched.
+The same correction applies across display refresh rates rather than being a
+special case for any one stream rate.
+
+Production requires the full exit threshold after entering latch. The
+`controller.latch_base_guard_exit` compatibility parameter restores the older
+behavior of exiting at the entry threshold as soon as the learned guard reaches
+its base value. It defaults to zero in production and is supplied as one when
+replaying an older schema-5 trace that lacks the field. Schema-3/4 replay also
+restores the historical 1.5 ms entry, 2 ms exit, zero period ratios, and
+base-guard exit behavior explicitly because those traces contain no resolved
+controller parameters.
+
+The `controller.latch_enter_headroom_period_*` numerator/denominator pairs and
+the corresponding `latch_exit_*` pair remain available for replay experiments
+and exact reproduction of captures made with display-scaled protection. Their
+production numerators are zero, so the absolute `latch_*_headroom_us` values
+set the live boundary. Older schema-5 traces that predate the period columns
+replay with their original absolute-only semantics, while traces containing
+non-zero period ratios retain those captured ratios.
+
+The fixed microsecond thresholds are intentionally a bounded first correction.
+A future policy should derive them from measured scheduler wake error,
+present-ready uncertainty, and native presentation/scanout evidence so latch
+selection reflects whether the current system can reliably use its available
+headroom.
+
+Adaptive presentation also requires a coherent source phase. After startup,
+a cadence-rate change, or a source-phase discontinuity, production uses the
+latched path until `controller.cadence_stability_latch_frames` consecutive
+clean cadence observations have completed (64 by default). This prevents a
+source hitch followed by a decoder burst from placing multiple immediate
+presents into one physical scanout interval. Stable sources with sufficient
+headroom return to adaptive presentation after the recovery window. Older
+schema-5 captures that lack this parameter replay it as zero so their original
+presentation decisions remain exact.
 
 `display.present_transport_us` is also the deterministic phase-sweep control.
 Sweep it from zero through one scanout period to test whether a candidate
@@ -832,6 +924,67 @@ Use `replay-scenarios.example.json` as the batch format. Top-level parameters
 are inherited by each named scenario, scenario parameters override them, and
 CLI `--set` values have final precedence. Assertions use dotted result paths
 and `<`, `<=`, `==`, `>=`, or `>`; a failed assertion exits with code 4.
+Batch scenarios run concurrently because each scenario is independent. The
+automatic limit is the available logical-processor count, capped at sixteen;
+use `--jobs N` to select an explicit limit or `--jobs 1` to force serial
+execution. Results remain in configuration order regardless of completion
+order, and the batch summary records `parallel_jobs` and `elapsed_ms`.
+Distribution summaries include p99.5, p99.9, and p99.95 in addition to the
+standard p50/p90/p95/p99 values, so extreme-tail sweeps do not require a large
+per-frame timeline.
+
+Every summary also carries sender-spacing cadence: each consecutive pair of
+presented frames is compared against the sender's own RTP spacing, excluding
+pairs whose sender or arrival interval exceeds 25 ms, and a pair presented more
+than 2 ms wider than the sender spacing is a hitch attributed to late arrival
+(ready offset above the playout delay), a render-lead jump, the display floor,
+or other. The same metric is computed for the recorded session
+(`original_sender_*`, `observed.sender_cadence`), the candidate
+(`replay_sender_*`, `simulation.sender_cadence`), and a stock-style
+present-on-render emulation built from decode completion plus the recorded
+prepare and present durations (`stock_sender_*`). Because the replay's own
+band residual measures each policy against its own source clock, use the
+sender-spacing fields to compare policies with different clock models.
+
+The sender-spacing fields score fidelity to the host's stamps, which is not
+the same as smoothness: host presentation stamps jitter frame to frame (about
++-2 ms at 1440p and +-5 ms at 4K on the reference rig) even for a game at a
+steady rate, so a policy that copies them exactly scores near zero there
+while showing that jitter on the panel. The `*_presented_jerk_*` fields
+(`presented_jerk_us` distribution, `presented_jerk_over_2ms_per_mille`) score
+the evenness of what was shown: the change in presented interval from one
+pair to the next, over the same stall-excluded pairs. That is the quantity
+the viewer perceives as stutter and the one to optimize; the sender-spacing
+fields remain the check that the policy is not drifting away from the
+source. `scripts\vrr-sweep-table.ps1` prints both.
+
+The production policy smooths the cadence
+(`controller.playout_smoothing_gain_per_mille`, 150): each target advances
+from the previous presented slot by a tracked source period (an EMA with
+`playout_smoothing_period_alpha_per_mille`, re-seeded from the cumulative
+rate fit when they disagree by a quarter) and pulls toward the frame's raw
+mapped slot by the gain, so a 5 ms stamp excursion moves the slot 0.75 ms.
+The lag behind the raw slot is capped at `playout_smoothing_max_lag_us`
+(8 ms); a rebase, material rate change, phase discontinuity, host stall or
+burst, or an error over `playout_smoothing_snap_per_mille` of a period snaps
+back to the raw slot. The calibrator sees lateness against the smoothed slot
+so the delay pays for the schedule running ahead of a late stamp. Gain 0
+disables it; `tests\vrr\configs\playout-smoothing-sweep.json` sweeps gain,
+period alpha, lag cap and delay maximum. On the 2026-09-01 captures it cut
+presented pairs with over 2 ms of jerk from 15 to 28 percent down to 1.3 to
+1.8 percent (5 percent on the host-stall capture) for 0.6 to 2.3 ms more
+median decode-to-submission latency and 2.6 to 4.8 ms more at p95.
+`replay_worker_saturated` is set when the worker-occupancy decision model
+shifts the median decision by more than a source period: the candidate keeps
+the single worker busier than the source cadence, the live worker would shed
+frames through its stale check, and this fixed-admission replay lets latency
+run away instead, so treat that scenario's numbers as invalid. The playout
+delay sweeps are `tests\vrr\configs\playout-delay-sweep-lowlatency.json`
+(the production budget) and `playout-delay-sweep-smoothness.json` (the retired
+extra render-lead budget, which saturates render-bound captures);
+`mode-compare.json` pits the two retired mode policies against the single
+production policy. Run one with `--config ... --jobs 0 --output sweep.json`
+and print the table with `scripts\vrr-sweep-table.ps1 sweep.json`.
 
 `mode: fixed` preserves recorded admission and lifecycle for rigorous A/B
 controller comparisons. `mode: worker` requires schema 5 and audits recorded

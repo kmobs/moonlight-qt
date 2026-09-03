@@ -312,6 +312,7 @@ void FFmpegVideoDecoder::reset()
 
     m_FramesIn = m_FramesOut = 0;
     m_FrameInfoQueue.clear();
+    m_FrameSubmitTimeQueue.clear();
 
     if (m_Pacer != nullptr) {
         // Pacer owns all producer threads. Stop them first so this final
@@ -1167,54 +1168,27 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||
             stats.vrrPresentCancelledFrames != 0) {
-        const auto percentOfEligible = [&stats](uint64_t count) {
-            return stats.vrrEligibleFrames == 0 ? 0.0 :
-                static_cast<double>(count) * 100.0 /
-                static_cast<double>(stats.vrrEligibleFrames);
-        };
-        char sampleAge[64];
-        if (stats.vrrStateSequence == 0) {
-            snprintf(sampleAge, sizeof(sampleAge), "N/A");
+        if (stats.vrrEligibleFrames == 0) {
+            ret = snprintf(&output[offset],
+                           length - offset,
+                           "VRR pacing: %s (starting...)\n",
+                           stats.vrrTelemetryActive ? "Active" : "Inactive");
         }
         else {
-            const uint64_t nowUs = LiGetMicroseconds();
-            const uint64_t ageUs = nowUs >= stats.vrrStateSampleTimeUs ?
-                nowUs - stats.vrrStateSampleTimeUs : 0;
-            snprintf(sampleAge, sizeof(sampleAge), "%.2f ms, seq %llu",
-                     static_cast<double>(ageUs) / 1000.0,
-                     static_cast<unsigned long long>(stats.vrrStateSequence));
-        }
+            const uint64_t lateFrames = qMin(stats.vrrPrepareLateFrames,
+                                             stats.vrrEligibleFrames);
+            const double readyOnTimePercent =
+                static_cast<double>(stats.vrrEligibleFrames - lateFrames) *
+                100.0 / static_cast<double>(stats.vrrEligibleFrames);
 
-        ret = snprintf(&output[offset],
-                       length - offset,
-                       "VRR eligible: %llu; prepare late %.2f%% (%llu, late-prep magnitude p50/p95/p99 (up to 128 retained late frames): %.2f/%.2f/%.2f ms)\n"
-                       "VRR wait-entry late: %.2f%%; submit error p50/p95/p99/max (up to 128 retained successful presentations): %+.2f/%+.2f/%+.2f/%+.2f ms\n"
-                       "VRR failed/cancelled: %llu/%llu; drops/spacing: %llu/%llu\n"
-                       "VRR decision readiness/timing reserve/guard: %.2f/%.2f/%.2f ms (sample %s)\n"
-                       "VRR render lead/wake lead (render/target)/source: %.2f/%.2f/%.2f/%.2f ms\n",
-                       static_cast<unsigned long long>(stats.vrrEligibleFrames),
-                       percentOfEligible(stats.vrrPrepareLateFrames),
-                       static_cast<unsigned long long>(stats.vrrPrepareLateFrames),
-                       static_cast<double>(stats.vrrPrepareLatenessP50Us) / 1000.0,
-                       static_cast<double>(stats.vrrPrepareLatenessP95Us) / 1000.0,
-                       static_cast<double>(stats.vrrPrepareLatenessP99Us) / 1000.0,
-                       percentOfEligible(stats.vrrTargetWaitEntryLateFrames),
-                       static_cast<double>(stats.vrrSubmitErrorP50Us) / 1000.0,
-                       static_cast<double>(stats.vrrSubmitErrorP95Us) / 1000.0,
-                       static_cast<double>(stats.vrrSubmitErrorP99Us) / 1000.0,
-                       static_cast<double>(stats.vrrSubmitErrorMaxUs) / 1000.0,
-                       static_cast<unsigned long long>(stats.vrrPresentFailedFrames),
-                       static_cast<unsigned long long>(stats.vrrPresentCancelledFrames),
-                       static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
-                       static_cast<unsigned long long>(stats.vrrSpacingCorrections),
-                       static_cast<double>(stats.vrrReadinessBudgetUs) / 1000.0,
-                       static_cast<double>(stats.vrrTimingBudgetUs) / 1000.0,
-                       static_cast<double>(stats.vrrGuardUs) / 1000.0,
-                       sampleAge,
-                       static_cast<double>(stats.vrrRenderLeadUs) / 1000.0,
-                       static_cast<double>(stats.vrrRenderWakeLeadUs) / 1000.0,
-                       static_cast<double>(stats.vrrTargetWakeLeadUs) / 1000.0,
-                       static_cast<double>(stats.vrrSourcePeriodUs) / 1000.0);
+            ret = snprintf(&output[offset],
+                           length - offset,
+                           "VRR pacing: %s | Ready on time: %.1f%% | Dropped: %llu | Errors: %llu\n",
+                           stats.vrrTelemetryActive ? "Active" : "Inactive",
+                           readyOnTimePercent,
+                           static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
+                           static_cast<unsigned long long>(stats.vrrPresentFailedFrames));
+        }
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
@@ -2115,6 +2089,9 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     int frameNumber = -1;
                     uint32_t rtpTimestamp = 0;
                     bool timestampValid = false;
+                    uint64_t receiveUs = 0;
+                    uint64_t reassembledUs = 0;
+                    uint64_t decodeSubmitUs = 0;
 
                     if (vrrActive) {
                         // Capture timing while the matching DECODE_UNIT is
@@ -2128,6 +2105,14 @@ void FFmpegVideoDecoder::decoderThreadProc()
                             frameNumber = du.frameNumber;
                             rtpTimestamp = du.rtpTimestamp;
                             timestampValid = true;
+                            // First packet from the network and completed
+                            // reassembly, stamped by moonlight-common-c on
+                            // the same clock as decodeCompleteUs.
+                            receiveUs = du.receiveTimeUs;
+                            reassembledUs = du.enqueueTimeUs;
+                        }
+                        if (!m_FrameSubmitTimeQueue.isEmpty()) {
+                            decodeSubmitUs = m_FrameSubmitTimeQueue.head();
                         }
                     }
 
@@ -2216,16 +2201,23 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         // existing renderers. VRR uses PacedFrame instead.
                         frame->pts = (int64_t)du.rtpTimestamp;
                     }
+                    if (!m_FrameSubmitTimeQueue.isEmpty()) {
+                        m_FrameSubmitTimeQueue.dequeue();
+                    }
 
                     m_ActiveWndVideoStats.decodedFrames++;
 
                     // Queue the frame for rendering (or render now if pacer is disabled)
                     if (vrrActive) {
-                        m_Pacer->submitFrame(PacedFrame(frame,
-                                                        frameNumber,
-                                                        rtpTimestamp,
-                                                        timestampValid,
-                                                        decodeCompleteUs));
+                        PacedFrame pacedFrame(frame,
+                                              frameNumber,
+                                              rtpTimestamp,
+                                              timestampValid,
+                                              decodeCompleteUs);
+                        pacedFrame.setDeliveryTimeline(receiveUs,
+                                                       reassembledUs,
+                                                       decodeSubmitUs);
+                        m_Pacer->submitFrame(std::move(pacedFrame));
                     }
                     else {
                         m_Pacer->submitFrame(frame);
@@ -2377,6 +2369,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 
     m_ActiveWndVideoStats.totalReassemblyTimeUs += (du->enqueueTimeUs - du->receiveTimeUs);
 
+    const uint64_t decodeSubmitUs = LiGetMicroseconds();
     err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
     if (err < 0) {
         char errorstring[512];
@@ -2405,6 +2398,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     }
 
     m_FrameInfoQueue.enqueue(*du);
+    m_FrameSubmitTimeQueue.enqueue(decodeSubmitUs);
 
     m_FramesIn++;
     return DR_OK;

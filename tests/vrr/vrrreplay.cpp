@@ -16,6 +16,7 @@
 #include <QMap>
 #include <QProcess>
 #include <QSet>
+#include <QThread>
 
 #include <algorithm>
 #include <array>
@@ -295,6 +296,7 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
         "queue_discontinuity",
         "decision_valid",
         "can_latch_present",
+        "additional_queued_frame",
         "render_scheduler_delay_valid",
         "render_deadline_already_elapsed",
         "render_wait_coarse_clock_stalled",
@@ -450,6 +452,7 @@ struct Columns {
     int decisionUs = -1;
     int displayRefreshHz = -1;
     int streamRateHz = -1;
+    int additionalQueuedFrame = -1;
     int displayPeriodUs = -1;
     int canLatch = -1;
     int sourceIntervalUs = -1;
@@ -687,6 +690,9 @@ struct Columns {
     int readinessPhaseUs = -1;
     int readinessDemandUs = -1;
     int appliedReadinessReserveUs = -1;
+    int renderBaselineUs = -1;
+    int renderInsuranceUs = -1;
+    int pacingLatencyBudgetUs = -1;
     int cadenceSampleCount = -1;
     int rateCandidateSampleCount = -1;
     int readinessSampleCount = -1;
@@ -696,6 +702,7 @@ struct Columns {
     int cleanSpacingFrames = -1;
     int phaseErrorFrames = -1;
     int readinessModelValid = -1;
+    int playoutDelayUs = -1;
     QMap<QString, int> capturedParameterColumns;
 
     bool resolve(const QList<QByteArray>& header, QString& error)
@@ -730,6 +737,7 @@ struct Columns {
         decisionUs = find("decision_us");
         displayRefreshHz = find("display_refresh_hz");
         streamRateHz = find("stream_rate_hz");
+        additionalQueuedFrame = find("additional_queued_frame");
         displayPeriodUs = find("display_period_us");
         canLatch = find("can_latch_present");
         sourceIntervalUs = find("sender_interval_us");
@@ -1094,6 +1102,9 @@ struct Columns {
         readinessPhaseUs = find("readiness_phase_us");
         readinessDemandUs = find("readiness_demand_us");
         appliedReadinessReserveUs = find("applied_readiness_reserve_us");
+        renderBaselineUs = find("render_baseline_us");
+        renderInsuranceUs = find("render_insurance_us");
+        pacingLatencyBudgetUs = find("pacing_latency_budget_us");
         cadenceSampleCount = find("cadence_sample_count");
         rateCandidateSampleCount = find("rate_candidate_sample_count");
         readinessSampleCount = find("readiness_sample_count");
@@ -1103,6 +1114,7 @@ struct Columns {
         cleanSpacingFrames = find("clean_spacing_frames");
         phaseErrorFrames = find("phase_error_frames");
         readinessModelValid = find("readiness_model_valid");
+        playoutDelayUs = find("playout_delay_us");
         for (const QString& path : vrrReplayParameterNames()) {
             if (!path.startsWith("controller.")) continue;
             const QString key = path.mid(QString("controller.").size());
@@ -1147,6 +1159,19 @@ struct Columns {
 private:
     int m_Maximum = -1;
 };
+
+// Schema default for a controller parameter path, as text, or empty when the
+// path is not a controller parameter.
+QString vrrControllerParameterDefaultText(const QString& path)
+{
+#define VRR_REPLAY_PARAMETER_DEFAULT(type, jsonName, memberName, defaultValue) \
+    if (path == QStringLiteral("controller." #jsonName)) { \
+        return QString::number(static_cast<qulonglong>(defaultValue)); \
+    }
+    VRR_TIMING_PARAMETER_FIELDS(VRR_REPLAY_PARAMETER_DEFAULT)
+#undef VRR_REPLAY_PARAMETER_DEFAULT
+    return QString();
+}
 
 struct Distribution {
     static constexpr uint64_t kExactLimitUs = 100000;
@@ -1235,14 +1260,18 @@ struct Distribution {
         }
     }
 
-    uint64_t percentile(unsigned int percent) const
+    uint64_t percentileRatio(uint64_t numerator, uint64_t denominator) const
     {
-        if (count == 0) {
+        if (count == 0 || denominator == 0) {
             return 0;
         }
-        const uint64_t boundedPercent = std::min(100U, percent);
+        const uint64_t boundedNumerator = std::min(denominator, numerator);
         const uint64_t rank = std::max<uint64_t>(
-            1, (count * boundedPercent + 99) / 100);
+            1,
+            (count / denominator) * boundedNumerator +
+                ((count % denominator) * boundedNumerator +
+                 denominator - 1) /
+                    denominator);
         uint64_t cumulative = 0;
         for (size_t bucket = 0; bucket < histogram.size(); ++bucket) {
             cumulative += histogram[bucket];
@@ -1251,6 +1280,121 @@ struct Distribution {
             }
         }
         return maximum;
+    }
+
+    uint64_t percentile(unsigned int percent) const
+    {
+        return percentileRatio(percent, 100);
+    }
+};
+
+// Sender-spacing cadence. Compares each consecutive pair of presented
+// submissions against the sender's own RTP spacing, which is the cadence the
+// game produced. Pairs whose sender or arrival interval exceeds the stall
+// threshold are excluded so host capture stalls do not dominate the tails. A
+// hitch is a pair presented more than two milliseconds wider than the sender
+// spacing; hitches are attributed to a frame that arrived later than the
+// playout delay, a render-lead jump, the display-spacing floor, or other.
+struct SenderCadenceTracker {
+    static constexpr uint64_t kStallIntervalUs = 25000;
+    static constexpr uint64_t kHitchUs = 2000;
+    static constexpr uint64_t kRenderLeadJumpUs = 500;
+    static constexpr uint64_t kFloorSlackUs = 300;
+
+    bool havePrior = false;
+    bool haveResidual = false;
+    uint64_t priorSenderUs = 0;
+    uint64_t priorDecodeUs = 0;
+    uint64_t priorSubmissionUs = 0;
+    int64_t priorResidualUs = 0;
+    uint64_t pairs = 0;
+    uint64_t hitches = 0;
+    uint64_t hitchLateArrivals = 0;
+    uint64_t hitchRenderLeadJumps = 0;
+    uint64_t hitchDisplayFloor = 0;
+    uint64_t hitchOther = 0;
+    Distribution absoluteSpacingErrorUs;
+    Distribution absoluteJerkUs;
+    // Evenness of what was shown, independent of the sender: the change in
+    // presented interval from one pair to the next. This is the quantity the
+    // viewer perceives as stutter; matching a jittery sender scores well on
+    // the fields above and badly here.
+    bool havePresentedInterval = false;
+    uint64_t priorPresentedIntervalUs = 0;
+    uint64_t presentedJerkPairs = 0;
+    uint64_t presentedJerkOverHitch = 0;
+    Distribution presentedJerkUs;
+
+    void observe(uint64_t senderUs, uint64_t decodeUs, uint64_t submissionUs,
+                 bool lateArrival, bool renderLeadJump,
+                 uint64_t displayPeriodUs)
+    {
+        if (havePrior && senderUs > priorSenderUs &&
+                decodeUs >= priorDecodeUs &&
+                submissionUs >= priorSubmissionUs) {
+            const uint64_t senderIntervalUs = senderUs - priorSenderUs;
+            const uint64_t arrivalIntervalUs = decodeUs - priorDecodeUs;
+            if (senderIntervalUs <= kStallIntervalUs &&
+                    arrivalIntervalUs <= kStallIntervalUs) {
+                const uint64_t submissionIntervalUs =
+                    submissionUs - priorSubmissionUs;
+                if (havePresentedInterval) {
+                    const uint64_t jerkUs =
+                        submissionIntervalUs > priorPresentedIntervalUs ?
+                            submissionIntervalUs - priorPresentedIntervalUs :
+                            priorPresentedIntervalUs - submissionIntervalUs;
+                    presentedJerkUs.add(jerkUs);
+                    ++presentedJerkPairs;
+                    if (jerkUs > kHitchUs) {
+                        ++presentedJerkOverHitch;
+                    }
+                }
+                havePresentedInterval = true;
+                priorPresentedIntervalUs = submissionIntervalUs;
+                const int64_t residualUs =
+                    static_cast<int64_t>(submissionIntervalUs) -
+                    static_cast<int64_t>(senderIntervalUs);
+                ++pairs;
+                absoluteSpacingErrorUs.add(static_cast<uint64_t>(
+                    residualUs < 0 ? -residualUs : residualUs));
+                if (haveResidual) {
+                    const int64_t jerkUs = residualUs - priorResidualUs;
+                    absoluteJerkUs.add(static_cast<uint64_t>(
+                        jerkUs < 0 ? -jerkUs : jerkUs));
+                }
+                haveResidual = true;
+                priorResidualUs = residualUs;
+                if (residualUs > static_cast<int64_t>(kHitchUs)) {
+                    ++hitches;
+                    if (lateArrival) {
+                        ++hitchLateArrivals;
+                    }
+                    else if (renderLeadJump) {
+                        ++hitchRenderLeadJumps;
+                    }
+                    else if (senderIntervalUs < displayPeriodUs &&
+                             submissionIntervalUs <=
+                                 displayPeriodUs + kFloorSlackUs) {
+                        ++hitchDisplayFloor;
+                    }
+                    else {
+                        ++hitchOther;
+                    }
+                }
+            }
+            else {
+                haveResidual = false;
+                havePresentedInterval = false;
+            }
+        }
+        else {
+            haveResidual = false;
+            havePresentedInterval = false;
+        }
+        havePrior = true;
+        priorSenderUs = senderUs;
+        priorDecodeUs = decodeUs;
+        priorSubmissionUs = submissionUs;
     }
 };
 
@@ -1479,6 +1623,27 @@ struct Metrics {
     uint64_t firstArrivalSequence = 0;
     uint64_t lastArrivalSequence = 0;
     uint64_t priorArrivalSequence = 0;
+    // Worker-occupancy decision model state: the last recorded gap between a
+    // submission and the next dequeue while the worker was busy, and the
+    // smallest recorded arrival-to-decision latency while it was idle.
+    uint64_t modeledBusyGapUs = 300;
+    uint64_t modeledIdleLatencyUs = 0;
+    bool modeledIdleLatencyValid = false;
+    Distribution occupancyDecisionShiftUs;
+    // Sender-spacing cadence for the recorded session, the candidate, and a
+    // stock-style present-on-render emulation (decode + prepare + present).
+    SenderCadenceTracker observedSenderCadence;
+    SenderCadenceTracker simulatedSenderCadence;
+    SenderCadenceTracker stockSenderCadence;
+    bool senderClockValid = false;
+    uint32_t senderPriorRtpTimestamp = 0;
+    uint64_t senderUnwrappedTicks = 0;
+    bool observedPriorRenderLeadValid = false;
+    uint64_t observedPriorRenderLeadUs = 0;
+    bool simulatedPriorRenderLeadValid = false;
+    uint64_t simulatedPriorRenderLeadUs = 0;
+    Distribution simulatedPlayoutDelayUs;
+    Distribution observedPlayoutDelayUs;
     uint64_t arrivalSequenceGaps = 0;
     uint64_t arrivalSequenceDuplicates = 0;
     uint64_t arrivalSequenceOutOfOrderTransitions = 0;
@@ -1486,6 +1651,7 @@ struct Metrics {
     TraceFooter traceFooter;
     uint64_t displayRefreshMismatchRows = 0;
     uint64_t streamRateMismatchRows = 0;
+    uint64_t additionalQueuedFrameMismatchRows = 0;
     uint64_t latchCapabilityMismatchRows = 0;
     uint64_t displayPeriodMismatchRows = 0;
     uint64_t controllerParameterMismatchRows = 0;
@@ -2013,6 +2179,9 @@ struct Metrics {
     Distribution referenceReadinessPhaseDrift;
     Distribution referenceReadinessDemandDrift;
     Distribution referenceAppliedReadinessReserveDrift;
+    Distribution referenceRenderBaselineDrift;
+    Distribution referenceRenderInsuranceDrift;
+    Distribution referencePacingLatencyBudgetDrift;
     Distribution referenceCadenceSampleCountDrift;
     Distribution referenceRateCandidateSampleCountDrift;
     Distribution referenceReadinessSampleCountDrift;
@@ -2197,6 +2366,19 @@ void addReferenceControllerDiagnostics(
             diagnostics.appliedReadinessReserveUs,
             optionalUnsignedField(
                 fields, columns.appliedReadinessReserveUs))));
+    metrics.referenceRenderBaselineDrift.add(absoluteValue(
+        signedDifference(
+            diagnostics.renderBaselineUs,
+            optionalUnsignedField(fields, columns.renderBaselineUs))));
+    metrics.referenceRenderInsuranceDrift.add(absoluteValue(
+        signedDifference(
+            diagnostics.renderInsuranceUs,
+            optionalUnsignedField(fields, columns.renderInsuranceUs))));
+    metrics.referencePacingLatencyBudgetDrift.add(absoluteValue(
+        signedDifference(
+            diagnostics.pacingLatencyBudgetUs,
+            optionalUnsignedField(
+                fields, columns.pacingLatencyBudgetUs))));
     metrics.referenceCadenceSampleCountDrift.add(absoluteValue(
         signedDifference(
             static_cast<uint64_t>(diagnostics.cadenceSamples),
@@ -2617,6 +2799,9 @@ QJsonObject distributionObject(const Distribution& distribution)
         object["p90"] = 0;
         object["p95"] = 0;
         object["p99"] = 0;
+        object["p99_5"] = 0;
+        object["p99_9"] = 0;
+        object["p99_95"] = 0;
         object["max"] = 0;
         return object;
     }
@@ -2629,7 +2814,46 @@ QJsonObject distributionObject(const Distribution& distribution)
     object["p90"] = static_cast<qint64>(distribution.percentile(90));
     object["p95"] = static_cast<qint64>(distribution.percentile(95));
     object["p99"] = static_cast<qint64>(distribution.percentile(99));
+    object["p99_5"] = static_cast<qint64>(
+        distribution.percentileRatio(995, 1000));
+    object["p99_9"] = static_cast<qint64>(
+        distribution.percentileRatio(999, 1000));
+    object["p99_95"] = static_cast<qint64>(
+        distribution.percentileRatio(9995, 10000));
     object["max"] = static_cast<qint64>(distribution.maximum);
+    return object;
+}
+
+QJsonObject senderCadenceObject(const SenderCadenceTracker& tracker,
+                                uint64_t durationUs)
+{
+    QJsonObject object;
+    object["pairs"] = static_cast<qint64>(tracker.pairs);
+    object["stall_interval_exclusion_us"] =
+        static_cast<qint64>(SenderCadenceTracker::kStallIntervalUs);
+    object["hitch_threshold_us"] =
+        static_cast<qint64>(SenderCadenceTracker::kHitchUs);
+    object["hitches"] = static_cast<qint64>(tracker.hitches);
+    object["hitches_per_second"] = durationUs != 0 ?
+        static_cast<double>(tracker.hitches) * 1000000.0 /
+            static_cast<double>(durationUs) : 0.0;
+    object["hitch_late_arrivals"] =
+        static_cast<qint64>(tracker.hitchLateArrivals);
+    object["hitch_render_lead_jumps"] =
+        static_cast<qint64>(tracker.hitchRenderLeadJumps);
+    object["hitch_display_floor"] =
+        static_cast<qint64>(tracker.hitchDisplayFloor);
+    object["hitch_other"] = static_cast<qint64>(tracker.hitchOther);
+    object["absolute_spacing_error_us"] = distributionObject(
+        tracker.absoluteSpacingErrorUs);
+    object["absolute_jerk_us"] = distributionObject(tracker.absoluteJerkUs);
+    object["presented_jerk_us"] = distributionObject(tracker.presentedJerkUs);
+    object["presented_jerk_pairs"] =
+        static_cast<qint64>(tracker.presentedJerkPairs);
+    object["presented_jerk_over_2ms_per_mille"] =
+        tracker.presentedJerkPairs != 0 ?
+            static_cast<qint64>(tracker.presentedJerkOverHitch * 1000 /
+                                tracker.presentedJerkPairs) : 0;
     return object;
 }
 
@@ -2651,15 +2875,28 @@ QJsonObject boundedDistributionObject(const BoundedDistribution& distribution)
         object["p90"] = 0;
         object["p95"] = 0;
         object["p99"] = 0;
+        object["p99_5"] = 0;
+        object["p99_9"] = 0;
+        object["p99_95"] = 0;
         object["max"] = 0;
         return object;
     }
 
     std::vector<uint64_t> sortedValues = distribution.samples;
     std::sort(sortedValues.begin(), sortedValues.end());
-    const auto sampledPercentile = [&sortedValues](unsigned int percent) {
+    const auto sampledPercentile = [&sortedValues](
+                                       size_t numerator,
+                                       size_t denominator) {
+        if (denominator == 0) {
+            return uint64_t { 0 };
+        }
+        const size_t boundedNumerator = std::min(denominator, numerator);
         const size_t rank = std::max<size_t>(
-            1, (sortedValues.size() * std::min(100U, percent) + 99) / 100);
+            1,
+            (sortedValues.size() / denominator) * boundedNumerator +
+                ((sortedValues.size() % denominator) * boundedNumerator +
+                 denominator - 1) /
+                    denominator);
         return sortedValues[rank - 1];
     };
     object["min"] = static_cast<qint64>(distribution.minimum);
@@ -2667,10 +2904,14 @@ QJsonObject boundedDistributionObject(const BoundedDistribution& distribution)
     object["stddev"] = static_cast<double>(std::sqrt(
         distribution.squaredDifferenceTotal /
         static_cast<long double>(distribution.count)));
-    object["p50"] = static_cast<qint64>(sampledPercentile(50));
-    object["p90"] = static_cast<qint64>(sampledPercentile(90));
-    object["p95"] = static_cast<qint64>(sampledPercentile(95));
-    object["p99"] = static_cast<qint64>(sampledPercentile(99));
+    object["p50"] = static_cast<qint64>(sampledPercentile(50, 100));
+    object["p90"] = static_cast<qint64>(sampledPercentile(90, 100));
+    object["p95"] = static_cast<qint64>(sampledPercentile(95, 100));
+    object["p99"] = static_cast<qint64>(sampledPercentile(99, 100));
+    object["p99_5"] = static_cast<qint64>(sampledPercentile(995, 1000));
+    object["p99_9"] = static_cast<qint64>(sampledPercentile(999, 1000));
+    object["p99_95"] = static_cast<qint64>(
+        sampledPercentile(9995, 10000));
     object["max"] = static_cast<qint64>(distribution.maximum);
     return object;
 }
@@ -2942,6 +3183,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
                           const QString& decodedTraceSha256,
                           int capturedDisplayHz, int capturedStreamFps,
                           int simulatedDisplayHz, int simulatedStreamFps,
+                          bool additionalQueuedFrame,
                           bool simulatedCanLatch,
                           const VrrReplayScenario& scenario)
 {
@@ -3039,11 +3281,15 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         "DXGI stores SyncQPCTime paired with latch_sync_refresh_seq; it is not generally the timestamp of latch_present_refresh_seq";
     capture["display_hz"] = capturedDisplayHz;
     capture["stream_fps"] = capturedStreamFps;
+    capture["additional_queued_frame"] = additionalQueuedFrame;
     QJsonObject sessionConfigIntegrity;
     sessionConfigIntegrity["display_refresh_mismatch_rows"] =
         static_cast<qint64>(metrics.displayRefreshMismatchRows);
     sessionConfigIntegrity["stream_rate_mismatch_rows"] =
         static_cast<qint64>(metrics.streamRateMismatchRows);
+    sessionConfigIntegrity["additional_queued_frame_mismatch_rows"] =
+        static_cast<qint64>(
+            metrics.additionalQueuedFrameMismatchRows);
     sessionConfigIntegrity["latch_capability_mismatch_rows"] =
         static_cast<qint64>(metrics.latchCapabilityMismatchRows);
     sessionConfigIntegrity["display_period_mismatch_rows"] =
@@ -3053,6 +3299,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     sessionConfigIntegrity["valid"] =
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
+        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0;
@@ -3380,6 +3627,10 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         exactScheduledDistribution(metrics.referenceReadinessDemandDrift) &&
         exactScheduledDistribution(
             metrics.referenceAppliedReadinessReserveDrift) &&
+        exactScheduledDistribution(metrics.referenceRenderBaselineDrift) &&
+        exactScheduledDistribution(metrics.referenceRenderInsuranceDrift) &&
+        exactScheduledDistribution(
+            metrics.referencePacingLatencyBudgetDrift) &&
         exactScheduledDistribution(
             metrics.referenceCadenceSampleCountDrift) &&
         exactScheduledDistribution(
@@ -5053,6 +5304,17 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     observed["drops"] = static_cast<qint64>(metrics.originalDrops);
     observed["latency_us"] = observedLatency;
     observed["execution_cost_us"] = observedCosts;
+    {
+        const uint64_t durationUs =
+            metrics.lastArrivalUs >= metrics.firstArrivalUs ?
+                metrics.lastArrivalUs - metrics.firstArrivalUs : 0;
+        observed["sender_cadence"] = senderCadenceObject(
+            metrics.observedSenderCadence, durationUs);
+        observed["playout_delay_us"] = distributionObject(
+            metrics.observedPlayoutDelayUs);
+        observed["stock_present_on_render_sender_cadence"] =
+            senderCadenceObject(metrics.stockSenderCadence, durationUs);
+    }
     observed["absolute_submit_error_us"] = distributionObject(
         metrics.observedAbsoluteSubmitError);
     observed["cadence_by_rounded_source_rate_fps"] = cadenceBandsObject(
@@ -5188,6 +5450,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     simulation["model"] = kReplayModel;
     simulation["display_hz"] = simulatedDisplayHz;
     simulation["stream_fps"] = simulatedStreamFps;
+    simulation["additional_queued_frame"] = additionalQueuedFrame;
     simulation["can_latch_present"] = simulatedCanLatch;
     simulation["scenario"] = scenario.name;
     simulation["mode"] = scenario.mode;
@@ -5516,6 +5779,24 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     simulation["drops"] = static_cast<qint64>(scenario.mode == "worker" ?
         metrics.workerCapacityEvictions : metrics.originalDrops);
     simulation["latency_us"] = simulatedLatency;
+    // How far the worker-occupancy model moved each decision from the
+    // recorded instant. A median shift beyond one source period means the
+    // candidate keeps the single worker busier than the source cadence; the
+    // live worker would shed frames through its stale check, which this
+    // fixed-admission replay does not emulate, so latency runs away instead.
+    simulation["occupancy_decision_shift_us"] = distributionObject(
+        metrics.occupancyDecisionShiftUs);
+    simulation["worker_saturated"] =
+        metrics.occupancyDecisionShiftUs.count != 0 &&
+        metrics.occupancyDecisionShiftUs.percentile(50) >
+            periodForRate(simulatedStreamFps > 0 ?
+                              simulatedStreamFps : 1);
+    simulation["playout_delay_us"] = distributionObject(
+        metrics.simulatedPlayoutDelayUs);
+    simulation["sender_cadence"] = senderCadenceObject(
+        metrics.simulatedSenderCadence,
+        metrics.lastArrivalUs >= metrics.firstArrivalUs ?
+            metrics.lastArrivalUs - metrics.firstArrivalUs : 0);
     simulation["absolute_submit_error_us"] = distributionObject(
         metrics.simulatedAbsoluteSubmitError);
     simulation["target_drift_us"] = distributionObject(
@@ -5593,6 +5874,12 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     referenceControllerDiagnostics["applied_readiness_reserve_drift_us"] =
         distributionObject(
             metrics.referenceAppliedReadinessReserveDrift);
+    referenceControllerDiagnostics["render_baseline_drift_us"] =
+        distributionObject(metrics.referenceRenderBaselineDrift);
+    referenceControllerDiagnostics["render_insurance_drift_us"] =
+        distributionObject(metrics.referenceRenderInsuranceDrift);
+    referenceControllerDiagnostics["pacing_latency_budget_drift_us"] =
+        distributionObject(metrics.referencePacingLatencyBudgetDrift);
     referenceControllerDiagnostics["cadence_sample_count_drift"] =
         distributionObject(metrics.referenceCadenceSampleCountDrift);
     referenceControllerDiagnostics["rate_candidate_sample_count_drift"] =
@@ -5662,6 +5949,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         semanticIntegrityReady &&
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
+        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0 &&
@@ -5890,6 +6178,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     const bool sessionConfigIntegrityReady =
         metrics.displayRefreshMismatchRows == 0 &&
         metrics.streamRateMismatchRows == 0 &&
+        metrics.additionalQueuedFrameMismatchRows == 0 &&
         metrics.latchCapabilityMismatchRows == 0 &&
         metrics.displayPeriodMismatchRows == 0 &&
         metrics.controllerParameterMismatchRows == 0;
@@ -6467,6 +6756,66 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     summary["raster_model_scope"] =
         "schema-5 integrity-checked DXGI SyncQPCTime/SyncRefreshCount history, stable QueryDisplayConfig physical-signal timing, and observation-only D3DKMT scan-position brackets anchor and audit modeled transitions across ideal VRR flip-following versus free-running fixed-refresh raster states; PresentRefreshCount is never treated as its timestamp";
 
+    // Sender-spacing cadence headline numbers for sweep tables.
+    {
+        const auto addSenderScalars = [&summary](
+            const QString& prefix, const SenderCadenceTracker& tracker,
+            uint64_t durationUs) {
+            summary[prefix + "sender_pairs"] =
+                static_cast<qint64>(tracker.pairs);
+            summary[prefix + "sender_hitches"] =
+                static_cast<qint64>(tracker.hitches);
+            summary[prefix + "sender_hitches_per_second"] = durationUs != 0 ?
+                static_cast<double>(tracker.hitches) * 1000000.0 /
+                    static_cast<double>(durationUs) : 0.0;
+            summary[prefix + "sender_hitch_late_arrivals"] =
+                static_cast<qint64>(tracker.hitchLateArrivals);
+            summary[prefix + "sender_spacing_error_p50_us"] =
+                static_cast<qint64>(
+                    tracker.absoluteSpacingErrorUs.percentile(50));
+            summary[prefix + "sender_spacing_error_p90_us"] =
+                static_cast<qint64>(
+                    tracker.absoluteSpacingErrorUs.percentile(90));
+            summary[prefix + "sender_spacing_error_p99_us"] =
+                static_cast<qint64>(
+                    tracker.absoluteSpacingErrorUs.percentile(99));
+            summary[prefix + "sender_jerk_p99_us"] =
+                static_cast<qint64>(tracker.absoluteJerkUs.percentile(99));
+            summary[prefix + "presented_jerk_p50_us"] =
+                static_cast<qint64>(tracker.presentedJerkUs.percentile(50));
+            summary[prefix + "presented_jerk_p90_us"] =
+                static_cast<qint64>(tracker.presentedJerkUs.percentile(90));
+            summary[prefix + "presented_jerk_p99_us"] =
+                static_cast<qint64>(tracker.presentedJerkUs.percentile(99));
+            summary[prefix + "presented_jerk_over_2ms_per_mille"] =
+                tracker.presentedJerkPairs != 0 ?
+                    static_cast<qint64>(tracker.presentedJerkOverHitch * 1000 /
+                                        tracker.presentedJerkPairs) : 0;
+        };
+        addSenderScalars("replay_", metrics.simulatedSenderCadence,
+                         captureDurationUs);
+        addSenderScalars("original_", metrics.observedSenderCadence,
+                         captureDurationUs);
+        addSenderScalars("stock_", metrics.stockSenderCadence,
+                         captureDurationUs);
+        summary["replay_decode_to_submission_p50_us"] =
+            static_cast<qint64>(
+                metrics.simulatedDecodeToSubmission.percentile(50));
+        summary["replay_worker_saturated"] =
+            metrics.occupancyDecisionShiftUs.count != 0 &&
+            metrics.occupancyDecisionShiftUs.percentile(50) >
+                periodForRate(simulatedStreamFps > 0 ? simulatedStreamFps : 1);
+        summary["replay_playout_delay_p50_us"] = static_cast<qint64>(
+            metrics.simulatedPlayoutDelayUs.percentile(50));
+        summary["replay_playout_delay_p90_us"] = static_cast<qint64>(
+            metrics.simulatedPlayoutDelayUs.percentile(90));
+        summary["replay_playout_delay_max_us"] = static_cast<qint64>(
+            metrics.simulatedPlayoutDelayUs.maximum);
+        summary["original_decode_to_submission_p50_us"] =
+            static_cast<qint64>(
+                metrics.observedDecodeToSubmission.percentile(50));
+    }
+
     // Stable top-level fields retain compatibility with existing launcher
     // summaries and comparison files.
     summary["display_hz"] = simulatedDisplayHz;
@@ -6625,6 +6974,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     summary["diagnostic_capture_ready"] = diagnosticCaptureReady;
     summary["raster_simulation_ready"] = rasterSimulationReady;
     summary["model"] = kReplayModel;
+    summary["decision_time_model"] = "worker-occupancy-v1";
     return summary;
 }
 
@@ -6633,6 +6983,15 @@ struct TimelineDetails {
     int simulatedSourceRateHz = 0;
     uint64_t recordedSourcePeriodUs = 0;
     uint64_t simulatedSourcePeriodUs = 0;
+    int64_t simulatedReadyOffsetUs = 0;
+    uint64_t simulatedRenderLeadUs = 0;
+    int64_t simulatedReadinessBudgetUs = 0;
+    uint64_t simulatedSourceTimeUs = 0;
+    uint64_t simulatedPlayoutDelayUs = 0;
+    int64_t simulatedCadenceSmoothingUs = 0;
+    bool simulatedCadenceEligible = false;
+    bool simulatedSourceRateChanged = false;
+    bool simulatedPhaseDiscontinuity = false;
     CadenceSample recordedCadence;
     CadenceSample simulatedCadence;
     int64_t recordedSpacingMarginUs = 0;
@@ -6879,6 +7238,10 @@ bool writeTimelineHeader(QFile& file)
         "recorded_tear_classification,simulated_tear_classification,"
         "recorded_source_rate_hz_rounded,simulated_source_rate_hz_rounded,"
         "recorded_source_period_us,simulated_source_period_us,"
+        "simulated_ready_offset_us,simulated_render_lead_us,"
+        "simulated_readiness_budget_us,simulated_source_time_us,"
+        "simulated_playout_delay_us,simulated_cadence_smoothing_us,"
+        "simulated_cadence_eligible,simulated_source_rate_changed,simulated_phase_discontinuity,"
         "recorded_cadence_valid,simulated_cadence_valid,"
         "recorded_source_elapsed_us,simulated_source_elapsed_us,"
         "recorded_submission_elapsed_us,simulated_submission_elapsed_us,"
@@ -7155,6 +7518,15 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
     append(QByteArray::number(details.simulatedSourceRateHz));
     append(QByteArray::number(details.recordedSourcePeriodUs));
     append(QByteArray::number(details.simulatedSourcePeriodUs));
+    append(QByteArray::number(details.simulatedReadyOffsetUs));
+    append(QByteArray::number(details.simulatedRenderLeadUs));
+    append(QByteArray::number(details.simulatedReadinessBudgetUs));
+    append(QByteArray::number(details.simulatedSourceTimeUs));
+    append(QByteArray::number(details.simulatedPlayoutDelayUs));
+    append(QByteArray::number(details.simulatedCadenceSmoothingUs));
+    append(QByteArray::number(details.simulatedCadenceEligible ? 1 : 0));
+    append(QByteArray::number(details.simulatedSourceRateChanged ? 1 : 0));
+    append(QByteArray::number(details.simulatedPhaseDiscontinuity ? 1 : 0));
     append(QByteArray::number(details.recordedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.simulatedCadence.valid ? 1 : 0));
     append(QByteArray::number(details.recordedCadence.sourceElapsedUs));
@@ -7470,6 +7842,10 @@ int main(int argc, char* argv[])
         "config", "Load versioned replay scenarios and parameters", "json");
     QCommandLineOption scenarioOption(
         "scenario", "Run only the named scenario (repeatable)", "name");
+    QCommandLineOption jobsOption(
+        "jobs",
+        "Maximum parallel replay processes for a batch (0 selects an automatic limit)",
+        "count", "0");
     QCommandLineOption setOption(
         "set", "Override a resolved parameter as section.name=value", "override");
     QCommandLineOption modeOption(
@@ -7491,6 +7867,7 @@ int main(int argc, char* argv[])
     parser.addOption(counterfactualRefreshReadyOption);
     parser.addOption(configOption);
     parser.addOption(scenarioOption);
+    parser.addOption(jobsOption);
     parser.addOption(setOption);
     parser.addOption(modeOption);
     parser.addOption(listParametersOption);
@@ -7560,6 +7937,12 @@ int main(int argc, char* argv[])
                            displayOverrideHz) ||
             !parseRateOverride(streamOption, "--stream-fps",
                                streamOverrideFps)) {
+        return 2;
+    }
+    bool jobsOk = false;
+    const int requestedJobs = parser.value(jobsOption).toInt(&jobsOk);
+    if (!jobsOk || requestedJobs < 0 || requestedJobs > 64) {
+        std::fprintf(stderr, "--jobs must be an integer from 0 through 64\n");
         return 2;
     }
 
@@ -7646,14 +8029,43 @@ int main(int argc, char* argv[])
                          "--timeline requires selecting a single scenario\n");
             return 2;
         }
-        QJsonArray scenarioResults;
+        const int idealThreadCount = std::max(1, QThread::idealThreadCount());
+        const int automaticJobs = std::min(
+            16, idealThreadCount);
+        const int parallelJobs = std::min(
+            static_cast<int>(replayConfiguration.scenarios.size()),
+            requestedJobs == 0 ? automaticJobs : requestedJobs);
+        struct BatchJob {
+            int index = 0;
+            QString name;
+            std::unique_ptr<QProcess> process;
+            QByteArray output;
+            QByteArray errors;
+        };
+        std::vector<std::unique_ptr<BatchJob>> activeJobs;
+        std::vector<QJsonObject> orderedResults(
+            static_cast<size_t>(replayConfiguration.scenarios.size()));
         bool allPassed = true;
         int firstFailureExitCode = 0;
-        for (const VrrReplayScenario& scenario :
-             replayConfiguration.scenarios) {
+        int nextScenario = 0;
+        QElapsedTimer batchTimer;
+        batchTimer.start();
+        const auto stopActiveJobs = [&activeJobs]() {
+            for (const std::unique_ptr<BatchJob>& job : activeJobs) {
+                if (job->process->state() == QProcess::NotRunning) {
+                    continue;
+                }
+                job->process->terminate();
+                if (!job->process->waitForFinished(2000)) {
+                    job->process->kill();
+                    job->process->waitForFinished(2000);
+                }
+            }
+        };
+        const auto scenarioArguments = [&](const QString& scenarioName) {
             QStringList arguments { tracePath, "--config",
                                     parser.value(configOption), "--scenario",
-                                    scenario.name };
+                                    scenarioName };
             for (const QString& overrideValue : parser.values(setOption))
                 arguments << "--set" << overrideValue;
             if (parser.isSet(modeOption)) arguments << "--mode" << parser.value(modeOption);
@@ -7669,40 +8081,73 @@ int main(int argc, char* argv[])
                 arguments << "--require-raster-ready";
             if (parser.isSet(counterfactualRefreshReadyOption))
                 arguments << "--require-counterfactual-refresh-ready";
-            QProcess child;
-            child.start(QCoreApplication::applicationFilePath(), arguments);
-            if (!child.waitForStarted()) {
-                std::fprintf(stderr, "Unable to start replay scenario %s: %s\n",
-                             qPrintable(scenario.name),
-                             qPrintable(child.errorString()));
-                return 1;
+            return arguments;
+        };
+        while (nextScenario < replayConfiguration.scenarios.size() ||
+               !activeJobs.empty()) {
+            while (nextScenario < replayConfiguration.scenarios.size() &&
+                   static_cast<int>(activeJobs.size()) < parallelJobs) {
+                const VrrReplayScenario& scenario =
+                    replayConfiguration.scenarios.at(nextScenario);
+                auto job = std::make_unique<BatchJob>();
+                job->index = nextScenario;
+                job->name = scenario.name;
+                job->process = std::make_unique<QProcess>();
+                job->process->start(
+                    QCoreApplication::applicationFilePath(),
+                    scenarioArguments(scenario.name));
+                if (!job->process->waitForStarted()) {
+                    std::fprintf(
+                        stderr, "Unable to start replay scenario %s: %s\n",
+                        qPrintable(scenario.name),
+                        qPrintable(job->process->errorString()));
+                    stopActiveJobs();
+                    return 1;
+                }
+                activeJobs.push_back(std::move(job));
+                ++nextScenario;
             }
-            QByteArray childOutput;
-            QByteArray childErrors;
-            while (child.state() != QProcess::NotRunning) {
-                child.waitForReadyRead(250);
-                childOutput.append(child.readAllStandardOutput());
-                childErrors.append(child.readAllStandardError());
+            bool completedJob = false;
+            for (auto jobIt = activeJobs.begin();
+                 jobIt != activeJobs.end();) {
+                BatchJob& job = **jobIt;
+                job.process->waitForFinished(1);
+                job.output.append(job.process->readAllStandardOutput());
+                job.errors.append(job.process->readAllStandardError());
+                if (job.process->state() != QProcess::NotRunning) {
+                    ++jobIt;
+                    continue;
+                }
+                completedJob = true;
+                QJsonParseError childError;
+                const QJsonDocument childDocument = QJsonDocument::fromJson(
+                    job.output, &childError);
+                if (!childDocument.isObject()) {
+                    std::fprintf(stderr, "Scenario %s failed: %s%s\n",
+                                 qPrintable(job.name),
+                                 qPrintable(childError.errorString()),
+                                 job.errors.constData());
+                    const int exitCode = job.process->exitCode();
+                    stopActiveJobs();
+                    return exitCode == 0 ? 1 : exitCode;
+                }
+                QJsonObject result = childDocument.object();
+                result["scenario"] = job.name;
+                result["exit_code"] = job.process->exitCode();
+                orderedResults[static_cast<size_t>(job.index)] = result;
+                allPassed = allPassed && job.process->exitCode() == 0;
+                if (firstFailureExitCode == 0 &&
+                        job.process->exitCode() != 0) {
+                    firstFailureExitCode = job.process->exitCode();
+                }
+                jobIt = activeJobs.erase(jobIt);
             }
-            childOutput.append(child.readAllStandardOutput());
-            childErrors.append(child.readAllStandardError());
-            QJsonParseError childError;
-            const QJsonDocument childDocument = QJsonDocument::fromJson(
-                childOutput, &childError);
-            if (!childDocument.isObject()) {
-                std::fprintf(stderr, "Scenario %s failed: %s%s\n",
-                             qPrintable(scenario.name),
-                             qPrintable(childError.errorString()),
-                             childErrors.constData());
-                return child.exitCode() == 0 ? 1 : child.exitCode();
+            if (!completedJob && !activeJobs.empty()) {
+                QThread::msleep(1);
             }
-            QJsonObject result = childDocument.object();
-            result["scenario"] = scenario.name;
-            result["exit_code"] = child.exitCode();
-            allPassed = allPassed && child.exitCode() == 0;
-            if (firstFailureExitCode == 0 && child.exitCode() != 0) {
-                firstFailureExitCode = child.exitCode();
-            }
+        }
+        QJsonArray scenarioResults;
+        for (const QJsonObject& result : orderedResults) {
             scenarioResults.append(result);
         }
         QJsonObject batch;
@@ -7710,6 +8155,8 @@ int main(int argc, char* argv[])
         batch["trace"] = QFileInfo(tracePath).fileName();
         batch["scenarios"] = scenarioResults;
         batch["passed"] = allPassed;
+        batch["parallel_jobs"] = parallelJobs;
+        batch["elapsed_ms"] = static_cast<double>(batchTimer.elapsed());
         const QByteArray output = QJsonDocument(batch).toJson(
             QJsonDocument::Indented);
         if (parser.isSet(outputOption)) {
@@ -10855,6 +11302,8 @@ int main(int argc, char* argv[])
             static_cast<int>(rowStreamRateValue);
         const bool rowCanLatch =
             unsignedField(fields, columns.canLatch) != 0;
+        const bool rowAdditionalQueuedFrame = optionalUnsignedField(
+            fields, columns.additionalQueuedFrame) != 0;
         if (periodForRate(rowDisplayRefreshHz) == 0 ||
                 periodForRate(rowStreamRateHz) == 0) {
             std::fprintf(
@@ -10871,49 +11320,133 @@ int main(int argc, char* argv[])
         if (capturedConfig.displayRefreshHz == 0) {
             capturedConfig.displayRefreshHz = rowDisplayRefreshHz;
             capturedConfig.streamRateHz = rowStreamRateHz;
+            capturedConfig.allowAdditionalQueuedFrame =
+                rowAdditionalQueuedFrame;
             capturedCanLatch = rowCanLatch;
-            if (traceSchema >= 5) {
-                VrrReplayScenario capturedScenario;
+            if (traceSchema < 5) {
+                // Schema-3/4 rows predate captured controller parameters.
+                // Reconstruct the absolute latch policy used to record them
+                // instead of inheriting current production defaults.
+                capturedParameters.latchedPresentationHeadroomUs = 1500;
+                capturedParameters.latchedPresentationExitHeadroomUs = 2000;
+                capturedParameters.
+                    latchedPresentationHeadroomPeriodNumerator = 0;
+                capturedParameters.
+                    latchedPresentationHeadroomPeriodDenominator = 1;
+                capturedParameters.
+                    latchedPresentationExitHeadroomPeriodNumerator = 0;
+                capturedParameters.
+                    latchedPresentationExitHeadroomPeriodDenominator = 1;
+                capturedParameters.latchedPresentationBaseGuardExit = 1;
+            }
+            else {
+                QJsonObject capturedControllerSnapshot;
                 int expectedParameterColumns = 0;
                 for (const QString& path : vrrReplayParameterNames()) {
                     if (!path.startsWith("controller.")) continue;
                     const auto column = columns.capturedParameterColumns.find(
                         path);
+                    uint64_t capturedValue = 0;
                     if (column == columns.capturedParameterColumns.end()) {
-                        // These display-period-scaled latch thresholds were
-                        // added after schema 5. Preserve the absolute-us
-                        // semantics captured by older schema-5 traces while
-                        // new traces record the ratios explicitly.
+                        // Preserve the policy semantics of schema-5 fields
+                        // added after the initial release. Older captures use
+                        // absolute latch thresholds, allow base-guard latch
+                        // exit, and predate render-tail pacing budgets; new
+                        // traces record all of these explicitly.
                         QString legacyValue;
-                        if (path.endsWith("_period_numerator")) {
+                        if (path ==
+                                "controller.render_baseline_percentile") {
+                            legacyValue = "50";
+                        }
+                        else if (path ==
+                                 "controller.pacing_latency_budget_divisor") {
+                            legacyValue = "0";
+                        }
+                        else if (path.endsWith("_period_numerator")) {
                             legacyValue = "0";
                         }
                         else if (path.endsWith("_period_denominator")) {
                             legacyValue = "1";
                         }
-                        if (legacyValue.isEmpty() ||
-                                !applyVrrReplayOverride(
-                                    path + "=" + legacyValue,
-                                    capturedScenario, error)) {
+                        else if (path ==
+                                 "controller.latch_base_guard_exit") {
+                            legacyValue = "1";
+                        }
+                        else if (path ==
+                                 "controller.cadence_stability_latch_frames") {
+                            // Captures made before cadence-instability
+                            // protection must retain their recorded adaptive
+                            // presentation decisions for exact replay.
+                            legacyValue = "0";
+                        }
+                        else if (path ==
+                                 "controller.source_playout_delay_us") {
+                            // Older schema-5 captures predate the explicit
+                            // source-clock playout reserve.
+                            legacyValue = "0";
+                        }
+                        else if (path ==
+                                 "controller.readiness_learning_window_us" ||
+                                 path ==
+                                 "controller.retain_readiness_on_phase_reset") {
+                            // Older schema-5 captures used a fixed sample
+                            // count and reacquired readiness after each phase
+                            // reset.
+                            legacyValue = "0";
+                        }
+                        else if (path ==
+                                 "controller.timestamp_playout_enabled") {
+                            // Older schema-5 captures predate timestamp
+                            // playout and always projected a source clock.
+                            legacyValue = "0";
+                        }
+                        else if (path ==
+                                 "controller.playout_offset_window_us") {
+                            legacyValue = "3000000";
+                        }
+                        else if (path ==
+                                 "controller.playout_offset_slew_us") {
+                            legacyValue = "20";
+                        }
+                        else if (path ==
+                                 "controller.playout_offset_warmup_samples") {
+                            legacyValue = "64";
+                        }
+                        else {
+                            // Any parameter added after a capture was made
+                            // takes its schema default: older captures ran
+                            // the controller exactly as if the parameter
+                            // did not exist, which is what the default
+                            // expresses.
+                            legacyValue =
+                                vrrControllerParameterDefaultText(path);
+                        }
+                        bool validLegacyValue = false;
+                        capturedValue = legacyValue.toULongLong(
+                            &validLegacyValue);
+                        if (legacyValue.isEmpty() || !validLegacyValue) {
                             std::fprintf(stderr,
                                          "Schema 5 trace is missing captured controller parameter: %s\n",
                                          qPrintable(path));
                             return 1;
                         }
-                        continue;
                     }
-                    ++expectedParameterColumns;
-                    if (!applyVrrReplayOverride(
-                                path + "=" + QString::number(unsignedField(
-                                    fields, column.value())),
-                                capturedScenario, error)) {
+                    else {
+                        ++expectedParameterColumns;
+                        capturedValue = unsignedField(
+                            fields, column.value());
+                        capturedParameterValues.insert(
+                            column.value(), fields[column.value()]);
+                    }
+                    if (capturedValue > 9007199254740991ULL) {
                         std::fprintf(stderr,
-                                     "Schema 5 trace has invalid captured parameters: %s\n",
-                                     qPrintable(error));
+                                     "Schema 5 trace has an inexact captured controller parameter: %s\n",
+                                     qPrintable(path));
                         return 1;
                     }
-                    capturedParameterValues.insert(
-                        column.value(), fields[column.value()]);
+                    capturedControllerSnapshot.insert(
+                        path.section('.', 1, 1),
+                        static_cast<double>(capturedValue));
                 }
                 if (columns.capturedParameterColumns.size() !=
                         expectedParameterColumns) {
@@ -10921,7 +11454,14 @@ int main(int argc, char* argv[])
                                  "Schema 5 trace is missing captured controller parameters\n");
                     return 1;
                 }
-                capturedParameters = capturedScenario.controller;
+                if (!applyVrrReplayControllerSnapshot(
+                            capturedControllerSnapshot,
+                            capturedParameters, error)) {
+                    std::fprintf(stderr,
+                                 "Schema 5 trace has invalid captured parameters: %s\n",
+                                 qPrintable(error));
+                    return 1;
+                }
             }
             simulatedConfig = capturedConfig;
             if (parser.isSet(displayOption)) {
@@ -10931,6 +11471,10 @@ int main(int argc, char* argv[])
                 simulatedConfig.streamRateHz = streamOverrideFps;
             }
             simulatedCanLatch = capturedCanLatch && !parser.isSet(latchOption);
+            if (!scenario.controllerCustomized) {
+                scenario.controller = vrrTimingParametersForSession(
+                    simulatedConfig);
+            }
             referenceController = std::make_unique<VrrTimingController>(
                 capturedConfig, capturedCanLatch, capturedParameters);
             simulatedController = std::make_unique<VrrTimingController>(
@@ -10941,6 +11485,9 @@ int main(int argc, char* argv[])
                 rowDisplayRefreshHz != capturedConfig.displayRefreshHz ? 1 : 0;
             metrics.streamRateMismatchRows +=
                 rowStreamRateHz != capturedConfig.streamRateHz ? 1 : 0;
+            metrics.additionalQueuedFrameMismatchRows +=
+                rowAdditionalQueuedFrame !=
+                    capturedConfig.allowAdditionalQueuedFrame ? 1 : 0;
             metrics.latchCapabilityMismatchRows +=
                 rowCanLatch != capturedCanLatch ? 1 : 0;
         }
@@ -12056,8 +12603,62 @@ int main(int argc, char* argv[])
         const uint64_t injectedDisplayTransitionDelayUs =
             simulatedPresentTransportUs -
                 rasterDisplayParameters.presentTransportUs;
+        // Worker-occupancy decision model. The recorded decision instant
+        // embeds the recorded schedule of the previous frame: the single
+        // pacing worker dequeues the next frame only after it has submitted
+        // the previous one. Re-derive the instant from the simulated previous
+        // submission so a candidate that presents earlier frees the worker
+        // earlier and one that presents later holds it longer. When the
+        // simulated and recorded previous submissions coincide, as they do
+        // for the unchanged reference policy, this reproduces the recorded
+        // instant exactly.
+        uint64_t occupancyDecisionUs = decisionUs;
+        if (rowDecisionValid && decisionUs != 0 &&
+                simulatedController->hasLastSubmission() &&
+                referenceController->hasLastSubmission()) {
+            const uint64_t recordedPreviousSubmissionUs =
+                referenceController->lastSubmissionUs();
+            const uint64_t simulatedPreviousSubmissionUs =
+                simulatedController->lastSubmissionUs();
+            const uint64_t idleLatencyUs = decisionUs >= pacerArrivalUs ?
+                decisionUs - pacerArrivalUs : 0;
+            if (decisionUs >= recordedPreviousSubmissionUs) {
+                const uint64_t postSubmissionGapUs =
+                    decisionUs - recordedPreviousSubmissionUs;
+                const bool workerWasBusy =
+                    postSubmissionGapUs < idleLatencyUs;
+                if (workerWasBusy) {
+                    metrics.modeledBusyGapUs = postSubmissionGapUs;
+                    if (!metrics.modeledIdleLatencyValid) {
+                        metrics.modeledIdleLatencyUs = idleLatencyUs;
+                        metrics.modeledIdleLatencyValid = true;
+                    }
+                    occupancyDecisionUs = std::max(
+                        saturatingAdd(pacerArrivalUs,
+                                      metrics.modeledIdleLatencyUs),
+                        saturatingAdd(simulatedPreviousSubmissionUs,
+                                      postSubmissionGapUs));
+                }
+                else {
+                    metrics.modeledIdleLatencyUs =
+                        metrics.modeledIdleLatencyValid ?
+                            std::min(metrics.modeledIdleLatencyUs,
+                                     idleLatencyUs) : idleLatencyUs;
+                    metrics.modeledIdleLatencyValid = true;
+                    if (simulatedPreviousSubmissionUs >
+                            recordedPreviousSubmissionUs) {
+                        occupancyDecisionUs = std::max(
+                            decisionUs,
+                            saturatingAdd(simulatedPreviousSubmissionUs,
+                                          metrics.modeledBusyGapUs));
+                    }
+                }
+                metrics.occupancyDecisionShiftUs.add(absoluteValue(
+                    signedDifference(occupancyDecisionUs, decisionUs)));
+            }
+        }
         const uint64_t simulatedDecisionUs = saturatingAdd(
-            decisionUs, injectedDecisionDelayUs);
+            occupancyDecisionUs, injectedDecisionDelayUs);
         timelineDetails.simulatedDecisionUs = simulatedDecisionUs;
         timelineDetails.injectedDecisionDelayUs =
             injectedDecisionDelayUs;
@@ -12126,6 +12727,24 @@ int main(int argc, char* argv[])
             simulatedController->schedule(frame, simulatedDecisionUs);
         timelineDetails.simulatedSourcePeriodUs =
             simulatedDecision.sourcePeriodUs;
+        timelineDetails.simulatedReadyOffsetUs =
+            simulatedDecision.readyOffsetUs;
+        timelineDetails.simulatedRenderLeadUs =
+            simulatedDecision.renderLeadUs;
+        timelineDetails.simulatedReadinessBudgetUs =
+            simulatedDecision.readinessBudgetUs;
+        timelineDetails.simulatedSourceTimeUs =
+            simulatedDecision.sourceTimeUs;
+        timelineDetails.simulatedPlayoutDelayUs =
+            simulatedDecision.playoutDelayUs;
+        timelineDetails.simulatedCadenceSmoothingUs =
+            simulatedDecision.cadenceSmoothingUs;
+        timelineDetails.simulatedCadenceEligible =
+            simulatedDecision.cadenceEligible;
+        timelineDetails.simulatedSourceRateChanged =
+            simulatedDecision.sourceRateChanged;
+        timelineDetails.simulatedPhaseDiscontinuity =
+            simulatedDecision.phaseDiscontinuity;
         timelineDetails.simulatedSourceRateHz = roundedRateForPeriod(
             simulatedDecision.sourcePeriodUs);
         timelineDetails.simulatedLatched =
@@ -13323,6 +13942,71 @@ int main(int argc, char* argv[])
             metrics.pairedSubmissionDelta.add(pairedDelta);
             metrics.pairedAbsoluteSubmissionDelta.add(absoluteValue(
                 pairedDelta));
+
+            // Sender-spacing cadence for the recorded run, the candidate and
+            // a stock-style present-on-render emulation.
+            if (unsignedField(fields, columns.rtpValid) != 0) {
+                if (metrics.senderClockValid) {
+                    metrics.senderUnwrappedTicks += static_cast<uint32_t>(
+                        rtpTimestamp - metrics.senderPriorRtpTimestamp);
+                }
+                metrics.senderPriorRtpTimestamp = rtpTimestamp;
+                metrics.senderClockValid = true;
+                const uint64_t senderUs =
+                    metrics.senderUnwrappedTicks * 1000ULL / 90ULL;
+                const uint64_t simulatedDisplayPeriodUs = periodForRate(
+                    simulatedConfig.displayRefreshHz);
+                const uint64_t recordedRenderLeadUs = unsignedField(
+                    fields, columns.renderLeadUs);
+                const bool recordedLeadJump =
+                    metrics.observedPriorRenderLeadValid &&
+                    absoluteValue(signedDifference(
+                        recordedRenderLeadUs,
+                        metrics.observedPriorRenderLeadUs)) >
+                        SenderCadenceTracker::kRenderLeadJumpUs;
+                metrics.observedPriorRenderLeadUs = recordedRenderLeadUs;
+                metrics.observedPriorRenderLeadValid = true;
+                const bool simulatedLeadJump =
+                    metrics.simulatedPriorRenderLeadValid &&
+                    absoluteValue(signedDifference(
+                        simulatedDecision.renderLeadUs,
+                        metrics.simulatedPriorRenderLeadUs)) >
+                        SenderCadenceTracker::kRenderLeadJumpUs;
+                metrics.simulatedPriorRenderLeadUs =
+                    simulatedDecision.renderLeadUs;
+                metrics.simulatedPriorRenderLeadValid = true;
+                const bool simulatedLateArrival =
+                    scenario.controller.timestampPlayoutEnabled != 0 &&
+                    simulatedDecision.readyOffsetUs > static_cast<int64_t>(
+                        simulatedDecision.playoutDelayUs);
+                metrics.simulatedPlayoutDelayUs.add(
+                    simulatedDecision.playoutDelayUs);
+                bool recordedLateArrival = false;
+                if (columns.playoutDelayUs >= 0) {
+                    const uint64_t recordedPlayoutDelayUs = unsignedField(
+                        fields, columns.playoutDelayUs);
+                    metrics.observedPlayoutDelayUs.add(
+                        recordedPlayoutDelayUs);
+                    recordedLateArrival =
+                        capturedParameters.timestampPlayoutEnabled != 0 &&
+                        signedField(fields, columns.readyOffsetUs) >
+                            static_cast<qint64>(recordedPlayoutDelayUs);
+                }
+                metrics.observedSenderCadence.observe(
+                    senderUs, decodeCompleteUs, recordedSubmissionUs,
+                    recordedLateArrival, recordedLeadJump,
+                    simulatedDisplayPeriodUs);
+                metrics.simulatedSenderCadence.observe(
+                    senderUs, decodeCompleteUs, simulatedSubmissionUs,
+                    simulatedLateArrival, simulatedLeadJump,
+                    simulatedDisplayPeriodUs);
+                metrics.stockSenderCadence.observe(
+                    senderUs, decodeCompleteUs,
+                    saturatingAdd(decodeCompleteUs,
+                                  saturatingAdd(preparationUs,
+                                                recordedPresentCallUs)),
+                    false, false, simulatedDisplayPeriodUs);
+            }
             addCadenceFrame(metrics.observedRateBands,
                 timelineDetails.recordedSourceRateHz, decodeCompleteUs,
                 recordedSubmissionUs, timelineDetails.recordedCadence,
@@ -13527,6 +14211,7 @@ int main(int argc, char* argv[])
         QString::fromLatin1(decodedTraceHash.result().toHex()),
         capturedConfig.displayRefreshHz, capturedConfig.streamRateHz,
         simulatedConfig.displayRefreshHz, simulatedConfig.streamRateHz,
+        capturedConfig.allowAdditionalQueuedFrame,
         simulatedCanLatch, scenario);
     bool comparisonCompatible = true;
     if (parser.isSet(compareOption)) {

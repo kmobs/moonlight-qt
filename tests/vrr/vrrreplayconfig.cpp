@@ -356,16 +356,19 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
     if (value.baseGuardDivisor == 0 ||
+            value.pacingLatencyExtraPeriodDenominator == 0 ||
             value.majorCadenceRatioDenominator == 0 ||
             value.candidateCadenceRatioDenominator == 0 ||
             value.readinessAttackDenominator == 0 ||
             value.readinessReleaseDenominator == 0 ||
+            value.readinessPeriodFloorDenominator == 0 ||
             value.usableHeadroomDenominator == 0 ||
             value.latchedPresentationHeadroomPeriodDenominator == 0 ||
             value.latchedPresentationExitHeadroomPeriodDenominator == 0) {
         return fail("parameter denominators must be non-zero");
     }
-    if (value.renderLeadFloorUs > value.renderLeadCeilingUs ||
+    if ((value.renderLeadCeilingUs != 0 &&
+         value.renderLeadFloorUs > value.renderLeadCeilingUs) ||
             value.minimumGuardUs > value.maximumBaseGuardUs ||
             value.maximumBaseGuardUs > value.maximumAdaptiveGuardUs ||
             value.minimumReadinessReserveUs > value.readinessCeilingUs ||
@@ -391,8 +394,41 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.rateCandidateSamples < 2 || value.phaseErrorFrames == 0) {
         return fail("sample counts and frame thresholds must be consistent and non-zero");
     }
+    if (value.latchedPresentationBaseGuardExit > 1) {
+        return fail("latch_base_guard_exit must be 0 or 1");
+    }
+    if (value.retainReadinessOnPhaseReset > 1) {
+        return fail("retain_readiness_on_phase_reset must be 0 or 1");
+    }
+    if (value.timestampPlayoutEnabled > 1) {
+        return fail("timestamp_playout_enabled must be 0 or 1");
+    }
+    if (value.playoutOffsetWindowUs == 0) {
+        return fail("playout_offset_window_us must be non-zero");
+    }
+    if (value.playoutDelayAdaptive > 1) {
+        return fail("playout_delay_adaptive must be 0 or 1");
+    }
+    if (value.playoutDelayMinimumUs > value.playoutDelayMaximumUs) {
+        return fail("playout_delay_minimum_us must not exceed playout_delay_maximum_us");
+    }
+    if (value.playoutDelayPercentilePerMille > 1000) {
+        return fail("playout_delay_percentile_per_mille must be in 0..1000");
+    }
+    if (value.playoutSmoothingGainPerMille > 1000 ||
+            value.playoutSmoothingPeriodAlphaPerMille > 1000 ||
+            value.playoutSmoothingSnapPerMille > 1000) {
+        return fail("playout_smoothing gain, period alpha and snap must be in 0..1000");
+    }
+    if (value.playoutDelayMinimumSamples == 0 ||
+            value.playoutDelayReservoirSamples == 0 ||
+            value.playoutBandWidthHz == 0 ||
+            value.playoutStallExclusionUs == 0) {
+        return fail("playout delay sample counts, band width and stall exclusion must be non-zero");
+    }
     const unsigned int percents[] = {
-        value.materialRateChangePercent, value.preparationPercentile,
+        value.materialRateChangePercent, value.renderBaselinePercentile,
+        value.preparationPercentile,
         value.schedulerPercentile, value.readinessLowPercentile,
         value.readinessTightPercentile, value.readinessLoosePercentile,
     };
@@ -402,6 +438,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.readinessLowPercentile > value.readinessLoosePercentile ||
             value.readinessLoosePercentile > value.readinessTightPercentile) {
         return fail("readiness percentiles must be low <= loose <= tight");
+    }
+    if (value.renderBaselinePercentile > value.preparationPercentile) {
+        return fail("render percentiles must be baseline <= preparation");
     }
     return true;
 }
@@ -555,8 +594,10 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
     }
     configuration = VrrReplayConfiguration {};
     if (root.contains("parameters")) {
+        const QJsonObject parameterObject =
+            root.value("parameters").toObject();
         if (!root.value("parameters").isObject() ||
-                !applyParametersObject(root.value("parameters").toObject(),
+                !applyParametersObject(parameterObject,
                                        configuration.commonController,
                                        configuration.commonWorker,
                                        configuration.commonDisplay,
@@ -564,6 +605,9 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
                                        error)) {
             return false;
         }
+        configuration.commonControllerCustomized =
+            parameterObject.value("controller").isObject() &&
+            !parameterObject.value("controller").toObject().isEmpty();
     }
     const QJsonValue scenariosValue = root.value("scenarios");
     if (!scenariosValue.isArray() || scenariosValue.toArray().isEmpty()) {
@@ -582,6 +626,8 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
         }
         VrrReplayScenario scenario;
         scenario.controller = configuration.commonController;
+        scenario.controllerCustomized =
+            configuration.commonControllerCustomized;
         scenario.worker = configuration.commonWorker;
         scenario.display = configuration.commonDisplay;
         scenario.execution = configuration.commonExecution;
@@ -594,12 +640,19 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
         if (scenario.mode != "fixed" && scenario.mode != "worker") {
             error = "scenario mode must be fixed or worker"; return false;
         }
-        if (object.contains("parameters") &&
-                (!object.value("parameters").isObject() ||
-                 !applyParametersObject(object.value("parameters").toObject(),
+        if (object.contains("parameters")) {
+            const QJsonObject parameterObject =
+                object.value("parameters").toObject();
+            if (!object.value("parameters").isObject() ||
+                 !applyParametersObject(parameterObject,
                                         scenario.controller, scenario.worker,
                                         scenario.display, scenario.execution,
-                                        error))) return false;
+                                        error)) return false;
+            scenario.controllerCustomized =
+                scenario.controllerCustomized ||
+                (parameterObject.value("controller").isObject() &&
+                 !parameterObject.value("controller").toObject().isEmpty());
+        }
         if (object.contains("assertions")) {
             if (!object.value("assertions").isArray()) {
                 error = "scenario assertions must be an array"; return false;
@@ -658,7 +711,11 @@ bool applyVrrReplayOverride(const QString& expression,
     QJsonObject section;
     section[path.section('.', 1, 1)] = static_cast<double>(number);
     if (path.startsWith("controller.")) {
-        return applyControllerObject(section, scenario.controller, error);
+        if (!applyControllerObject(section, scenario.controller, error)) {
+            return false;
+        }
+        scenario.controllerCustomized = true;
+        return true;
     }
     if (path.startsWith("worker.")) {
         return applyWorkerObject(section, scenario.worker, error);
@@ -672,4 +729,19 @@ bool applyVrrReplayOverride(const QString& expression,
     error = "override must start with controller., worker., display., or execution.: " +
         expression;
     return false;
+}
+
+bool applyVrrReplayControllerSnapshot(const QJsonObject& object,
+                                      VrrTimingParameters& parameters,
+                                      QString& error)
+{
+    // Captured parameters are one coherent controller snapshot. Applying
+    // interdependent fields one at a time can temporarily invert a valid
+    // floor/ceiling or hysteresis pair against the current defaults.
+    VrrTimingParameters candidate = parameters;
+    if (!applyControllerObject(object, candidate, error)) {
+        return false;
+    }
+    parameters = candidate;
+    return true;
 }

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <vector>
 
 namespace {
 
@@ -114,7 +115,9 @@ void testTimingFormulaeAndReserveCap()
                    expectedGuardUs,
            "headroom must subtract one display period and the guard");
     expect(first.targetUs ==
-               100000 + first.renderLeadUs + parameters.presentationSafetyUs &&
+               100000 + first.renderLeadUs +
+                   parameters.presentationSafetyUs +
+                   parameters.sourcePlayoutDelayUs &&
                first.renderStartUs ==
                    first.targetUs - first.renderLeadUs - first.renderWakeLeadUs,
            "target must include render lead and presentation safety");
@@ -133,6 +136,407 @@ void testTimingFormulaeAndReserveCap()
     capped.noteSubmission(true, false, cappedDecision.targetUs);
     expect(capped.renderLeadUs() <= capped.sourcePeriodUs(),
            "render lead must never exceed the source period");
+}
+
+void testSourcePlayoutDelayOffsetsProjectedTargets()
+{
+    VrrTimingParameters parameters;
+    parameters.sourcePlayoutDelayUs = 12000;
+    VrrTimingController buffered(config(60, 120), true, parameters);
+    VrrTimingController direct(config(60, 120), true,
+                               VrrTimingParameters {});
+
+    const VrrTimingDecision bufferedFirst = buffered.schedule(
+        frame(1, 0, true, 100000), 100000);
+    const VrrTimingDecision directFirst = direct.schedule(
+        frame(1, 0, true, 100000), 100000);
+    expect(bufferedFirst.targetUs ==
+               directFirst.targetUs + parameters.sourcePlayoutDelayUs,
+           "source playout delay must offset the projected target instead of the arrival-time clamp");
+    expect(bufferedFirst.timingBudgetUs ==
+               directFirst.timingBudgetUs + parameters.sourcePlayoutDelayUs,
+           "source playout delay must be reported in the timing budget");
+
+    const VrrSessionConfig lowLatency = config(60, 120);
+    VrrSessionConfig smoothness = lowLatency;
+    smoothness.allowAdditionalQueuedFrame = true;
+    const VrrTimingParameters lowLatencyPolicy =
+        vrrTimingParametersForSession(lowLatency);
+    const VrrTimingParameters smoothnessPolicy =
+        vrrTimingParametersForSession(smoothness);
+    expect(lowLatencyPolicy.timestampPlayoutEnabled == 1 &&
+               lowLatencyPolicy.playoutDelayAdaptive == 1 &&
+               lowLatencyPolicy.sourcePlayoutDelayUs == 3000 &&
+               lowLatencyPolicy.playoutDelayStartUs == 6000 &&
+               lowLatencyPolicy.playoutDelayMinimumUs == 1000 &&
+               lowLatencyPolicy.playoutDelayMaximumUs == 8000 &&
+               lowLatencyPolicy.playoutDelayPercentilePerMille == 999 &&
+               lowLatencyPolicy.playoutSmoothingGainPerMille == 150 &&
+               lowLatencyPolicy.playoutSmoothingMaxLagUs == 8000 &&
+               lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
+               lowLatencyPolicy.pacingLatencyQueueModeExtra == 0 &&
+               lowLatencyPolicy.readinessLowPercentile == 0 &&
+               lowLatencyPolicy.readinessLoosePercentile == 80 &&
+               lowLatencyPolicy.retainReadinessOnPhaseReset == 0,
+           "sessions must resolve the single adaptive p99.9 timestamp playout policy");
+    expect(smoothnessPolicy.playoutDelayAdaptive ==
+                   lowLatencyPolicy.playoutDelayAdaptive &&
+               smoothnessPolicy.playoutDelayStartUs ==
+                   lowLatencyPolicy.playoutDelayStartUs &&
+               smoothnessPolicy.playoutDelayMaximumUs ==
+                   lowLatencyPolicy.playoutDelayMaximumUs &&
+               smoothnessPolicy.playoutDelayPercentilePerMille ==
+                   lowLatencyPolicy.playoutDelayPercentilePerMille &&
+               smoothnessPolicy.pacingLatencyQueueModeExtra == 0,
+           "the retired smoothness flag must not change the session policy");
+    VrrSessionConfig legacySmoothness = config(100, 120);
+    legacySmoothness.allowAdditionalQueuedFrame = true;
+    VrrTimingParameters legacyParameters;
+    legacyParameters.timestampPlayoutEnabled = 0;
+    VrrTimingController legacy(legacySmoothness, true, legacyParameters);
+    VrrTimingController current(legacySmoothness, true, smoothnessPolicy);
+    expect(legacy.diagnostics().pacingLatencyBudgetUs ==
+               current.diagnostics().pacingLatencyBudgetUs +
+                   legacy.sourcePeriodUs(),
+           "only captures made under the retired option keep its extra render budget");
+}
+
+void testSmoothnessTimestampPlayoutHoldsFixedDelay()
+{
+    // 60 FPS on 120 Hz so the display-spacing floor never binds and every
+    // target is decided by the playout schedule alone.
+    VrrSessionConfig session = config(60, 120);
+    session.allowAdditionalQueuedFrame = true;
+    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    // This test covers the fixed-delay mechanism; the calibrator and the
+    // cadence smoother have their own.
+    policy.playoutDelayAdaptive = 0;
+    policy.playoutSmoothingGainPerMille = 0;
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const uint64_t delayUs = policy.sourcePlayoutDelayUs;
+
+    const auto rtpFor = [](int i) {
+        return static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 60ULL);
+    };
+    // Deterministic jitter in [0, 3000) us, all below the 5 ms delay. Every
+    // fiftieth frame arrives with zero jitter so the three-second offset
+    // window always contains the true floor and the mapping stays fixed.
+    const auto jitterFor = [](int i) {
+        if (i % 50 == 0) {
+            return static_cast<uint64_t>(0);
+        }
+        return static_cast<uint64_t>((static_cast<uint64_t>(i) * 7919ULL) % 3001ULL);
+    };
+
+    VrrTimingDecision decision;
+    uint64_t previousTargetUs = 0;
+    unsigned int spacingErrors = 0;
+    unsigned int reserveReports = 0;
+    for (int i = 0; i < 400; ++i) {
+        const uint32_t timestamp = rtpFor(i);
+        const uint64_t idealUs = decodedTimeForRtp(epochUs, timestamp);
+        const uint64_t decodedUs = idealUs + jitterFor(i);
+        decision = controller.schedule(
+            frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        expect(i == 0 || (!decision.rebased && !decision.phaseDiscontinuity),
+               "sub-delay jitter must never re-anchor the timestamp clock");
+        if (decision.readinessBudgetUs != 0 ||
+                controller.diagnostics().appliedReadinessReserveUs != 0) {
+            ++reserveReports;
+        }
+        if (i > 0) {
+            const uint64_t expectedSpacingUs =
+                idealUs - decodedTimeForRtp(epochUs, rtpFor(i - 1));
+            const uint64_t spacingUs = decision.targetUs - previousTargetUs;
+            if (spacingUs != expectedSpacingUs) {
+                if (spacingErrors < 5) {
+                    std::fprintf(stderr,
+                                 "playout spacing i=%d target=%llu ideal=%llu decoded=%llu spacing=%llu expected=%llu offset=%lld ready=%lld source=%llu lead=%llu flags=%d%d%d\n",
+                                 i,
+                                 static_cast<unsigned long long>(decision.targetUs),
+                                 static_cast<unsigned long long>(idealUs),
+                                 static_cast<unsigned long long>(decodedUs),
+                                 static_cast<unsigned long long>(spacingUs),
+                                 static_cast<unsigned long long>(expectedSpacingUs),
+                                 static_cast<long long>(controller.playoutOffsetUs()),
+                                 static_cast<long long>(decision.readyOffsetUs),
+                                 static_cast<unsigned long long>(decision.sourceTimeUs),
+                                 static_cast<unsigned long long>(decision.renderLeadUs),
+                                 decision.rebased ? 1 : 0,
+                                 decision.phaseDiscontinuity ? 1 : 0,
+                                 decision.sourceRateChanged ? 1 : 0);
+                }
+                ++spacingErrors;
+            }
+        }
+        previousTargetUs = decision.targetUs;
+    }
+    expect(spacingErrors == 0,
+           "timestamp playout must reproduce sender spacing exactly under sub-delay jitter");
+    expect(reserveReports == 0,
+           "timestamp playout must not apply or report a learned readiness reserve");
+    expect(controller.timestampPlayoutActive(),
+           "smoothness sessions with RTP timestamps must use timestamp playout");
+    expect(controller.playoutOffsetUs() == static_cast<int64_t>(epochUs),
+           "the applied offset must be the earliest arrival in the window");
+    expect(decision.targetUs ==
+               decodedTimeForRtp(epochUs, rtpFor(399)) + delayUs +
+                   decision.renderLeadUs,
+           "every target must sit exactly one fixed delay after mapped sender time");
+    expect(controller.timingBudgetUs() == delayUs,
+           "the timing budget must report only the fixed playout delay");
+
+    // A frame later than the delay clamps to now and nothing else moves.
+    const uint32_t lateTimestamp = rtpFor(400);
+    const uint64_t lateIdealUs = decodedTimeForRtp(epochUs, lateTimestamp);
+    const uint64_t lateDecodedUs = lateIdealUs + delayUs + 1500;
+    const VrrTimingDecision late = controller.schedule(
+        frame(401, lateTimestamp, true, lateDecodedUs), lateDecodedUs);
+    controller.noteSubmission(true, false, late.targetUs);
+    expect(late.targetUs == lateDecodedUs + late.renderLeadUs,
+           "a frame later than the delay must present as soon as it is ready");
+    expect(!late.phaseDiscontinuity && !late.rebased &&
+               controller.playoutOffsetUs() == static_cast<int64_t>(epochUs),
+           "one late frame must not move the sender clock mapping");
+
+    const uint32_t nextTimestamp = rtpFor(401);
+    const uint64_t nextIdealUs = decodedTimeForRtp(epochUs, nextTimestamp);
+    const VrrTimingDecision next = controller.schedule(
+        frame(402, nextTimestamp, true, nextIdealUs + 200), nextIdealUs + 200);
+    controller.noteSubmission(true, false, next.targetUs);
+    expect(next.targetUs == nextIdealUs + delayUs + next.renderLeadUs,
+           "the frame after a late frame must return to its own slot");
+
+    // Slow clock drift is followed at the slew rate, never as a jump.
+    const int64_t offsetBeforeDrift = controller.playoutOffsetUs();
+    uint64_t maximumSpacingErrorUs = 0;
+    previousTargetUs = next.targetUs;
+    for (int i = 402; i < 1400; ++i) {
+        const uint32_t timestamp = rtpFor(i);
+        const uint64_t idealUs = decodedTimeForRtp(epochUs, timestamp);
+        // Frames arrive one microsecond later per frame relative to RTP.
+        const uint64_t decodedUs = idealUs + static_cast<uint64_t>(i - 401);
+        decision = controller.schedule(
+            frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        const uint64_t expectedSpacingUs =
+            idealUs - decodedTimeForRtp(epochUs, rtpFor(i - 1));
+        const uint64_t spacingUs = decision.targetUs - previousTargetUs;
+        const uint64_t errorUs = spacingUs > expectedSpacingUs ?
+            spacingUs - expectedSpacingUs : expectedSpacingUs - spacingUs;
+        maximumSpacingErrorUs = std::max(maximumSpacingErrorUs, errorUs);
+        previousTargetUs = decision.targetUs;
+    }
+    expect(controller.playoutOffsetUs() > offsetBeforeDrift + 500,
+           "the mapping offset must follow sustained drift");
+    expect(maximumSpacingErrorUs <= policy.playoutOffsetSlewUs,
+           "drift tracking must never move a target by more than the slew per frame");
+}
+
+void testCadenceSmoothingEvensJitteredSource()
+{
+    // A steady 60 FPS game whose host stamps jitter +-3 ms per frame. With
+    // smoothing off the presented intervals copy that jitter; with the
+    // session policy they must be far more even, at a bounded lag behind
+    // the raw slot, without ever re-anchoring.
+    VrrSessionConfig session = config(60, 120);
+    const uint64_t epochUs = 1000000;
+    const auto stampFor = [](int i) {
+        // Deterministic jitter in [-3000, 3000) us on the sender stamp.
+        const int64_t jitterUs =
+            static_cast<int64_t>((static_cast<uint64_t>(i) * 7919ULL) % 6000ULL) -
+            3000;
+        // Start 10 ms in so the jitter never makes the first stamp wrap.
+        const int64_t idealUs = 10000 + static_cast<int64_t>(i) * 1000000LL / 60LL;
+        return static_cast<uint32_t>((idealUs + jitterUs) * 90LL / 1000LL);
+    };
+    const auto run = [&](uint64_t gainPerMille, double& spreadUs,
+                         int64_t& maximumLagUs, unsigned int& resets) {
+        VrrTimingParameters policy = vrrTimingParametersForSession(session);
+        policy.playoutDelayAdaptive = 0;
+        policy.sourcePlayoutDelayUs = 8000;
+        policy.playoutSmoothingGainPerMille = gainPerMille;
+        VrrTimingController controller(session, true, policy);
+        std::vector<int64_t> intervals;
+        uint64_t previousTargetUs = 0;
+        maximumLagUs = 0;
+        resets = 0;
+        for (int i = 0; i < 600; ++i) {
+            const uint32_t timestamp = stampFor(i);
+            // The frame decodes a fixed transport delay after its stamp.
+            const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 500;
+            const VrrTimingDecision decision = controller.schedule(
+                frame(i + 1, timestamp, true, decodedUs), decodedUs);
+            controller.noteSubmission(true, false, decision.targetUs);
+            if (i > 0 && (decision.rebased || decision.phaseDiscontinuity)) {
+                ++resets;
+            }
+            if (i >= 100) {
+                intervals.push_back(static_cast<int64_t>(decision.targetUs) -
+                                    static_cast<int64_t>(previousTargetUs));
+                maximumLagUs = std::max(maximumLagUs,
+                                        decision.cadenceSmoothingUs);
+            }
+            previousTargetUs = decision.targetUs;
+        }
+        double mean = 0;
+        for (int64_t value : intervals) mean += static_cast<double>(value);
+        mean /= static_cast<double>(intervals.size());
+        double variance = 0;
+        for (int64_t value : intervals) {
+            variance += (static_cast<double>(value) - mean) *
+                (static_cast<double>(value) - mean);
+        }
+        spreadUs = std::sqrt(variance / static_cast<double>(intervals.size()));
+    };
+    double rawSpreadUs = 0;
+    double smoothSpreadUs = 0;
+    int64_t rawLagUs = 0;
+    int64_t smoothLagUs = 0;
+    unsigned int rawResets = 0;
+    unsigned int smoothResets = 0;
+    run(0, rawSpreadUs, rawLagUs, rawResets);
+    run(150, smoothSpreadUs, smoothLagUs, smoothResets);
+    std::fprintf(stderr,
+                 "cadence smoothing: raw spread=%.0f us lag=%lld resets=%u; smoothed spread=%.0f us lag=%lld resets=%u\n",
+                 rawSpreadUs, static_cast<long long>(rawLagUs), rawResets,
+                 smoothSpreadUs, static_cast<long long>(smoothLagUs),
+                 smoothResets);
+    expect(rawSpreadUs > 1500.0,
+           "with smoothing off the presented intervals must copy the sender jitter");
+    expect(smoothSpreadUs < rawSpreadUs / 3.0,
+           "the session smoother must cut the presented interval spread by at least 3x");
+    expect(smoothLagUs <= 8000 && smoothLagUs > 0,
+           "the smoothed schedule must lag the raw slot by at most the configured maximum");
+    expect(rawResets == 0 && smoothResets == 0,
+           "sender stamp jitter must never re-anchor the timestamp clock");
+}
+
+void testAdaptivePlayoutDelayCalibratesPerBand()
+{
+    VrrSessionConfig session = config(116, 120);
+    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const auto rtpFor = [](int i, int rateHz) {
+        return static_cast<uint32_t>(
+            static_cast<uint64_t>(i) * 90000ULL /
+            static_cast<uint64_t>(rateHz));
+    };
+    // Uniform-ish jitter in [0, 3000) us with a zero every 50th frame so the
+    // mapping floor stays fixed: p98 is about 2940 us.
+    const auto jitterFor = [](int i) {
+        if (i % 50 == 0) {
+            return static_cast<uint64_t>(0);
+        }
+        return static_cast<uint64_t>((static_cast<uint64_t>(i) * 7919ULL) % 3001ULL);
+    };
+
+    VrrTimingDecision decision;
+    bool startHeld = true;
+    uint64_t maximumStepUs = 0;
+    uint64_t previousDelayUs = 0;
+    for (int i = 0; i < 1500; ++i) {
+        const uint32_t timestamp = rtpFor(i, 116);
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + jitterFor(i);
+        decision = controller.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (i < 400 && decision.playoutDelayUs != policy.playoutDelayStartUs) {
+            startHeld = false;
+        }
+        if (i > 0) {
+            const uint64_t stepUs = decision.playoutDelayUs > previousDelayUs ?
+                decision.playoutDelayUs - previousDelayUs :
+                previousDelayUs - decision.playoutDelayUs;
+            maximumStepUs = std::max(maximumStepUs, stepUs);
+        }
+        previousDelayUs = decision.playoutDelayUs;
+    }
+    expect(startHeld,
+           "the delay must hold the start value until the band has enough samples to release");
+    expect(controller.playoutBandIndex() == 116 / 20,
+           "the band must follow the fitted source rate");
+    const uint64_t expectedUs = 2940 + policy.playoutDelayMarginUs;
+    expect(decision.playoutDelayUs >= expectedUs - 200 &&
+               decision.playoutDelayUs <= expectedUs + 200,
+           "the delay must converge to the target lateness percentile plus margin");
+    expect(maximumStepUs <= std::max(policy.playoutDelayAttackUs,
+                                     policy.playoutDelayReleaseUs),
+           "the delay must never move more than one slew step per frame within a band");
+    expect(controller.timingBudgetUs() == decision.playoutDelayUs,
+           "the timing budget must report the applied adaptive delay");
+
+    // A worse regime: one frame in ten arrives 6 ms late. The delay must
+    // attack upward at the attack rate, never in one jump.
+    const uint64_t delayBeforeUs = decision.playoutDelayUs;
+    uint64_t maximumRiseUs = 0;
+    for (int i = 1500; i < 2500; ++i) {
+        const uint32_t timestamp = rtpFor(i, 116);
+        const uint64_t lateUs = (i % 10 == 0) ? 6000 : 0;
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + jitterFor(i) + lateUs;
+        decision = controller.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (decision.playoutDelayUs > previousDelayUs) {
+            maximumRiseUs = std::max(maximumRiseUs, decision.playoutDelayUs - previousDelayUs);
+        }
+        previousDelayUs = decision.playoutDelayUs;
+    }
+    expect(decision.playoutDelayUs > delayBeforeUs + 2000,
+           "a sustained late regime must raise the delay");
+    expect(maximumRiseUs <= policy.playoutDelayAttackUs,
+           "the delay must rise at most one attack step per frame");
+
+    // A cadence change to 60 FPS opens a new band that starts high again.
+    const uint64_t baseUs = decodedTimeForRtp(epochUs, rtpFor(2500, 116));
+    bool sawStartInNewBand = false;
+    for (int i = 0; i < 200; ++i) {
+        const uint32_t timestamp = rtpFor(2500, 116) + rtpFor(i, 60);
+        const uint64_t decodedUs = baseUs + static_cast<uint64_t>(i) * 1000000ULL / 60ULL;
+        decision = controller.schedule(frame(2501 + i, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (controller.playoutBandIndex() == 60 / 20 &&
+                decision.playoutDelayUs == policy.playoutDelayStartUs) {
+            sawStartInNewBand = true;
+        }
+    }
+    expect(controller.playoutBandIndex() == 60 / 20,
+           "a material rate change must move to the new band");
+    expect(sawStartInNewBand,
+           "a new band must start from the mode's high start value");
+}
+
+void testSmoothnessLearningWindowTracksCadence()
+{
+    // The quarter-second learning window remains a replay-selectable policy
+    // even though the production smoothness session no longer uses it.
+    const auto learnedSampleCount = [](int sourceRateHz) {
+        VrrSessionConfig session = config(sourceRateHz, 240);
+        session.allowAdditionalQueuedFrame = true;
+        VrrTimingParameters parameters;
+        parameters.readinessLearningWindowUs = 250000;
+        parameters.readinessLearningSamples = 120;
+        VrrTimingController controller(session, true, parameters);
+        const uint64_t epochUs = 100000;
+        for (int i = 0; i < 140; ++i) {
+            const uint32_t timestamp = static_cast<uint32_t>(
+                static_cast<uint64_t>(i) * 90000ULL /
+                static_cast<uint64_t>(sourceRateHz));
+            const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp);
+            const VrrTimingDecision decision = controller.schedule(
+                frame(i + 1, timestamp, true, decodedUs), decodedUs);
+            controller.noteSubmission(true, false, decision.targetUs);
+        }
+        return controller.diagnostics().readinessSamples;
+    };
+
+    const size_t samples60 = learnedSampleCount(60);
+    const size_t samples120 = learnedSampleCount(120);
+    expect(samples60 == 16,
+           "the quarter-second readiness window must retain its robust 16-sample floor at 60 FPS");
+    expect(samples120 >= 29 && samples120 <= 31,
+           "the quarter-second readiness window must contain about 30 samples at 120 FPS");
 }
 
 void testLongRunNearRefreshRtpCadence()
@@ -324,16 +728,29 @@ void testSpacingGuardFeedback()
 
 void testNearRefreshRequestsLatchedPresentation()
 {
-    VrrTimingController nearRefresh(config(116, 120));
+    VrrTimingParameters headroomOnlyParameters;
+    headroomOnlyParameters.cadenceStabilityLatchFrames = 0;
+    for (int streamRateHz = 30; streamRateHz <= 115; ++streamRateHz) {
+        VrrTimingController withHeadroom(
+            config(streamRateHz, 120), true, headroomOnlyParameters);
+        const VrrTimingDecision decision = withHeadroom.schedule(
+            frame(1, 0, true, 100000), 100000);
+        expect(!decision.latchedPresentation,
+               "useful in-range cadences at 120 Hz must retain adaptive presentation");
+    }
+
+    VrrTimingController nearRefresh(
+        config(116, 120), true, headroomOnlyParameters);
     VrrTimingDecision decision = nearRefresh.schedule(
         frame(1, 0, true, 100000), 100000);
-    expect(decision.latchedPresentation,
-           "a near-refresh cadence must request latched presentation");
+    expect(decision.headroomUs == 188 && decision.latchedPresentation,
+           "116 FPS must retain its 188 us near-refresh latched path");
 
-    VrrTimingController withHeadroom(config(20, 120));
-    decision = withHeadroom.schedule(frame(1, 0, true, 100000), 100000);
-    expect(!decision.latchedPresentation,
-           "a cadence beyond the display-scaled protection window must keep immediate flips");
+    VrrTimingController boundary(
+        config(115, 120), true, headroomOnlyParameters);
+    decision = boundary.schedule(frame(1, 0, true, 100000), 100000);
+    expect(decision.headroomUs == 263 && !decision.latchedPresentation,
+           "115 FPS must remain adaptive with 263 us of headroom");
 
     VrrTimingController immutableMailbox(config(116, 120), false);
     decision = immutableMailbox.schedule(
@@ -342,51 +759,109 @@ void testNearRefreshRequestsLatchedPresentation()
            "an immutable cadence-following backend must not be classified as fixed-vsync latched");
 }
 
-void testLatchedPresentationRecoversAfterGuardDecay()
+void testLatchedPresentationUsesFullHysteresis()
 {
-    // Just below one quarter of a 144 Hz display rate, the base guard leaves a
-    // small margin beyond the three-display-period protection window. A spacing
-    // correction should select latching while needed, but must not make that
-    // cadence stay latched after the guard returns to normal.
-    VrrTimingController controller(config(35, 144));
-    VrrTimingDecision decision = controller.schedule(
+    const auto decayGuardToBase = [](VrrTimingController& controller,
+                                     uint64_t baseGuardUs) {
+        const VrrTimingParameters& parameters = controller.parameters();
+        const size_t decayCycles = static_cast<size_t>(
+            (controller.guardUs() - baseGuardUs +
+             parameters.guardStepUs - 1) /
+            parameters.guardStepUs);
+        for (size_t i = 0;
+             i < decayCycles * parameters.guardDecayFrames; ++i) {
+            controller.noteSpacingDeficit(0);
+        }
+    };
+
+    // 115 FPS begins between the entry and exit thresholds. A small guard
+    // excursion should latch it, and returning to the base guard must not
+    // immediately undo that decision while it remains inside the band.
+    VrrTimingParameters hysteresisParameters;
+    hysteresisParameters.cadenceStabilityLatchFrames = 0;
+    VrrTimingController borderline(
+        config(115, 120), true, hysteresisParameters);
+    VrrTimingDecision decision = borderline.schedule(
         frame(1, 0, true, 100000), 100000);
     expect(!decision.latchedPresentation,
-           "a cadence beyond the scaled entry window must begin in immediate mode");
+           "115 FPS must begin adaptive above the latch-entry threshold");
 
     const uint64_t baseGuardUs = decision.guardUs;
-    const VrrTimingParameters& parameters = controller.parameters();
-    const uint64_t scaledLatchHeadroomUs =
-        controller.displayPeriodUs() *
-            parameters.latchedPresentationHeadroomPeriodNumerator /
-            parameters.latchedPresentationHeadroomPeriodDenominator;
-    const uint64_t latchHeadroomUs = std::max(
-        parameters.latchedPresentationHeadroomUs,
-        scaledLatchHeadroomUs);
+    const VrrTimingParameters& parameters = borderline.parameters();
+    expect(decision.headroomUs >
+               parameters.latchedPresentationHeadroomUs &&
+           decision.headroomUs <
+               parameters.latchedPresentationExitHeadroomUs,
+           "115 FPS must begin inside the configured hysteresis band");
     const uint64_t latchDeficitUs =
-        decision.headroomUs - latchHeadroomUs + 1;
-    controller.noteSpacingDeficit(latchDeficitUs);
-    decision = controller.schedule(
-        frame(2, 2571, true, 128571), 128571);
+        decision.headroomUs - parameters.latchedPresentationHeadroomUs + 1;
+    borderline.noteSpacingDeficit(latchDeficitUs);
+    decision = borderline.schedule(
+        frame(2, 783, true, 108696), 108696);
     expect(decision.latchedPresentation,
            "a transient guard increase must select the safe latched path");
 
-    const size_t decayCycles = static_cast<size_t>(
-        (controller.guardUs() - baseGuardUs +
-         parameters.guardStepUs - 1) /
-        parameters.guardStepUs);
-    for (size_t i = 0;
-         i < decayCycles * parameters.guardDecayFrames; ++i) {
-        controller.noteSpacingDeficit(0);
-    }
-    decision = controller.schedule(
-        frame(3, 5143, true, 157144), 157144);
+    decayGuardToBase(borderline, baseGuardUs);
+    decision = borderline.schedule(
+        frame(3, 1565, true, 117392), 117392);
+    expect(decision.latchedPresentation,
+           "base-guard recovery inside the hysteresis band must stay latched");
+
+    // 113 FPS has enough base headroom to cross the exit threshold after the
+    // same temporary guard protection decays.
+    VrrTimingController recoverable(
+        config(113, 120), true, hysteresisParameters);
+    decision = recoverable.schedule(
+        frame(1, 0, true, 100000), 100000);
+    const uint64_t recoverableBaseGuardUs = decision.guardUs;
+    expect(!decision.latchedPresentation &&
+               decision.headroomUs >=
+                   parameters.latchedPresentationExitHeadroomUs,
+           "113 FPS must have enough base headroom to exit latching");
+    recoverable.noteSpacingDeficit(
+        decision.headroomUs -
+            parameters.latchedPresentationHeadroomUs + 1);
+    decision = recoverable.schedule(
+        frame(2, 796, true, 108850), 108850);
+    expect(decision.latchedPresentation,
+           "a large guard excursion must latch 113 FPS temporarily");
+    decayGuardToBase(recoverable, recoverableBaseGuardUs);
+    decision = recoverable.schedule(
+        frame(3, 1593, true, 117700), 117700);
     expect(!decision.latchedPresentation,
-           "a fully recovered guard must restore immediate presentation outside the scaled window");
+           "crossing the full exit threshold must restore adaptive presentation");
+
+    // Old traces did exit as soon as the guard reached its base value. Keep
+    // that behavior selectable so exact baseline replay remains possible.
+    VrrTimingParameters legacyParameters;
+    legacyParameters.latchedPresentationBaseGuardExit = 1;
+    legacyParameters.cadenceStabilityLatchFrames = 0;
+    VrrTimingController legacy(config(115, 120), true, legacyParameters);
+    decision = legacy.schedule(frame(1, 0, true, 100000), 100000);
+    const uint64_t legacyBaseGuardUs = decision.guardUs;
+    legacy.noteSpacingDeficit(
+        decision.headroomUs -
+            legacyParameters.latchedPresentationHeadroomUs + 1);
+    decision = legacy.schedule(
+        frame(2, 783, true, 108696), 108696);
+    expect(decision.latchedPresentation,
+           "legacy replay policy must still enter latching");
+    decayGuardToBase(legacy, legacyBaseGuardUs);
+    decision = legacy.schedule(
+        frame(3, 1565, true, 117392), 117392);
+    expect(!decision.latchedPresentation,
+           "legacy replay policy must retain base-guard exit semantics");
 }
 
-void testDisplayScaledLatchedPresentationBoundary()
+void testOptionalDisplayScaledLatchedPresentationBoundary()
 {
+    VrrTimingParameters parameters;
+    parameters.cadenceStabilityLatchFrames = 0;
+    parameters.latchedPresentationHeadroomPeriodNumerator = 3;
+    parameters.latchedPresentationHeadroomPeriodDenominator = 1;
+    parameters.latchedPresentationExitHeadroomPeriodNumerator = 13;
+    parameters.latchedPresentationExitHeadroomPeriodDenominator = 4;
+
     const struct {
         int displayHz;
         int protectedRateHz;
@@ -399,7 +874,8 @@ void testDisplayScaledLatchedPresentationBoundary()
     };
     for (const auto& value : cases) {
         VrrTimingController protectedController(
-            config(value.protectedRateHz, value.displayHz));
+            config(value.protectedRateHz, value.displayHz), true,
+            parameters);
         const VrrTimingDecision protectedDecision =
             protectedController.schedule(
                 frame(1, 0, true, 100000), 100000);
@@ -407,13 +883,58 @@ void testDisplayScaledLatchedPresentationBoundary()
                "three-period latch protection must scale with display refresh");
 
         VrrTimingController adaptiveController(
-            config(value.adaptiveRateHz, value.displayHz));
+            config(value.adaptiveRateHz, value.displayHz), true,
+            parameters);
         const VrrTimingDecision adaptiveDecision =
             adaptiveController.schedule(
                 frame(1, 0, true, 100000), 100000);
         expect(!adaptiveDecision.latchedPresentation,
                "cadence beyond the three-period window must stay adaptive at every display rate");
     }
+}
+
+void testCadenceInstabilityUsesLatchedRecovery()
+{
+    constexpr int sourceRateHz = 90;
+    constexpr uint64_t epochUs = 100000;
+    VrrTimingController controller(config(sourceRateHz, 120));
+    const VrrTimingParameters& parameters = controller.parameters();
+
+    VrrTimingDecision decision = controller.schedule(
+        frame(0, 0, true, epochUs), epochUs);
+    expect(decision.latchedPresentation,
+           "an uninitialized source phase must begin on the safe latched path");
+
+    for (size_t i = 1;
+         i <= parameters.cadenceStabilityLatchFrames; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(
+            i * 90000ULL / sourceRateHz);
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp);
+        decision = controller.schedule(
+            frame(static_cast<int>(i), timestamp, true, decodedUs),
+            decodedUs);
+        expect(decision.latchedPresentation,
+               "cadence recovery must remain latched for the configured clean window");
+    }
+
+    const size_t adaptiveFrame = parameters.cadenceStabilityLatchFrames + 1;
+    uint32_t timestamp = static_cast<uint32_t>(
+        adaptiveFrame * 90000ULL / sourceRateHz);
+    uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp);
+    decision = controller.schedule(
+        frame(static_cast<int>(adaptiveFrame), timestamp, true, decodedUs),
+        decodedUs);
+    expect(!decision.latchedPresentation,
+           "a stable source with ample display headroom must recover adaptive VRR");
+
+    const size_t hitchFrame = adaptiveFrame + 1;
+    timestamp += 9000;
+    decodedUs += 100000;
+    decision = controller.schedule(
+        frame(static_cast<int>(hitchFrame), timestamp, true, decodedUs),
+        decodedUs);
+    expect(decision.phaseDiscontinuity && decision.latchedPresentation,
+           "a source hitch must immediately restore latched protection");
 }
 
 void testHeadroomAwareReadinessReserve()
@@ -754,7 +1275,9 @@ void testQuantizedCadenceProjectsSmoothTargets()
 {
     constexpr uint64_t epochUs = 1000000;
     constexpr uint64_t expectedPeriodUs = 10000;
-    VrrTimingController controller(config(116, 120));
+    VrrSessionConfig smoothnessConfig = config(116, 120);
+    smoothnessConfig.allowAdditionalQueuedFrame = true;
+    VrrTimingController controller(smoothnessConfig);
     VrrTimingDecision decision = controller.schedule(
         frame(0, 0, true, epochUs), epochUs);
     controller.noteSubmission(true, false, decision.targetUs);
@@ -840,6 +1363,124 @@ void testSchedulerDelayFeedback()
     }
     expect(controller.targetWakeLeadUs() == 300,
            "frames without a coarse target sleep must retain learned delay");
+}
+
+void trainRenderDurations(VrrTimingController& controller,
+                          uint64_t baselineUs, uint64_t tailUs)
+{
+    constexpr uint64_t epochUs = 1000000;
+    for (int i = 0; i < 96; ++i) {
+        const uint64_t decodedUs = epochUs +
+            static_cast<uint64_t>(i) * 10000ULL;
+        VrrTimingDecision decision = controller.schedule(
+            frame(i, static_cast<uint32_t>(i * 900), true, decodedUs),
+            decodedUs);
+        controller.notePreparationDuration(i == 95 ? tailUs : baselineUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+    }
+}
+
+void testRenderBaselineDoesNotConsumePacingBudget()
+{
+    VrrTimingController controller(config(100, 120));
+    trainRenderDurations(controller, 9000, 9000);
+
+    const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+    expect(diagnostics.renderBaselineUs == 9000 &&
+               controller.renderLeadUs() == 9000,
+           "stable render work above the old ceiling must be learned in full");
+    expect(diagnostics.renderInsuranceUs == 0,
+           "stable render work must not be counted as pacing insurance");
+    expect(controller.timingBudgetUs() <=
+               diagnostics.pacingLatencyBudgetUs,
+           "unavoidable render baseline must not consume the half-scanout budget");
+}
+
+void testRenderTailSharesHalfScanoutBudget()
+{
+    VrrTimingController controller(config(100, 120));
+    trainRenderDurations(controller, 4000, 10000);
+
+    const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+    expect(diagnostics.renderBaselineUs == 4000,
+           "render baseline must use the configured median percentile");
+    expect(controller.renderLeadUs() >= 7600 &&
+               controller.renderLeadUs() <= 7700,
+           "render p99 must be capped to baseline plus available tail insurance");
+    expect(diagnostics.renderInsuranceUs >= 3600 &&
+               diagnostics.renderInsuranceUs <= 3700,
+           "only the p99-minus-median render tail must consume pacing budget");
+    expect(diagnostics.appliedReadinessReserveUs == 500,
+           "render tail must leave the minimum readiness reserve intact");
+    expect(controller.timingBudgetUs() <=
+               diagnostics.pacingLatencyBudgetUs,
+           "readiness and render-tail insurance must not exceed half a scanout");
+}
+
+void testPacingBudgetAtExtremeRefreshRates()
+{
+    for (int displayRefreshHz = 60; displayRefreshHz <= 2000;
+            displayRefreshHz += 37) {
+        VrrTimingController controller(config(100, displayRefreshHz));
+        trainRenderDurations(controller, 400, 2400);
+        const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+        if (controller.timingBudgetUs() >
+                diagnostics.pacingLatencyBudgetUs) {
+            std::fprintf(stderr,
+                         "refresh %d: pacing=%llu budget=%llu baseline=%llu insurance=%llu readiness=%llu\n",
+                         displayRefreshHz,
+                         static_cast<unsigned long long>(
+                             controller.timingBudgetUs()),
+                         static_cast<unsigned long long>(
+                             diagnostics.pacingLatencyBudgetUs),
+                         static_cast<unsigned long long>(
+                             diagnostics.renderBaselineUs),
+                         static_cast<unsigned long long>(
+                             diagnostics.renderInsuranceUs),
+                         static_cast<unsigned long long>(
+                             diagnostics.appliedReadinessReserveUs));
+        }
+        expect(controller.timingBudgetUs() <=
+                   diagnostics.pacingLatencyBudgetUs,
+               "pacing reserve must remain bounded from 60 through 2000 Hz");
+    }
+}
+
+void testSmoothnessAddsOneSourcePeriodOfReserve()
+{
+    VrrSessionConfig lowLatencyConfig = config(100, 120);
+    VrrSessionConfig smoothnessConfig = lowLatencyConfig;
+    smoothnessConfig.allowAdditionalQueuedFrame = true;
+    VrrTimingController lowLatency(lowLatencyConfig);
+    VrrTimingController smoothness(smoothnessConfig);
+
+    const VrrTimingDiagnostics lowLatencyDiagnostics =
+        lowLatency.diagnostics();
+    const VrrTimingDiagnostics smoothnessDiagnostics =
+        smoothness.diagnostics();
+    expect(smoothnessDiagnostics.pacingLatencyBudgetUs ==
+               lowLatencyDiagnostics.pacingLatencyBudgetUs +
+                   smoothness.sourcePeriodUs(),
+           "smoothness mode must grant exactly one source period of reserve");
+}
+
+void testLegacyReplayPolicyRetainsAbsoluteRenderCeiling()
+{
+    VrrTimingParameters parameters;
+    parameters.renderLeadCeilingUs = 6500;
+    parameters.pacingLatencyBudgetDivisor = 0;
+    VrrTimingController controller(config(100, 120), true, parameters);
+    trainRenderDurations(controller, 9000, 9000);
+
+    const VrrTimingDiagnostics diagnostics = controller.diagnostics();
+    expect(controller.renderLeadUs() == 6500,
+           "legacy replay mode must retain the captured absolute render ceiling");
+    expect(diagnostics.pacingLatencyBudgetUs == 0,
+           "legacy replay mode must mark the pacing latency policy disabled");
+    expect(controller.timingBudgetUs() ==
+               diagnostics.appliedReadinessReserveUs +
+                   controller.renderLeadUs(),
+           "legacy replay timing budget must include the full render lead");
 }
 
 void testTargetWaiterBoundaries()
@@ -975,13 +1616,19 @@ int main()
 {
     testRtpWrapResetAndFallback();
     testTimingFormulaeAndReserveCap();
+    testSourcePlayoutDelayOffsetsProjectedTargets();
+    testSmoothnessTimestampPlayoutHoldsFixedDelay();
+    testCadenceSmoothingEvensJitteredSource();
+    testAdaptivePlayoutDelayCalibratesPerBand();
+    testSmoothnessLearningWindowTracksCadence();
     testLongRunNearRefreshRtpCadence();
     testQuantizedCadenceDoesNotOscillate();
     testNegotiatedRateCeiling();
     testSpacingGuardFeedback();
     testNearRefreshRequestsLatchedPresentation();
-    testLatchedPresentationRecoversAfterGuardDecay();
-    testDisplayScaledLatchedPresentationBoundary();
+    testLatchedPresentationUsesFullHysteresis();
+    testOptionalDisplayScaledLatchedPresentationBoundary();
+    testCadenceInstabilityUsesLatchedRecovery();
     testHeadroomAwareReadinessReserve();
     testCadenceGapAndRateChange();
     testFutureSourceProjectionReseedsPhase();
@@ -994,6 +1641,11 @@ int main()
     testQuantizedCadenceProjectsSmoothTargets();
     testSkippedLocalFramePreservesCadence();
     testSchedulerDelayFeedback();
+    testRenderBaselineDoesNotConsumePacingBudget();
+    testRenderTailSharesHalfScanoutBudget();
+    testPacingBudgetAtExtremeRefreshRates();
+    testSmoothnessAddsOneSourcePeriodOfReserve();
+    testLegacyReplayPolicyRetainsAbsoluteRenderCeiling();
     testTargetWaiterBoundaries();
     testRuntimeParametersChangePolicy();
     return failures == 0 ? 0 : 1;

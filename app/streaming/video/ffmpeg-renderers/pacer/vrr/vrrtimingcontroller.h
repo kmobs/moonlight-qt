@@ -5,30 +5,71 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
+#include <vector>
 
 // This list is also the replay/trace parameter schema. Keeping the JSON name,
 // C++ member, type, and production default together prevents those copies from
-// drifting while avoiding hand-written serialization for every field.
+// drifting while avoiding hand-written serialization for every field. The
+// display-period latch terms default to zero so production uses the absolute
+// headroom thresholds; non-zero ratios remain available to replay captures
+// made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
     X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
-    X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 6500) \
+    X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 0) \
     X(uint64_t, render_lead_slack_us, renderLeadSlackUs, 0) \
+    X(unsigned int, render_baseline_percentile, renderBaselinePercentile, 50) \
+    X(uint64_t, pacing_latency_budget_divisor, pacingLatencyBudgetDivisor, 2) \
+    X(uint64_t, pacing_latency_extra_period_numerator, pacingLatencyExtraPeriodNumerator, 0) \
+    X(uint64_t, pacing_latency_extra_period_denominator, pacingLatencyExtraPeriodDenominator, 1) \
+    X(uint64_t, pacing_latency_queue_mode_extra, pacingLatencyQueueModeExtra, 1) \
     X(uint64_t, presentation_safety_us, presentationSafetyUs, 0) \
+    X(uint64_t, source_playout_delay_us, sourcePlayoutDelayUs, 0) \
+    X(uint64_t, timestamp_playout_enabled, timestampPlayoutEnabled, 0) \
+    X(uint64_t, playout_offset_window_us, playoutOffsetWindowUs, 3000000) \
+    X(uint64_t, playout_offset_slew_us, playoutOffsetSlewUs, 20) \
+    X(size_t, playout_offset_warmup_samples, playoutOffsetWarmupSamples, 64) \
+    X(uint64_t, playout_delay_adaptive, playoutDelayAdaptive, 0) \
+    X(uint64_t, playout_delay_start_us, playoutDelayStartUs, 0) \
+    X(uint64_t, playout_delay_minimum_us, playoutDelayMinimumUs, 1000) \
+    X(uint64_t, playout_delay_maximum_us, playoutDelayMaximumUs, 12000) \
+    X(uint64_t, playout_delay_percentile_per_mille, playoutDelayPercentilePerMille, 980) \
+    X(uint64_t, playout_delay_margin_us, playoutDelayMarginUs, 300) \
+    X(uint64_t, playout_delay_tolerance_us, playoutDelayToleranceUs, 0) \
+    X(uint64_t, playout_delay_attack_us, playoutDelayAttackUs, 50) \
+    X(uint64_t, playout_delay_release_us, playoutDelayReleaseUs, 10) \
+    X(size_t, playout_delay_minimum_samples, playoutDelayMinimumSamples, 250) \
+    X(size_t, playout_delay_release_samples, playoutDelayReleaseSamples, 500) \
+    X(size_t, playout_delay_reservoir_samples, playoutDelayReservoirSamples, 1024) \
+    X(uint64_t, playout_band_width_hz, playoutBandWidthHz, 20) \
+    X(uint64_t, playout_band_stale_us, playoutBandStaleUs, 120000000) \
+    X(uint64_t, playout_stall_exclusion_us, playoutStallExclusionUs, 25000) \
+    X(uint64_t, playout_burst_exclusion_per_mille, playoutBurstExclusionPerMille, 0) \
+    X(uint64_t, playout_smoothing_gain_per_mille, playoutSmoothingGainPerMille, 0) \
+    X(uint64_t, playout_smoothing_period_alpha_per_mille, playoutSmoothingPeriodAlphaPerMille, 50) \
+    X(uint64_t, playout_smoothing_max_lag_us, playoutSmoothingMaxLagUs, 8000) \
+    X(uint64_t, playout_smoothing_snap_per_mille, playoutSmoothingSnapPerMille, 1000) \
     X(uint64_t, readiness_ceiling_us, readinessCeilingUs, 10000) \
     X(uint64_t, minimum_readiness_reserve_us, minimumReadinessReserveUs, 500) \
     X(uint64_t, cold_start_readiness_demand_us, coldStartReadinessDemandUs, 1500) \
     X(uint64_t, arrival_spread_guard_us, arrivalSpreadGuardUs, 900) \
     X(uint64_t, readiness_acquire_step_us, readinessAcquireStepUs, 1000) \
+    X(uint64_t, readiness_learning_window_us, readinessLearningWindowUs, 0) \
+    X(uint64_t, readiness_floor_period_numerator, readinessPeriodFloorNumerator, 0) \
+    X(uint64_t, readiness_floor_period_denominator, readinessPeriodFloorDenominator, 1) \
+    X(uint64_t, retain_readiness_on_phase_reset, retainReadinessOnPhaseReset, 0) \
     X(uint64_t, maximum_render_wake_lead_us, maximumRenderWakeLeadUs, 2000) \
     X(uint64_t, maximum_target_wake_lead_us, maximumTargetWakeLeadUs, 500) \
     X(uint64_t, minimum_guard_us, minimumGuardUs, 100) \
-    X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 1500) \
-    X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 2000) \
-    X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 3) \
+    X(uint64_t, latch_enter_headroom_us, latchedPresentationHeadroomUs, 225) \
+    X(uint64_t, latch_exit_headroom_us, latchedPresentationExitHeadroomUs, 400) \
+    X(uint64_t, latch_base_guard_exit, latchedPresentationBaseGuardExit, 0) \
+    X(size_t, cadence_stability_latch_frames, cadenceStabilityLatchFrames, 64) \
+    X(uint64_t, latch_enter_headroom_period_numerator, latchedPresentationHeadroomPeriodNumerator, 0) \
     X(uint64_t, latch_enter_headroom_period_denominator, latchedPresentationHeadroomPeriodDenominator, 1) \
-    X(uint64_t, latch_exit_headroom_period_numerator, latchedPresentationExitHeadroomPeriodNumerator, 13) \
-    X(uint64_t, latch_exit_headroom_period_denominator, latchedPresentationExitHeadroomPeriodDenominator, 4) \
+    X(uint64_t, latch_exit_headroom_period_numerator, latchedPresentationExitHeadroomPeriodNumerator, 0) \
+    X(uint64_t, latch_exit_headroom_period_denominator, latchedPresentationExitHeadroomPeriodDenominator, 1) \
     X(uint64_t, maximum_base_guard_us, maximumBaseGuardUs, 250) \
     X(uint64_t, maximum_adaptive_guard_us, maximumAdaptiveGuardUs, 1000) \
     X(uint64_t, guard_step_us, guardStepUs, 50) \
@@ -71,10 +112,18 @@ struct VrrTimingParameters {
 #undef VRR_DECLARE_TIMING_PARAMETER
 };
 
+// Resolve mode-dependent production policy once for both the live worker and
+// the replay baseline. Candidate replay configs may still override any field.
+VrrTimingParameters vrrTimingParametersForSession(
+    const VrrSessionConfig& config);
+
 struct VrrTimingDiagnostics {
     int64_t readinessPhaseUs = 0;
     uint64_t readinessDemandUs = 0;
     uint64_t appliedReadinessReserveUs = 0;
+    uint64_t renderBaselineUs = 0;
+    uint64_t renderInsuranceUs = 0;
+    uint64_t pacingLatencyBudgetUs = 0;
     size_t cadenceSamples = 0;
     size_t rateCandidateSamples = 0;
     size_t readinessSamples = 0;
@@ -98,6 +147,12 @@ struct VrrTimingDecision {
 
     int64_t readyOffsetUs = 0;
     int64_t readinessBudgetUs = 0;
+    // The source playout delay this target was built with: the adaptive
+    // per-band delay under timestamp playout, else the fixed parameter.
+    uint64_t playoutDelayUs = 0;
+    // Cadence smoothing: how far this target was moved from its raw mapped
+    // slot (positive = later) to keep presented intervals even.
+    int64_t cadenceSmoothingUs = 0;
 
     uint64_t renderStartUs = 0;
     uint64_t targetUs = 0;
@@ -160,6 +215,16 @@ public:
     uint64_t earliestSubmissionUs() const;
     uint64_t lastSubmissionUs() const;
     bool hasLastSubmission() const;
+    // Timestamp playout: the applied sender-to-local clock offset and whether
+    // the last scheduled frame used the fixed-delay timestamp path.
+    int64_t playoutOffsetUs() const;
+    bool timestampPlayoutActive() const;
+    // Adaptive playout delay: the delay currently applied, the rate band it
+    // belongs to (fitted source rate divided by the band width), and how many
+    // lateness samples that band has admitted.
+    uint64_t playoutDelayUs() const;
+    unsigned int playoutBandIndex() const;
+    uint64_t playoutBandSamples() const;
     const VrrTimingParameters& parameters() const;
     VrrTimingDiagnostics diagnostics() const;
 
@@ -187,6 +252,42 @@ private:
         uint64_t rtpTicks = 0;
     };
 
+    struct PlayoutOffsetSample {
+        uint64_t decodeCompleteUs = 0;
+        int64_t offsetUs = 0;
+    };
+
+    // Per-rate-band lateness reservoir and the delay learned from it.
+    struct PlayoutBand {
+        std::vector<uint64_t> latenessUs;
+        size_t nextIndex = 0;
+        uint64_t samplesSeen = 0;
+        uint64_t lastUsedUs = 0;
+        uint64_t appliedDelayUs = 0;
+        bool applied = false;
+    };
+
+    bool timestampPlayoutEnabled() const;
+    void resetPlayoutOffsets();
+    int64_t observePlayoutOffset(uint64_t decodeCompleteUs,
+                                 int64_t offsetUs);
+    static uint64_t rtpTicksToUs(uint64_t ticks);
+    void updatePlayoutDelay(const PacedFrame& frame,
+                            const CadenceObservation& cadence,
+                            bool rebased, int64_t readyOffsetUs,
+                            uint64_t nowUs);
+    uint64_t effectivePlayoutDelayUs() const;
+    // Cadence smoothing: returns the signed adjustment to add to the raw
+    // mapped slot for this frame, tracking the source period and pulling
+    // toward the raw slot by the configured gain. Resets on discontinuities.
+    int64_t cadenceSmoothingAdjustUs(const CadenceObservation& cadence,
+                                     bool rebased, uint64_t rawBasisUs,
+                                     uint64_t playoutDelayUs);
+    void resetCadenceSmoothing();
+    uint64_t playoutDelayStartUs() const;
+    uint64_t playoutDelayMinimumUs() const;
+    uint64_t playoutDelayMaximumUs() const;
+
     void clearTimeline(bool retainLearnedBudgets);
     void initializeTimeline(const PacedFrame& frame);
     CadenceObservation observeCadence(const PacedFrame& frame);
@@ -203,8 +304,18 @@ private:
     void anchorSourceTime(uint64_t sourceTimeUs);
     void updateLearnedBudgets();
     void updateReadinessModel();
-    void applyReadinessBudget(bool acquireReserve);
+    void applyReadinessBudget(bool acquireReserve,
+                              bool immediateAcquisition = false);
+    void clampReadinessReserveToPolicy();
 
+    uint64_t pacingLatencyBudgetUs() const;
+    bool pacingLatencyPolicyEnabled() const;
+    uint64_t minimumReadinessReserveUs() const;
+    uint64_t renderInsuranceCeilingUs() const;
+    uint64_t renderInsuranceUs() const;
+    uint64_t readinessReserveCeilingUs() const;
+    uint64_t readinessPeriodFloorUs() const;
+    size_t readinessLearningSampleLimit() const;
     uint64_t renderLeadFloorUs() const;
     uint64_t renderLeadCeilingUs() const;
     uint64_t readinessCeilingUs() const;
@@ -237,11 +348,13 @@ private:
     uint64_t m_ReadinessDemandUs = 0;
     uint64_t m_AppliedReadinessReserveUs = 0;
     bool m_ReadinessModelValid = false;
+    uint64_t m_RenderBaselineUs = 0;
     uint64_t m_RenderLeadUs = 0;
     uint64_t m_RenderWakeLeadUs = 0;
     uint64_t m_TargetWakeLeadUs = 0;
     bool m_CanLatchPresentation = true;
     bool m_LatchedPresentation = false;
+    size_t m_CadenceStabilityLatchFramesRemaining = 0;
 
     bool m_HaveTimeline = false;
     uint64_t m_SourceTimeUs = 0;
@@ -260,6 +373,23 @@ private:
     uint64_t m_LastSubmissionUs = 0;
     unsigned int m_CleanSpacingFrames = 0;
     unsigned int m_PhaseErrorFrames = 0;
+
+    std::deque<PlayoutOffsetSample> m_PlayoutOffsets;
+    bool m_PlayoutOffsetValid = false;
+    int64_t m_AppliedPlayoutOffsetUs = 0;
+    uint64_t m_PlayoutSamplesSeen = 0;
+    bool m_TimestampPlayoutActive = false;
+    std::map<unsigned int, PlayoutBand> m_PlayoutBands;
+    unsigned int m_PlayoutBandIndex = 0;
+    bool m_PlayoutBandValid = false;
+    uint64_t m_AppliedPlayoutDelayUs = 0;
+    uint64_t m_LastDecodeCompleteUs = 0;
+    bool m_HaveLastDecodeComplete = false;
+    // Cadence smoothing state: the presented slot the schedule continues
+    // from (target minus lead and safety) and the tracked source period.
+    bool m_HaveSmoothedBasis = false;
+    uint64_t m_LastSmoothedBasisUs = 0;
+    uint64_t m_SmoothedPeriodUs = 0;
 
     std::deque<CadenceSample> m_CadenceSamples;
     std::deque<CadenceSample> m_RateCandidateSamples;

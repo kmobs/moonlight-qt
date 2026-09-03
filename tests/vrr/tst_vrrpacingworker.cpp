@@ -242,6 +242,45 @@ void testQueuedStaleFrameYieldsToFreshSuccessor()
     }
 }
 
+void testSinglePeriodQueueDelayPreservesFluidity()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.blockPreparation();
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first;
+    TrackedFrameLifetime retained;
+    TrackedFrameLifetime fresh;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(),
+               "worker must start for single-period queue recovery");
+        worker.submit(frame(1, first));
+        expect(backend.waitForPrepareCount(1),
+               "active frame must enter preparation before queueing successors");
+
+        worker.submit(frame(2, retained));
+        worker.submit(frame(3, fresh));
+        // This crosses the 60 FPS source period but remains below the bounded
+        // two-period backlog threshold. The captured production bug dropped
+        // content at this boundary despite a valid future target.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        backend.releasePreparation();
+
+        expect(backend.waitForPresentCount(3),
+               "a one-period queue delay must retain every frame");
+        const std::vector<int> presentedFrames = backend.presentedFrames();
+        expect(presentedFrames.size() >= 3 &&
+                   presentedFrames[0] == 1 &&
+                   presentedFrames[1] == 2 &&
+                   presentedFrames[2] == 3,
+               "ordinary pipeline occupancy must preserve frame order");
+        expect(telemetryStats(telemetry).vrrPacingDroppedFrames == 0,
+               "ordinary pipeline occupancy must not manufacture a pacing drop");
+    }
+}
+
 void testTelemetrySnapshotsRemainCumulative()
 {
     PacerTelemetry telemetry;
@@ -383,6 +422,53 @@ void testDeferredSurfaceLifetime()
 
     expect(second.releases.load() == 1,
            "worker destruction must release the final deferred surface");
+}
+
+void testReusableSurfaceReleasedWithoutSuccessor()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setSourceFrameReusable(true);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime reusable;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for reusable lifetime testing");
+        worker.submit(frame(1, reusable));
+        expect(backend.waitForPresentCount(1), "reusable frame must present");
+        expect(waitFor([&reusable] { return reusable.releases.load() == 1; }),
+               "a GPU-complete decoder surface must release without a successor");
+        const std::vector<int> presented = backend.presentedFrames();
+        expect(presented.size() == 1 && presented.front() == 1,
+               "presentation must not depend on the released source frame");
+    }
+
+    expect(reusable.releases.load() == 1,
+           "worker destruction must not release a reusable surface twice");
+}
+
+void testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    backend.setDecodeBoundary(73);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "worker must start for decode-boundary testing");
+        worker.submit(frame(1, lifetime));
+        expect(backend.waitForPresentCount(1),
+               "decode-boundary frame must present");
+        const std::vector<uint64_t> boundaries =
+            backend.preparedDecodeBoundaries();
+        expect(backend.decodeBoundaryCaptureCount() == 1,
+               "each submitted frame must capture one decoder boundary");
+        expect(boundaries.size() == 1 && boundaries.front() == 73,
+               "preparation must receive the submitted frame's exact boundary");
+    }
 }
 
 void testCancelledPresentationCountsAsDroppedOutput()
@@ -683,6 +769,8 @@ void testTraceCapturesEveryDeliveredFrame()
     const int arrivalColumn = columns.indexOf("pacer_arrival_us");
     const int decisionValidColumn = columns.indexOf("decision_valid");
     const int dispositionColumn = columns.indexOf("disposition");
+    const int additionalQueuedFrameColumn =
+        columns.indexOf("additional_queued_frame");
     const int externalRebaseColumn =
         columns.indexOf("external_rebase_applied");
     const int externalRebaseFlagsColumn =
@@ -693,6 +781,9 @@ void testTraceCapturesEveryDeliveredFrame()
         "readiness_phase_us",
         "readiness_demand_us",
         "applied_readiness_reserve_us",
+        "render_baseline_us",
+        "render_insurance_us",
+        "pacing_latency_budget_us",
         "cadence_sample_count",
         "rate_candidate_sample_count",
         "readiness_sample_count",
@@ -846,6 +937,7 @@ void testTraceCapturesEveryDeliveredFrame()
     }
     expect(frameColumn >= 0 && rtpColumn >= 0 && arrivalColumn >= 0 &&
                decisionValidColumn >= 0 && dispositionColumn >= 0 &&
+               additionalQueuedFrameColumn >= 0 &&
                externalRebaseColumn >= 0 &&
                externalRebaseFlagsColumn >= 0 &&
                midframeWindowStateFlagsColumn >= 0 &&
@@ -913,6 +1005,8 @@ void testTraceCapturesEveryDeliveredFrame()
                "replay trace must preserve each raw RTP timestamp");
         expect(fields[arrivalColumn].toULongLong() != 0,
                "replay trace must capture the pacer arrival instant");
+        expect(fields[additionalQueuedFrameColumn] == "0",
+               "default trace rows must record low-latency queue policy");
         if (fields[decisionValidColumn] == "0") {
             for (int diagnosticColumn : controllerDiagnosticColumns) {
                 expect(fields[diagnosticColumn] == "0",
@@ -1011,6 +1105,82 @@ void testTraceCapturesEveryDeliveredFrame()
     SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
 }
 
+void testSmoothnessTraceCapturesReadinessPolicy()
+{
+    resetFakeClock();
+    QTemporaryDir traceDirectory;
+    expect(traceDirectory.isValid(),
+           "smoothness policy trace test must create a temporary directory");
+    const QString tracePath = traceDirectory.filePath("vrr-smoothness-policy.csv");
+    const QByteArray tracePathBytes = QFile::encodeName(tracePath);
+    SDL_setenv("MOONLIGHT_VRR_TRACE", tracePathBytes.constData(), 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+
+    FakeVrrFramePresenter backend;
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+    VrrSessionConfig smoothnessConfig = enabledConfig();
+    {
+        VrrPacingWorker worker(&backend, smoothnessConfig, &telemetry);
+        expect(worker.start(),
+               "worker must start for playout policy tracing");
+        worker.submit(frame(1, lifetime));
+        expect(backend.waitForPresentCount(1),
+               "smoothness policy trace must present one frame");
+    }
+
+    const QList<QByteArray> lines = readExpandedTrace(tracePath).split('\n');
+    const QList<QByteArray> columns = lines.value(0).split(',');
+    const int dispositionColumn = columns.indexOf("disposition");
+    const int additionalQueueColumn =
+        columns.indexOf("additional_queued_frame");
+    const int lowPercentileColumn =
+        columns.indexOf("param_readiness_low_percentile");
+    const int loosePercentileColumn =
+        columns.indexOf("param_readiness_loose_percentile");
+    const int sourceDelayColumn =
+        columns.indexOf("param_source_playout_delay_us");
+    const int timestampPlayoutColumn =
+        columns.indexOf("param_timestamp_playout_enabled");
+    const int retainReserveColumn =
+        columns.indexOf("param_retain_readiness_on_phase_reset");
+    const int adaptiveColumn =
+        columns.indexOf("param_playout_delay_adaptive");
+    const int playoutDelayColumn = columns.indexOf("playout_delay_us");
+    expect(dispositionColumn >= 0 && additionalQueueColumn >= 0 &&
+               lowPercentileColumn >= 0 && loosePercentileColumn >= 0 &&
+               sourceDelayColumn >= 0 && timestampPlayoutColumn >= 0 &&
+               retainReserveColumn >= 0 && adaptiveColumn >= 0 &&
+               playoutDelayColumn >= 0,
+           "smoothness trace must expose its resolved playout policy and the applied delay");
+
+    bool foundPresentedRow = false;
+    for (int i = 1; i < lines.size(); ++i) {
+        if (lines[i].isEmpty() || lines[i].startsWith("#vrr_trace_footer,")) {
+            continue;
+        }
+        const QList<QByteArray> fields = lines[i].split(',');
+        if (fields.value(dispositionColumn) != "presented") {
+            continue;
+        }
+        foundPresentedRow = true;
+        expect(fields.value(additionalQueueColumn) == "0" &&
+                   fields.value(lowPercentileColumn) == "0" &&
+                   fields.value(loosePercentileColumn) == "80" &&
+                   fields.value(sourceDelayColumn) == "3000" &&
+                   fields.value(timestampPlayoutColumn) == "1" &&
+                   fields.value(adaptiveColumn) == "1" &&
+                   fields.value(retainReserveColumn) == "0" &&
+                   fields.value(playoutDelayColumn).toULongLong() >= 1000,
+                "the session must record the single adaptive timestamp playout policy");
+    }
+    expect(foundPresentedRow,
+           "smoothness policy trace must contain a presented row");
+
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+}
+
 void testFailedCancellationNativeEvidenceIsTraced()
 {
     resetFakeClock();
@@ -1106,7 +1276,10 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QByteArray row = lines.value(1);
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
-    expect(header.contains("native_present_call_us") &&
+    expect(header.contains("frame_receive_us") &&
+               header.contains("frame_reassembled_us") &&
+               header.contains("decode_submit_us") &&
+               header.contains("native_present_call_us") &&
                header.contains("presenter_submission_time_valid") &&
                header.contains("presenter_submission_time_us") &&
                header.contains("presenter_submission_time_used") &&
@@ -1222,9 +1395,12 @@ int main()
     testQueueCapacityAndDrops();
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
+    testSinglePeriodQueueDelayPreservesFluidity();
     testTelemetrySnapshotsRemainCumulative();
     testSuspendDiscardAndFreshFrame();
     testDeferredSurfaceLifetime();
+    testReusableSurfaceReleasedWithoutSuccessor();
+    testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly();
     testCancelledPresentationCountsAsDroppedOutput();
     testPresentCallSpacingSetsDisplayFloor();
     testBlockingPresentUsesWorkerCallBoundary();
@@ -1233,6 +1409,7 @@ int main()
     testSuspendedPreparedCancellationHonorsDisplayFloor();
     testImmutablePresentationContract();
     testTraceCapturesEveryDeliveredFrame();
+    testSmoothnessTraceCapturesReadinessPolicy();
     testFailedCancellationNativeEvidenceIsTraced();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
 
