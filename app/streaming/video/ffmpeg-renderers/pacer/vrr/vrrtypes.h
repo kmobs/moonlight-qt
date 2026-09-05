@@ -16,6 +16,13 @@ struct VrrSessionConfig {
     int displayRefreshHz = 0;
     int streamRateHz = 0;
     bool allowAdditionalQueuedFrame = false;
+    // Re-present the last frame inside a gap longer than the panel's
+    // adaptive-refresh floor; zero Hz disables it.
+    bool gapFillEnabled = false;
+    int gapFillMinimumRefreshHz = 0;
+    // A session preference resolved into the recorded controller parameters.
+    // Both modes retain jitter buffering and display-spacing protection.
+    bool smoothFrameTiming = true;
 };
 
 // A move-only frame record.  Decoder completion is captured while the
@@ -49,6 +56,15 @@ public:
     AVFrame* release()
     {
         return m_Frame.release();
+    }
+
+    // The decoder's GPU work was observed to finish after the CPU reported
+    // completion: readiness moves to that later time.
+    void noteGpuReadyUs(uint64_t gpuReadyUs)
+    {
+        if (gpuReadyUs > m_DecodeCompleteUs) {
+            m_DecodeCompleteUs = gpuReadyUs;
+        }
     }
 
     explicit operator bool() const

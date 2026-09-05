@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace {
@@ -29,6 +30,18 @@ VrrSessionConfig config(int streamRateHz = 60, int displayRefreshHz = 120)
     value.streamRateHz = streamRateHz;
     value.displayRefreshHz = displayRefreshHz;
     return value;
+}
+
+// The retired metronome, for the tests that keep it replayable.
+VrrTimingParameters metronomePolicy(const VrrSessionConfig& session)
+{
+    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    policy.playoutSmoothingGainPerMille = 150;
+    policy.playoutMetronomeEnabled = 1;
+    policy.playoutMotionDeadbandEnabled = 0;
+    policy.playoutBandWidthHz = 20;
+    policy.playoutDelaySlewAcrossBands = 0;
+    return policy;
 }
 
 PacedFrame frame(int number, uint32_t timestamp, bool timestampValid,
@@ -170,15 +183,31 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
                lowLatencyPolicy.playoutDelayStartUs == 6000 &&
                lowLatencyPolicy.playoutDelayMinimumUs == 1000 &&
                lowLatencyPolicy.playoutDelayMaximumUs == 8000 &&
-               lowLatencyPolicy.playoutDelayPercentilePerMille == 999 &&
-               lowLatencyPolicy.playoutSmoothingGainPerMille == 150 &&
-               lowLatencyPolicy.playoutSmoothingMaxLagUs == 8000 &&
+               lowLatencyPolicy.playoutDelayPercentilePerMille == 1000 &&
+               lowLatencyPolicy.playoutPrepareOnArrival == 0 &&
+               lowLatencyPolicy.renderStartAfterSubmissionUs == 6000 &&
+               lowLatencyPolicy.renderStartMinimumLeadUs == 2500 &&
+               lowLatencyPolicy.renderLeadFloorUs == 3000 &&
+               lowLatencyPolicy.playoutSmoothingGainPerMille == 200 &&
+               lowLatencyPolicy.playoutSmoothingPeriodAlphaPerMille == 100 &&
+               lowLatencyPolicy.playoutSmoothingMaxLagUs == 6000 &&
+               lowLatencyPolicy.playoutMetronomeEnabled == 0 &&
+               lowLatencyPolicy.playoutDelayStartPeriodPerMille == 950 &&
+               lowLatencyPolicy.playoutDelayMaximumPeriodPerMille == 950 &&
+               lowLatencyPolicy.playoutSmoothingSnapPerMille == 3000 &&
+               lowLatencyPolicy.playoutOffsetReseedFrames == 3 &&
+               lowLatencyPolicy.playoutBandWidthHz == 20 &&
+               lowLatencyPolicy.playoutMotionDeadbandEnabled == 0 &&
+               lowLatencyPolicy.playoutDelaySlewAcrossBands == 1 &&
+               lowLatencyPolicy.rateCandidateMinimumUs == 200000 &&
+               lowLatencyPolicy.playoutStallBurstExclusion == 1 &&
+               lowLatencyPolicy.latchedFloorDisabled == 1 &&
                lowLatencyPolicy.pacingLatencyExtraPeriodNumerator == 0 &&
                lowLatencyPolicy.pacingLatencyQueueModeExtra == 0 &&
                lowLatencyPolicy.readinessLowPercentile == 0 &&
                lowLatencyPolicy.readinessLoosePercentile == 80 &&
                lowLatencyPolicy.retainReadinessOnPhaseReset == 0,
-           "sessions must resolve the single adaptive p99.9 timestamp playout policy");
+           "sessions must resolve the calibrated adaptive timestamp playout policy");
     expect(smoothnessPolicy.playoutDelayAdaptive ==
                    lowLatencyPolicy.playoutDelayAdaptive &&
                smoothnessPolicy.playoutDelayStartUs ==
@@ -201,25 +230,30 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
            "only captures made under the retired option keep its extra render budget");
 }
 
-void testSmoothnessTimestampPlayoutHoldsFixedDelay()
+void testTimestampModePreservesUnevenHostIntervals()
 {
-    // 60 FPS on 120 Hz so the display-spacing floor never binds and every
-    // target is decided by the playout schedule alone.
+    // A 60 FPS average with alternating 13.33/20 ms source intervals.
+    // Both fit a 120 Hz display, so a faithful scheduler must preserve
+    // this real source variation while absorbing separate delivery jitter.
     VrrSessionConfig session = config(60, 120);
-    session.allowAdditionalQueuedFrame = true;
+    session.smoothFrameTiming = false;
     VrrTimingParameters policy = vrrTimingParametersForSession(session);
-    // This test covers the fixed-delay mechanism; the calibrator and the
-    // cadence smoother have their own.
+    expect(policy.timestampPlayoutEnabled == 1 &&
+               policy.playoutDelayAdaptive == 1 &&
+               policy.playoutMetronomeEnabled == 0 &&
+               policy.playoutSmoothingGainPerMille == 0,
+           "disabling frame timing smoothing must keep buffering and disable both smoothers");
+    // Hold the buffering delay constant to isolate interval fidelity;
+    // the adaptive calibrator has separate coverage.
     policy.playoutDelayAdaptive = 0;
-    policy.playoutSmoothingGainPerMille = 0;
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     const uint64_t delayUs = policy.sourcePlayoutDelayUs;
 
     const auto rtpFor = [](int i) {
-        return static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 60ULL);
+        return static_cast<uint32_t>((i / 2) * 3000 + (i % 2) * 1200);
     };
-    // Deterministic jitter in [0, 3000) us, all below the 5 ms delay. Every
+    // Deterministic jitter in [0, 3000] us, within the 3 ms delay. Every
     // fiftieth frame arrives with zero jitter so the three-second offset
     // window always contains the true floor and the mapping stays fixed.
     const auto jitterFor = [](int i) {
@@ -278,7 +312,7 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
     expect(reserveReports == 0,
            "timestamp playout must not apply or report a learned readiness reserve");
     expect(controller.timestampPlayoutActive(),
-           "smoothness sessions with RTP timestamps must use timestamp playout");
+           "sessions with smoothing disabled must still use timestamp playout");
     expect(controller.playoutOffsetUs() == static_cast<int64_t>(epochUs),
            "the applied offset must be the earliest arrival in the window");
     expect(decision.targetUs ==
@@ -335,6 +369,39 @@ void testSmoothnessTimestampPlayoutHoldsFixedDelay()
            "drift tracking must never move a target by more than the slew per frame");
 }
 
+void testTimestampModeStillBoundsCatchUpBursts()
+{
+    VrrSessionConfig session = config(116, 120);
+    session.smoothFrameTiming = false;
+    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    policy.playoutDelayAdaptive = 0;
+    VrrTimingController controller(session, false, policy);
+    const uint64_t epochUs = 1000000;
+    const auto present = [&](int number, uint32_t stamp, uint64_t readyUs) {
+        const VrrTimingDecision decision = controller.schedule(
+            frame(number, stamp, true, readyUs), readyUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        return decision;
+    };
+
+    present(1, 0, epochUs);
+    // A 10 ms source interval, with the second frame arriving 8 ms late.
+    const VrrTimingDecision late = present(2, 900, epochUs + 18000);
+    const uint64_t floorUs = controller.earliestSubmissionUs();
+    // The next frame arrives on time and must not catch up in only 5 ms.
+    const VrrTimingDecision next = present(3, 1800, epochUs + 20000);
+    expect(next.targetUs >= floorUs &&
+               next.targetUs >= late.targetUs + controller.displayPeriodUs() +
+                                   controller.guardUs(),
+           "timestamp mode must retain the adaptive presentation spacing guard");
+    expect(next.targetUs > epochUs + 20000 + policy.sourcePlayoutDelayUs,
+           "display limits must override an infeasibly close host timestamp target");
+    expect(next.targetUs == floorUs,
+           "timestamp mode must not add latency beyond the required spacing floor");
+    expect(next.cadenceSmoothingUs == 0 && controller.timestampPlayoutActive(),
+           "protecting a catch-up burst must not re-enable cadence smoothing");
+}
+
 void testCadenceSmoothingEvensJitteredSource()
 {
     // A steady 60 FPS game whose host stamps jitter +-3 ms per frame. With
@@ -358,6 +425,8 @@ void testCadenceSmoothingEvensJitteredSource()
         policy.playoutDelayAdaptive = 0;
         policy.sourcePlayoutDelayUs = 8000;
         policy.playoutSmoothingGainPerMille = gainPerMille;
+        // The legacy gain smoother is what older captures replay under.
+        policy.playoutMetronomeEnabled = 0;
         VrrTimingController controller(session, true, policy);
         std::vector<int64_t> intervals;
         uint64_t previousTargetUs = 0;
@@ -414,7 +483,7 @@ void testCadenceSmoothingEvensJitteredSource()
            "sender stamp jitter must never re-anchor the timestamp clock");
 }
 
-void testAdaptivePlayoutDelayCalibratesPerBand()
+void testAdaptivePlayoutDelaySlewsAcrossBands()
 {
     VrrSessionConfig session = config(116, 120);
     const VrrTimingParameters policy = vrrTimingParametersForSession(session);
@@ -438,12 +507,18 @@ void testAdaptivePlayoutDelayCalibratesPerBand()
     bool startHeld = true;
     uint64_t maximumStepUs = 0;
     uint64_t previousDelayUs = 0;
-    for (int i = 0; i < 1500; ++i) {
+    constexpr int kReleaseFrames = 2600;
+    for (int i = 0; i < kReleaseFrames; ++i) {
         const uint32_t timestamp = rtpFor(i, 116);
         const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + jitterFor(i);
         decision = controller.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
         controller.noteSubmission(true, false, decision.targetUs);
-        if (i < 400 && decision.playoutDelayUs != policy.playoutDelayStartUs) {
+        // The start value is two fitted source periods; the reservoir opens
+        // on the negotiated 120 FPS period and the fitted 116 FPS one
+        // follows, so both scaled starts are acceptable.
+        const uint64_t scaledStartUs =
+            decision.sourcePeriodUs * policy.playoutDelayStartPeriodPerMille / 1000;
+        if (i < 400 && decision.playoutDelayUs < scaledStartUs - 500) {
             startHeld = false;
         }
         if (i > 0) {
@@ -455,7 +530,7 @@ void testAdaptivePlayoutDelayCalibratesPerBand()
         previousDelayUs = decision.playoutDelayUs;
     }
     expect(startHeld,
-           "the delay must hold the start value until the band has enough samples to release");
+           "the delay must hold the start value until the reservoir has enough samples to release");
     expect(controller.playoutBandIndex() == 116 / 20,
            "the band must follow the fitted source rate");
     const uint64_t expectedUs = 2940 + policy.playoutDelayMarginUs;
@@ -465,14 +540,20 @@ void testAdaptivePlayoutDelayCalibratesPerBand()
     expect(maximumStepUs <= std::max(policy.playoutDelayAttackUs,
                                      policy.playoutDelayReleaseUs),
            "the delay must never move more than one slew step per frame within a band");
-    expect(controller.timingBudgetUs() == decision.playoutDelayUs,
+    // The target is built with the delay in force when its slot was mapped;
+    // the budget reports the calibrator's latest value, one slew step on.
+    const uint64_t budgetGapUs = controller.timingBudgetUs() > decision.playoutDelayUs ?
+        controller.timingBudgetUs() - decision.playoutDelayUs :
+        decision.playoutDelayUs - controller.timingBudgetUs();
+    expect(budgetGapUs <= std::max(policy.playoutDelayAttackUs,
+                                   policy.playoutDelayReleaseUs),
            "the timing budget must report the applied adaptive delay");
 
     // A worse regime: one frame in ten arrives 6 ms late. The delay must
     // attack upward at the attack rate, never in one jump.
     const uint64_t delayBeforeUs = decision.playoutDelayUs;
     uint64_t maximumRiseUs = 0;
-    for (int i = 1500; i < 2500; ++i) {
+    for (int i = kReleaseFrames; i < kReleaseFrames + 1000; ++i) {
         const uint32_t timestamp = rtpFor(i, 116);
         const uint64_t lateUs = (i % 10 == 0) ? 6000 : 0;
         const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + jitterFor(i) + lateUs;
@@ -488,23 +569,270 @@ void testAdaptivePlayoutDelayCalibratesPerBand()
     expect(maximumRiseUs <= policy.playoutDelayAttackUs,
            "the delay must rise at most one attack step per frame");
 
-    // A cadence change to 60 FPS opens a new band that starts high again.
-    const uint64_t baseUs = decodedTimeForRtp(epochUs, rtpFor(2500, 116));
-    bool sawStartInNewBand = false;
+    // A cadence change to 60 FPS opens a new band at its start value, and
+    // the delay in force walks there one slew step per frame.
+    const int lastFrame = kReleaseFrames + 1000;
+    const uint64_t baseUs = decodedTimeForRtp(epochUs, rtpFor(lastFrame, 116));
+    const uint64_t delayAtChangeUs = decision.playoutDelayUs;
+    uint64_t maximumStepAcrossRatesUs = 0;
+    bool rateChanged = false;
     for (int i = 0; i < 200; ++i) {
-        const uint32_t timestamp = rtpFor(2500, 116) + rtpFor(i, 60);
+        const uint32_t timestamp = rtpFor(lastFrame, 116) + rtpFor(i, 60);
         const uint64_t decodedUs = baseUs + static_cast<uint64_t>(i) * 1000000ULL / 60ULL;
-        decision = controller.schedule(frame(2501 + i, timestamp, true, decodedUs), decodedUs);
+        decision = controller.schedule(frame(lastFrame + 1 + i, timestamp, true, decodedUs), decodedUs);
         controller.noteSubmission(true, false, decision.targetUs);
-        if (controller.playoutBandIndex() == 60 / 20 &&
-                decision.playoutDelayUs == policy.playoutDelayStartUs) {
-            sawStartInNewBand = true;
-        }
+        rateChanged = rateChanged || decision.sourceRateChanged;
+        const uint64_t stepUs = decision.playoutDelayUs > previousDelayUs ?
+            decision.playoutDelayUs - previousDelayUs :
+            previousDelayUs - decision.playoutDelayUs;
+        maximumStepAcrossRatesUs = std::max(maximumStepAcrossRatesUs, stepUs);
+        previousDelayUs = decision.playoutDelayUs;
     }
-    expect(controller.playoutBandIndex() == 60 / 20,
+    std::fprintf(stderr, "band slew: rateChanged=%d band=%u period=%llu delay at change=%llu after=%llu max step=%llu\n",
+                 rateChanged ? 1 : 0, controller.playoutBandIndex(),
+                 static_cast<unsigned long long>(controller.sourcePeriodUs()),
+                 static_cast<unsigned long long>(delayAtChangeUs),
+                 static_cast<unsigned long long>(decision.playoutDelayUs),
+                 static_cast<unsigned long long>(maximumStepAcrossRatesUs));
+    // A gradual glide of the endpoint fit never crosses the material
+    // threshold in one step, so the flag stays clear; the period itself
+    // must arrive at the new rate.
+    (void) rateChanged;
+    expect(std::abs(static_cast<int64_t>(controller.sourcePeriodUs()) - 16667) < 100 &&
+               controller.playoutBandIndex() == 60 / 20,
            "a material rate change must move to the new band");
-    expect(sawStartInNewBand,
-           "a new band must start from the mode's high start value");
+    expect(maximumStepAcrossRatesUs <= std::max(policy.playoutDelayAttackUs,
+                                                policy.playoutDelayReleaseUs),
+           "a band change must never move the delay by more than one slew step");
+    expect(decision.playoutDelayUs > delayAtChangeUs + 4000,
+           "the delay must walk toward the new band's start value");
+}
+
+void testPrepareOnArrivalSpendsTheCushion()
+{
+    // With preparation on arrival a frame that arrives on time starts its
+    // preparation at once: the render start sits a whole playout delay
+    // before the usual lead, at the frame's mapped slot.
+    VrrSessionConfig session = config(116, 120);
+    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    policy.playoutPrepareOnArrival = 1;
+    policy.renderStartAfterSubmissionUs = 0;
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    VrrTimingDecision decision;
+    for (int i = 0; i < 300; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 116ULL);
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 700;
+        decision = controller.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+    }
+    expect(decision.renderStartUs + decision.renderLeadUs +
+               decision.renderWakeLeadUs + decision.playoutDelayUs ==
+               decision.targetUs,
+           "the render start must precede the target by the lead plus the playout delay");
+    expect(decision.renderStartUs <= decision.sourceTimeUs + 1,
+           "an on-time frame must be ready to prepare at its mapped slot");
+    expect(decision.playoutDelayUs >= 6000,
+           "the whole-tail cushion must not release below the start before it has evidence");
+}
+
+void testRenderStartKeepsClearOfPreviousPresent()
+{
+    // Preparation must not begin within the acquire-blocking window after
+    // the previous present, but it must keep the minimum lead before the
+    // target when the interval is too short for both.
+    VrrSessionConfig session = config(116, 120);
+    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    VrrTimingDecision decision;
+    uint64_t lastSubmissionUs = 0;
+    bool clear = true;
+    bool leadKept = true;
+    for (int i = 0; i < 300; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 116ULL);
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 700;
+        decision = controller.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        if (i > 50) {
+            const uint64_t gapUs = decision.renderStartUs - lastSubmissionUs;
+            const uint64_t leadUs = decision.targetUs - decision.renderStartUs;
+            // Inside the blocking window only when the minimum lead forced it.
+            if (gapUs < policy.renderStartAfterSubmissionUs &&
+                    leadUs > policy.renderStartMinimumLeadUs) {
+                clear = false;
+            }
+            // The guard never leaves less than the minimum lead; a lead
+            // already shorter than that was the learned lead, not the guard.
+            if (gapUs >= policy.renderStartAfterSubmissionUs &&
+                    leadUs < policy.renderStartMinimumLeadUs &&
+                    decision.renderLeadUs + decision.renderWakeLeadUs >=
+                        policy.renderStartMinimumLeadUs) {
+                leadKept = false;
+            }
+        }
+        controller.noteSubmission(true, false, decision.targetUs);
+        lastSubmissionUs = decision.targetUs;
+    }
+    expect(clear,
+           "preparation must start no sooner than the acquire-safe gap after the previous present");
+    expect(leadKept,
+           "preparation must keep the minimum lead before the target");
+}
+
+void testShortHitchDoesNotRefitSourceRate()
+{
+    // Four host frames stamped 33 ms apart are a hitch, not a 30 Hz source.
+    // The fitted rate, the metronome period and the delay must hold; a real
+    // cutscene that keeps the slow cadence for longer is still accepted.
+    VrrSessionConfig session = config(116, 120);
+    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    int frameNumber = 0;
+    uint32_t timestamp = 0;
+    VrrTimingDecision decision;
+    for (int i = 0; i < 700; ++i) {
+        timestamp = static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 116ULL);
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 800;
+        decision = controller.schedule(frame(++frameNumber, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+    }
+    const uint64_t stablePeriodUs = controller.sourcePeriodUs();
+    const uint64_t stableDelayUs = decision.playoutDelayUs;
+
+    bool refitted = false;
+    uint64_t maximumDelayStepUs = 0;
+    uint64_t previousDelayUs = stableDelayUs;
+    for (int i = 0; i < 4; ++i) {
+        timestamp += 3000;
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 800;
+        decision = controller.schedule(frame(++frameNumber, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        refitted = refitted || decision.sourceRateChanged;
+    }
+    for (int i = 0; i < 100; ++i) {
+        timestamp += 776;
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 800;
+        decision = controller.schedule(frame(++frameNumber, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        refitted = refitted || decision.sourceRateChanged;
+        const uint64_t stepUs = decision.playoutDelayUs > previousDelayUs ?
+            decision.playoutDelayUs - previousDelayUs :
+            previousDelayUs - decision.playoutDelayUs;
+        maximumDelayStepUs = std::max(maximumDelayStepUs, stepUs);
+        previousDelayUs = decision.playoutDelayUs;
+    }
+    expect(!refitted,
+           "a four-frame hitch must not be accepted as a new source rate");
+    expect(std::abs(static_cast<int64_t>(controller.sourcePeriodUs()) -
+                    static_cast<int64_t>(stablePeriodUs)) < 100,
+           "a four-frame hitch must leave the fitted source period alone");
+    expect(maximumDelayStepUs <= std::max(policy.playoutDelayAttackUs,
+                                          policy.playoutDelayReleaseUs),
+           "a hitch must never move the playout delay by more than one slew step");
+
+    VrrTimingDecision cutscene;
+    bool accepted = false;
+    for (int i = 0; i < 15; ++i) {
+        timestamp += 3000;
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, timestamp) + 800;
+        cutscene = controller.schedule(frame(++frameNumber, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, cutscene.targetUs);
+        accepted = accepted || cutscene.sourceRateChanged;
+    }
+    expect(accepted &&
+               std::abs(1000000.0 /
+                   static_cast<double>(controller.sourcePeriodUs()) - 30.0) < 0.5,
+           "a 30 FPS cutscene must be accepted once it has lasted 200 ms");
+}
+
+void testMotionDeadbandHonorsStampSteps()
+{
+    // Small stamp wobble is capture noise the grid absorbs. A stamp that
+    // departs from the grid by more than the learned bound is the host
+    // reporting a change in frame timing: the frame presents on its stamp
+    // and the grid restarts there instead of paying the difference back
+    // over dozens of frames.
+    // A 60 FPS stream on the 120 Hz panel, so the display floor never
+    // stands between a stamp and its slot. Replay-only policy.
+    VrrSessionConfig session = config(60, 120);
+    VrrTimingParameters policy = metronomePolicy(session);
+    policy.playoutMotionDeadbandEnabled = 1;
+    // One reservoir, so the slowdown below is not also a band change.
+    policy.playoutBandWidthHz = 1000;
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const int64_t periodUs = 1000000 / 60;
+    const auto wobbleUs = [](int i) {
+        return static_cast<int64_t>((static_cast<uint64_t>(i) * 7919ULL) % 600ULL) - 300;
+    };
+    int64_t stampUs = 20000;
+    VrrTimingDecision decision;
+    uint64_t previousTargetUs = 0;
+    int64_t worstSteadyDeviationUs = 0;
+    int frameNumber = 0;
+    const auto step = [&](int64_t stampIntervalUs, int64_t jitterUs) {
+        stampUs += stampIntervalUs;
+        const uint32_t timestamp = static_cast<uint32_t>((stampUs + jitterUs) * 90LL / 1000LL);
+        const uint64_t decodedUs = static_cast<uint64_t>(
+            static_cast<int64_t>(epochUs) + stampUs + jitterUs + 900);
+        decision = controller.schedule(frame(++frameNumber, timestamp, true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+    };
+    for (int i = 0; i < 600; ++i) {
+        step(periodUs, wobbleUs(i));
+        if (i >= 300) {
+            const int64_t deviationUs = static_cast<int64_t>(decision.targetUs) -
+                static_cast<int64_t>(previousTargetUs) - periodUs;
+            worstSteadyDeviationUs = std::max(
+                worstSteadyDeviationUs, deviationUs < 0 ? -deviationUs : deviationUs);
+        }
+        previousTargetUs = decision.targetUs;
+    }
+    expect(worstSteadyDeviationUs < 300,
+           "stamp wobble inside the deadband must not reach the presented cadence");
+
+    // The game's phase steps 3 ms earlier than the grid would predict.
+    // The grid must re-anchor within a frame or two rather than walk the
+    // offset back at the bounded step.
+    step(periodUs - 3000, 0);
+    previousTargetUs = decision.targetUs;
+    int64_t worstResidualUs = 0;
+    std::fprintf(stderr, "deadband phase step residuals:");
+    for (int i = 0; i < 40; ++i) {
+        step(periodUs, wobbleUs(i));
+        std::fprintf(stderr, " %lld", static_cast<long long>(decision.cadenceSmoothingUs));
+        if (i >= 3) {
+            const int64_t residualUs = decision.cadenceSmoothingUs;
+            worstResidualUs = std::max(worstResidualUs,
+                                       residualUs < 0 ? -residualUs : residualUs);
+        }
+        previousTargetUs = decision.targetUs;
+    }
+    std::fprintf(stderr, "\n");
+    expect(worstResidualUs < 800,
+           "after a phase step the grid must sit on the stamps again within a few frames");
+
+    // The game slows to 24 ms frames. Every slowed frame must present on
+    // its own stamp: the interval follows the stamp interval at once.
+    int64_t worstSlowIntervalErrorUs = 0;
+    std::fprintf(stderr, "deadband slow intervals:");
+    for (int i = 0; i < 20; ++i) {
+        step(24000, wobbleUs(i));
+        const int64_t intervalUs = static_cast<int64_t>(decision.targetUs) -
+            static_cast<int64_t>(previousTargetUs);
+        const int64_t errorUs = intervalUs - 24000;
+        std::fprintf(stderr, " %lld/%lld", static_cast<long long>(intervalUs),
+                     static_cast<long long>(decision.cadenceSmoothingUs));
+        if (i >= 1) {
+            worstSlowIntervalErrorUs = std::max(
+                worstSlowIntervalErrorUs, errorUs < 0 ? -errorUs : errorUs);
+        }
+        previousTargetUs = decision.targetUs;
+    }
+    std::fprintf(stderr, "\n");
+    expect(worstSlowIntervalErrorUs < 700,
+           "a real change in frame timing must present on the stamp, not on the old grid");
 }
 
 void testSmoothnessLearningWindowTracksCadence()
@@ -656,6 +984,250 @@ void testQuantizedCadenceDoesNotOscillate()
         expect(maximumTimingBudgetUs <= 2000,
                "host-quantized cadence must not create a multi-millisecond readiness reserve");
     }
+}
+
+void testHighRefreshCalibrationBandsHaveNoCadenceCliff()
+{
+    constexpr uint64_t epochUs = 1000000;
+    const int64_t stampJitterUs[] = {
+        0, 700, -500, 900, -800, 400, -200, 600, -600, 200,
+    };
+    struct Sweep {
+        int displayRefreshHz;
+        int minimumSourceRateHz;
+        int maximumSourceRateHz;
+    };
+    // 115..139 covers the reported 120..127 trouble range on a 144 Hz
+    // display and crosses the 120 Hz reservoir edge.  A 240 Hz display lets
+    // us cross every subsequent 20 Hz edge through 220 without asking the
+    // physical 120 Hz development panel to present an impossible cadence.
+    const Sweep sweeps[] = {
+        {144, 115, 139},
+        {240, 115, 227},
+    };
+
+    uint64_t worstP90JerkUs = 0;
+    uint64_t worstDelayStepUs = 0;
+    int worstRateHz = 0;
+    int worstDisplayHz = 0;
+    bool sawUnexpectedReset = false;
+    bool sawWrongBand = false;
+    bool sawBandOscillation = false;
+    bool sawUntrainedBand = false;
+
+    for (const Sweep& sweep : sweeps) {
+        for (int rateHz = sweep.minimumSourceRateHz;
+             rateHz <= sweep.maximumSourceRateHz; ++rateHz) {
+            const VrrSessionConfig session = config(
+                rateHz, sweep.displayRefreshHz);
+            const VrrTimingParameters policy =
+                vrrTimingParametersForSession(session);
+            VrrTimingController controller(session, true, policy);
+            std::vector<uint64_t> jerksUs;
+            uint64_t previousTargetUs = 0;
+            uint64_t previousIntervalUs = 0;
+            uint64_t previousDelayUs = 0;
+            unsigned int steadyBand = 0;
+            bool haveSteadyBand = false;
+            const int warmupFrames = rateHz * 4;
+            const int frameCount = rateHz * 8;
+
+            for (int i = 0; i <= frameCount; ++i) {
+                const int64_t idealStampUs = 10000 +
+                    static_cast<int64_t>(i) * 1000000LL / rateHz;
+                const int64_t jitterUs =
+                    stampJitterUs[i % (sizeof(stampJitterUs) /
+                                        sizeof(stampJitterUs[0]))];
+                const uint32_t timestamp = static_cast<uint32_t>(
+                    (idealStampUs + jitterUs) * 90LL / 1000LL);
+                const uint64_t arrivalJitterUs = i % 97 == 0 ? 0 :
+                    (static_cast<uint64_t>(i) * 1291ULL) % 3001ULL;
+                const uint64_t decodedUs =
+                    decodedTimeForRtp(epochUs, timestamp) + arrivalJitterUs;
+                const VrrTimingDecision decision = controller.schedule(
+                    frame(i, timestamp, true, decodedUs), decodedUs);
+                controller.noteSubmission(true, false, decision.targetUs);
+
+                if (i > warmupFrames &&
+                        (decision.rebased || decision.phaseDiscontinuity ||
+                         decision.sourceRateChanged)) {
+                    sawUnexpectedReset = true;
+                }
+                if (i > warmupFrames) {
+                    if (!haveSteadyBand) {
+                        steadyBand = controller.playoutBandIndex();
+                        haveSteadyBand = true;
+                    }
+                    else if (controller.playoutBandIndex() != steadyBand) {
+                        sawBandOscillation = true;
+                    }
+                }
+                if (i > 0) {
+                    const uint64_t delayStepUs =
+                        decision.playoutDelayUs > previousDelayUs ?
+                            decision.playoutDelayUs - previousDelayUs :
+                            previousDelayUs - decision.playoutDelayUs;
+                    worstDelayStepUs = std::max(worstDelayStepUs,
+                                                delayStepUs);
+                }
+                if (i > warmupFrames && previousTargetUs != 0) {
+                    const uint64_t intervalUs =
+                        decision.targetUs - previousTargetUs;
+                    if (previousIntervalUs != 0) {
+                        jerksUs.push_back(intervalUs > previousIntervalUs ?
+                            intervalUs - previousIntervalUs :
+                            previousIntervalUs - intervalUs);
+                    }
+                    previousIntervalUs = intervalUs;
+                }
+                previousTargetUs = decision.targetUs;
+                previousDelayUs = decision.playoutDelayUs;
+            }
+
+            std::sort(jerksUs.begin(), jerksUs.end());
+            const size_t p90Index = jerksUs.empty() ? 0 :
+                (jerksUs.size() * 90 + 99) / 100 - 1;
+            const uint64_t p90JerkUs = jerksUs.empty() ? 0 :
+                jerksUs[p90Index];
+            if (p90JerkUs > worstP90JerkUs) {
+                worstP90JerkUs = p90JerkUs;
+                worstRateHz = rateHz;
+                worstDisplayHz = sweep.displayRefreshHz;
+            }
+            const unsigned int expectedBand =
+                static_cast<unsigned int>(rateHz) /
+                    std::max<uint64_t>(1, policy.playoutBandWidthHz);
+            const unsigned int actualBand = controller.playoutBandIndex();
+            const uint64_t hysteresisHz = std::max<uint64_t>(
+                1, policy.playoutBandWidthHz / 6);
+            // An exact lower edge may deliberately remain in the lower band
+            // until it clears the hysteresis shoulder. That is the stable
+            // result, not a misclassification or a calibration cliff.
+            const bool heldBelowUpperEdge = expectedBand != 0 &&
+                actualBand + 1 == expectedBand &&
+                static_cast<uint64_t>(rateHz) <
+                    static_cast<uint64_t>(expectedBand) *
+                        policy.playoutBandWidthHz + hysteresisHz;
+            if (actualBand != expectedBand && !heldBelowUpperEdge) {
+                std::fprintf(stderr,
+                             "high-refresh band mismatch: %d/%d Hz settled in %u, nominal %u, learned period=%llu us\n",
+                             rateHz, sweep.displayRefreshHz,
+                             actualBand, expectedBand,
+                             static_cast<unsigned long long>(
+                                 controller.sourcePeriodUs()));
+                sawWrongBand = true;
+            }
+            sawUntrainedBand = sawUntrainedBand ||
+                controller.playoutBandSamples() <
+                    policy.playoutDelayReleaseSamples;
+        }
+    }
+
+    std::fprintf(stderr,
+                 "high-refresh band sweep: worst p90 jerk=%llu us at %d/%d Hz, max delay step=%llu us\n",
+                 static_cast<unsigned long long>(worstP90JerkUs),
+                 worstRateHz, worstDisplayHz,
+                 static_cast<unsigned long long>(worstDelayStepUs));
+    expect(!sawUnexpectedReset,
+           "steady 115..227 FPS sources must not reset or refit after warmup");
+    expect(!sawWrongBand,
+           "every high-refresh source rate must settle in its expected calibration band");
+    expect(!sawBandOscillation,
+           "a steady source near a calibration edge must not oscillate between bands");
+    expect(!sawUntrainedBand,
+           "every high-refresh calibration band must collect enough samples to release its start delay");
+    expect(worstDelayStepUs <= 50,
+           "adaptive delay must not introduce a cadence cliff at any high-refresh band");
+    expect(worstP90JerkUs <= 1000,
+           "production smoothing must keep p90 presented jerk below 1 ms across high-refresh bands");
+}
+
+void testReported120HzBandBoundarySlewsCalibration()
+{
+    struct Result {
+        uint64_t maximumDelayStepUs = 0;
+        bool sawLowerBand = false;
+        bool returnedToUpperBand = false;
+    };
+    const auto run = [](VrrTimingParameters policy) {
+        constexpr uint64_t epochUs = 1000000;
+        VrrTimingController controller(config(127, 144), true, policy);
+        Result result;
+        long double rtpTicks = 9000.0L;
+        uint64_t previousDelayUs = 0;
+        int frameNumber = 0;
+
+        const auto runRate = [&](int rateHz, int frameCount,
+                                 uint64_t arrivalJitterLimitUs) {
+            for (int i = 0; i < frameCount; ++i) {
+                rtpTicks += 90000.0L / static_cast<long double>(rateHz);
+                const uint32_t timestamp = static_cast<uint32_t>(
+                    std::llround(rtpTicks));
+                const uint64_t arrivalJitterUs =
+                    (static_cast<uint64_t>(frameNumber) * 1291ULL) %
+                    (arrivalJitterLimitUs + 1);
+                const uint64_t decodedUs =
+                    decodedTimeForRtp(epochUs, timestamp) + arrivalJitterUs;
+                const VrrTimingDecision decision = controller.schedule(
+                    frame(frameNumber, timestamp, true, decodedUs), decodedUs);
+                controller.noteSubmission(true, false, decision.targetUs);
+                if (frameNumber != 0) {
+                    const uint64_t stepUs =
+                        decision.playoutDelayUs > previousDelayUs ?
+                            decision.playoutDelayUs - previousDelayUs :
+                            previousDelayUs - decision.playoutDelayUs;
+                    result.maximumDelayStepUs = std::max(
+                        result.maximumDelayStepUs, stepUs);
+                }
+                previousDelayUs = decision.playoutDelayUs;
+                ++frameNumber;
+
+                if (controller.playoutBandIndex() == 5) {
+                    result.sawLowerBand = true;
+                }
+                else if (result.sawLowerBand &&
+                         controller.playoutBandIndex() == 6) {
+                    result.returnedToUpperBand = true;
+                }
+            }
+        };
+
+        // Settle below the 120 Hz edge with a clean arrival tail, then move
+        // into the reported 120..127 FPS range with a materially different
+        // tail. The old direct band assignment exposed that difference as a
+        // single-frame timing jump.
+        runRate(116, 1800, 900);
+        runRate(127, 1800, 5000);
+        return result;
+    };
+
+    const VrrTimingParameters production =
+        vrrTimingParametersForSession(config(127, 144));
+    const Result current = run(production);
+
+    VrrTimingParameters vrr12Like = production;
+    vrr12Like.playoutDelaySlewAcrossBands = 0;
+    vrr12Like.rateCandidateMinimumUs = 0;
+    vrr12Like.playoutDelayStartPeriodPerMille = 0;
+    vrr12Like.playoutDelayMaximumPeriodPerMille = 0;
+    vrr12Like.playoutSmoothingGainPerMille = 150;
+    vrr12Like.playoutSmoothingPeriodAlphaPerMille = 50;
+    vrr12Like.playoutSmoothingMaxLagUs = 8000;
+    const Result oldBandApplication = run(vrr12Like);
+
+    std::fprintf(stderr,
+                 "120 Hz calibration edge: current max delay step=%llu us, vrr12-style=%llu us\n",
+                 static_cast<unsigned long long>(current.maximumDelayStepUs),
+                 static_cast<unsigned long long>(
+                     oldBandApplication.maximumDelayStepUs));
+    expect(current.sawLowerBand && current.returnedToUpperBand,
+           "the regression must cross from the lower calibration band into 120..127 FPS");
+    expect(current.maximumDelayStepUs <=
+               std::max(production.playoutDelayAttackUs,
+                        production.playoutDelayReleaseUs),
+           "crossing into 120..127 FPS must slew rather than step the active delay");
+    expect(oldBandApplication.maximumDelayStepUs > 1000,
+           "the vrr12-style direct band assignment must reproduce the old timing cliff");
 }
 
 void testNegotiatedRateCeiling()
@@ -1594,6 +2166,280 @@ void testTargetWaiterBoundaries()
            "an advancing clock must reach the deadline even when a fast CPU yields more than 4096 times");
 }
 
+void testMetronomeHoldsCadenceThroughJitterAndLateFrames()
+{
+    // A steady 116 FPS game. Host stamps wobble +-3 ms per frame and
+    // delivery adds [0, 2 ms) of arrival jitter that is independent of the
+    // stamp. The metronome must present at the fitted period with at most
+    // a bounded step per frame: neither kind of jitter reaches the panel.
+    VrrSessionConfig session = config(116, 120);
+    const VrrTimingParameters policy = metronomePolicy(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const int64_t periodUs = 1000000 / 116;
+    const auto idealUs = [&](int i) {
+        return static_cast<int64_t>(20000) + static_cast<int64_t>(i) * 1000000LL / 116LL;
+    };
+    const auto stampJitterUs = [](int i) {
+        return static_cast<int64_t>((static_cast<uint64_t>(i) * 7919ULL) % 6000ULL) - 3000;
+    };
+    const auto arrivalJitterUs = [](int i) {
+        return static_cast<int64_t>((static_cast<uint64_t>(i) * 104729ULL) % 2000ULL);
+    };
+    const auto rtpFor = [&](int i) {
+        return static_cast<uint32_t>((idealUs(i) + stampJitterUs(i)) * 90LL / 1000LL);
+    };
+    const auto decodedFor = [&](int i, int64_t extraUs) {
+        return static_cast<uint64_t>(static_cast<int64_t>(epochUs) + idealUs(i) +
+                                     500 + arrivalJitterUs(i) + extraUs);
+    };
+
+    const int64_t stepCeilingUs = std::max<int64_t>(
+        static_cast<int64_t>(policy.playoutPhaseStepMinimumUs),
+        periodUs * static_cast<int64_t>(policy.playoutPhaseStepPeriodPerMille) / 1000);
+    // In steady state the tick moves by at most one minimum residual step
+    // plus the calibrator's own slew, which it follows exactly.
+    const int64_t steadyToleranceUs =
+        static_cast<int64_t>(policy.playoutPhaseStepMinimumUs) +
+        static_cast<int64_t>(std::max(policy.playoutDelayAttackUs,
+                                      policy.playoutDelayReleaseUs)) + 2;
+    const int64_t toleranceUs = stepCeilingUs +
+        static_cast<int64_t>(policy.playoutPhaseStepMinimumUs) + 2;
+
+    VrrTimingDecision decision;
+    uint64_t previousTargetUs = 0;
+    int64_t worstDeviationUs = 0;
+    unsigned int resets = 0;
+    unsigned int steppedFrames = 0;
+    unsigned int buckets[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < 1200; ++i) {
+        const uint64_t decodedUs = decodedFor(i, 0);
+        decision = controller.schedule(frame(i + 1, rtpFor(i), true, decodedUs),
+                                       decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (i > 0 && (decision.rebased || decision.phaseDiscontinuity)) {
+            ++resets;
+        }
+        if (i >= 200) {
+            const int64_t intervalUs = static_cast<int64_t>(decision.targetUs) -
+                static_cast<int64_t>(previousTargetUs);
+            const int64_t deviationUs = intervalUs - periodUs;
+            const int64_t magnitudeUs = deviationUs < 0 ? -deviationUs : deviationUs;
+            worstDeviationUs = std::max(worstDeviationUs, magnitudeUs);
+            if (magnitudeUs > steadyToleranceUs) {
+                ++steppedFrames;
+            }
+            ++buckets[magnitudeUs <= 12 ? 0 : magnitudeUs <= 32 ? 1 :
+                      magnitudeUs <= 62 ? 2 : magnitudeUs <= 120 ? 3 : 4];
+        }
+        previousTargetUs = decision.targetUs;
+    }
+    std::fprintf(stderr,
+                 "metronome: worst steady interval deviation=%lld us (tolerance %lld), frames over minimum step=%u, resets=%u delay=%llu, |dev| buckets <=12:%u <=32:%u <=62:%u <=120:%u more:%u\n",
+                 static_cast<long long>(worstDeviationUs),
+                 static_cast<long long>(toleranceUs), steppedFrames, resets,
+                 static_cast<unsigned long long>(decision.playoutDelayUs),
+                 buckets[0], buckets[1], buckets[2], buckets[3], buckets[4]);
+    expect(resets == 0,
+           "stamp and arrival jitter must never re-anchor the metronome");
+    expect(worstDeviationUs <= toleranceUs,
+           "the metronome must never move the presented slot by more than one bounded step");
+    expect(steppedFrames == 0,
+           "in steady state no interval may move beyond one residual step plus the delay slew");
+    expect(buckets[0] >= 700,
+           "in steady state most intervals must sit within a dozen microseconds of the period");
+    expect(decision.playoutDelayUs >= 4000,
+           "with 2 ms arrival jitter over a 3 ms stamp floor the cushion must stay several ms");
+
+    // A 30 ms arrival stall lands four frames at once. Emulating the
+    // worker, a frame that missed its tick by a whole period yields to the
+    // fresher frame already waiting; the last one presents as soon as it is
+    // ready (one stretched interval). Nothing after it presents early, and
+    // the lag it took on is paid back one bounded step per frame.
+    int64_t lateIntervalUs = 0;
+    int64_t worstRecoveryDeviationUs = 0;
+    int64_t worstShortIntervalUs = 0;
+    int64_t lagAfterUs = 0;
+    unsigned int emulatedDrops = 0;
+    bool sawStretch = false;
+    const uint64_t stallEndUs = decodedFor(1200, 30000);
+    std::string lagTrace;
+    for (int i = 1200; i < 1700; ++i) {
+        const bool inBurst = i < 1204;
+        const uint64_t decodedUs = inBurst ?
+            stallEndUs + static_cast<uint64_t>(i - 1200) * 100 : decodedFor(i, 0);
+        decision = controller.schedule(frame(i + 1, rtpFor(i), true, decodedUs),
+                                       decodedUs);
+        const bool successorQueued = i < 1203;
+        if (decision.missedTicks != 0 && successorQueued) {
+            controller.noteSubmission(false, false, 0);
+            ++emulatedDrops;
+            continue;
+        }
+        controller.noteSubmission(true, false, decision.targetUs);
+        const int64_t intervalUs = static_cast<int64_t>(decision.targetUs) -
+            static_cast<int64_t>(previousTargetUs);
+        if (!sawStretch) {
+            // The first burst frame to present ends the stall.
+            sawStretch = true;
+            lateIntervalUs = intervalUs;
+        }
+        else {
+            const int64_t deviationUs = intervalUs - periodUs;
+            worstRecoveryDeviationUs = std::max(
+                worstRecoveryDeviationUs, deviationUs < 0 ? -deviationUs : deviationUs);
+            worstShortIntervalUs = std::min(worstShortIntervalUs, deviationUs);
+        }
+        if ((i >= 1200 && i < 1212) || i % 100 == 0) {
+            char entry[64];
+            std::snprintf(entry, sizeof(entry), " %d:%lld/%llu", i,
+                          static_cast<long long>(decision.cadenceSmoothingUs),
+                          static_cast<unsigned long long>(decision.playoutDelayUs));
+            lagTrace += entry;
+        }
+        previousTargetUs = decision.targetUs;
+        if (i >= 1600) {
+            // The per-frame lag carries the raw slot's own stamp wobble;
+            // average it out to see where the schedule actually sits.
+            lagAfterUs += decision.cadenceSmoothingUs;
+        }
+    }
+    lagAfterUs /= 100;
+    std::fprintf(stderr,
+                 "metronome: stall drops=%u late interval=%lld us, recovery worst deviation=%lld us, shortest=%lld us, lag after=%lld us\n"
+                 "metronome lag/delay trace:%s\n",
+                 emulatedDrops, static_cast<long long>(lateIntervalUs),
+                 static_cast<long long>(worstRecoveryDeviationUs),
+                 static_cast<long long>(worstShortIntervalUs),
+                 static_cast<long long>(lagAfterUs), lagTrace.c_str());
+    expect(emulatedDrops >= 2,
+           "frames overtaken by whole periods during a stall must yield to the freshest one");
+    expect(lateIntervalUs > periodUs,
+           "the frame that ends a stall must present when ready, not be smeared into the cadence");
+    expect(worstRecoveryDeviationUs <= toleranceUs,
+           "after a stall every following interval must stay within one phase step of the period");
+    expect(lagAfterUs > -600 && lagAfterUs < 600,
+           "the lag from a stall must be paid back within a few hundred frames");
+}
+
+void testMetronomeIgnoresSingleEarlyOutlier()
+{
+    // A single frame whose stamp is far behind its arrival maps more than a
+    // period into the future. The production policy must wait for it rather
+    // than re-seed the clock on it, so the frames around it keep their
+    // slots and cadence.
+    VrrSessionConfig session = config(116, 120);
+    const VrrTimingParameters policy = metronomePolicy(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const int64_t periodUs = 1000000 / 116;
+    const auto rtpFor = [](int i) {
+        return static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 116ULL);
+    };
+    VrrTimingDecision decision;
+    uint64_t previousTargetUs = 0;
+    int64_t worstDeviationUs = 0;
+    unsigned int discontinuities = 0;
+    for (int i = 0; i < 900; ++i) {
+        uint64_t decodedUs = decodedTimeForRtp(epochUs, rtpFor(i)) + 800;
+        if (i == 600) {
+            // The stamp says this frame is two periods newer than it is.
+            decodedUs -= static_cast<uint64_t>(2 * periodUs);
+        }
+        decision = controller.schedule(frame(i + 1, rtpFor(i), true, decodedUs),
+                                       decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        if (i > 0 && (decision.rebased || decision.phaseDiscontinuity)) {
+            ++discontinuities;
+        }
+        if (i >= 400) {
+            const int64_t deviationUs = static_cast<int64_t>(decision.targetUs) -
+                static_cast<int64_t>(previousTargetUs) - periodUs;
+            worstDeviationUs = std::max(worstDeviationUs,
+                                        deviationUs < 0 ? -deviationUs : deviationUs);
+        }
+        previousTargetUs = decision.targetUs;
+    }
+    std::fprintf(stderr, "early outlier: discontinuities=%u worst deviation=%lld us\n",
+                 discontinuities, static_cast<long long>(worstDeviationUs));
+    expect(discontinuities == 0,
+           "one early outlier must not re-seed the sender clock mapping");
+    expect(worstDeviationUs < 1000,
+           "one early outlier must not move the presented cadence");
+}
+
+void testBurstExclusionKeepsDelayAfterStall()
+{
+    // A clean link learns a small cushion. A 60 ms arrival stall then lands
+    // seven frames at once. Their lateness is the stall's backlog, not the
+    // link's jitter, and must not pin the cushion at its cap.
+    VrrSessionConfig session = config(116, 120);
+    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    const uint64_t epochUs = 1000000;
+    const auto rtpFor = [](int i) {
+        return static_cast<uint32_t>(static_cast<uint64_t>(i) * 90000ULL / 116ULL);
+    };
+    const auto jitterFor = [](int i) {
+        return static_cast<uint64_t>((static_cast<uint64_t>(i) * 7919ULL) % 1500ULL);
+    };
+    VrrTimingDecision decision;
+    for (int i = 0; i < 2500; ++i) {
+        const uint64_t decodedUs = decodedTimeForRtp(epochUs, rtpFor(i)) + jitterFor(i);
+        decision = controller.schedule(frame(i + 1, rtpFor(i), true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+    }
+    const uint64_t delayBeforeUs = decision.playoutDelayUs;
+    expect(delayBeforeUs < 4000,
+           "a clean link must release the cushion well below the start value");
+
+    const uint64_t stallEndUs = decodedTimeForRtp(epochUs, rtpFor(2500)) + 60000;
+    uint64_t worstDelayUs = delayBeforeUs;
+    for (int i = 2500; i < 3000; ++i) {
+        uint64_t decodedUs = decodedTimeForRtp(epochUs, rtpFor(i)) + jitterFor(i);
+        if (i >= 2500 && i < 2507) {
+            decodedUs = stallEndUs + static_cast<uint64_t>(i - 2500) * 100;
+        }
+        decision = controller.schedule(frame(i + 1, rtpFor(i), true, decodedUs), decodedUs);
+        controller.noteSubmission(true, false, decision.targetUs);
+        worstDelayUs = std::max(worstDelayUs, decision.playoutDelayUs);
+    }
+    std::fprintf(stderr, "burst exclusion: delay before=%llu worst after stall=%llu\n",
+                 static_cast<unsigned long long>(delayBeforeUs),
+                 static_cast<unsigned long long>(worstDelayUs));
+    expect(worstDelayUs <= delayBeforeUs + 500,
+           "the backlog behind an arrival stall must not raise the cushion");
+}
+
+void testLatchedPresentationDropsSoftwareFloor()
+{
+    // At the refresh rate the source period equals the display period, so a
+    // software floor of one display period plus a guard can never be met
+    // and sheds a frame every second. Latched presents are ordered by the
+    // flip queue instead, so the production policy reports no floor there.
+    VrrSessionConfig session = config(120, 120);
+    VrrTimingController production(session, true,
+                                   vrrTimingParametersForSession(session));
+    VrrTimingController legacy(session, true, VrrTimingParameters {});
+    const uint64_t startUs = 1000000;
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t timestamp = static_cast<uint32_t>(i * 750);
+        const uint64_t decodedUs = startUs + static_cast<uint64_t>(i) * 8333;
+        const VrrTimingDecision produced =
+            production.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        production.noteSubmission(true, false, produced.targetUs);
+        const VrrTimingDecision legacyDecision =
+            legacy.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
+        legacy.noteSubmission(true, false, legacyDecision.targetUs);
+        expect(produced.latchedPresentation && legacyDecision.latchedPresentation,
+               "a source at the refresh rate must request latched presentation");
+    }
+    expect(production.earliestSubmissionUs() == 0,
+           "latched production presentation must not impose a software spacing floor");
+    expect(legacy.earliestSubmissionUs() != 0,
+           "the legacy policy must keep its spacing floor for replay fidelity");
+}
+
 void testRuntimeParametersChangePolicy()
 {
     VrrTimingController defaults(config(60, 120));
@@ -1617,12 +2463,19 @@ int main()
     testRtpWrapResetAndFallback();
     testTimingFormulaeAndReserveCap();
     testSourcePlayoutDelayOffsetsProjectedTargets();
-    testSmoothnessTimestampPlayoutHoldsFixedDelay();
+    testTimestampModePreservesUnevenHostIntervals();
+    testTimestampModeStillBoundsCatchUpBursts();
     testCadenceSmoothingEvensJitteredSource();
-    testAdaptivePlayoutDelayCalibratesPerBand();
+    testAdaptivePlayoutDelaySlewsAcrossBands();
+    testPrepareOnArrivalSpendsTheCushion();
+    testRenderStartKeepsClearOfPreviousPresent();
+    testShortHitchDoesNotRefitSourceRate();
+    testMotionDeadbandHonorsStampSteps();
     testSmoothnessLearningWindowTracksCadence();
     testLongRunNearRefreshRtpCadence();
     testQuantizedCadenceDoesNotOscillate();
+    testHighRefreshCalibrationBandsHaveNoCadenceCliff();
+    testReported120HzBandBoundarySlewsCalibration();
     testNegotiatedRateCeiling();
     testSpacingGuardFeedback();
     testNearRefreshRequestsLatchedPresentation();
@@ -1647,6 +2500,10 @@ int main()
     testSmoothnessAddsOneSourcePeriodOfReserve();
     testLegacyReplayPolicyRetainsAbsoluteRenderCeiling();
     testTargetWaiterBoundaries();
+    testMetronomeHoldsCadenceThroughJitterAndLateFrames();
+    testMetronomeIgnoresSingleEarlyOutlier();
+    testBurstExclusionKeepsDelayAfterStall();
+    testLatchedPresentationDropsSoftwareFloor();
     testRuntimeParametersChangePolicy();
     return failures == 0 ? 0 : 1;
 }
