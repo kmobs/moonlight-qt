@@ -355,6 +355,11 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
+    if (value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
+            value.playoutStableSmoothnessReference > 1 ||
+            value.renderStartPreserveLearnedLead > 1) {
+        return fail("native hitch adaptation, readiness adaptation, stable smoothness reference, and learned preparation lead flags must be 0 or 1");
+    }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||
             value.majorCadenceRatioDenominator == 0 ||
@@ -408,6 +413,22 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutDelayAdaptive > 1) {
         return fail("playout_delay_adaptive must be 0 or 1");
+    }
+    if (value.playoutSmoothnessFeedbackEnabled > 1 || value.playoutHistoryEnabled > 1 || value.playoutPerFrameLatch > 1 || value.playoutPredictionEnabled > 1 || value.playoutPreserveDxgiFeedback > 1) {
+        return fail("history, prediction, smoothness feedback, DXGI feedback preservation and per-frame latch flags must be 0 or 1");
+    }
+    if (value.playoutSmoothnessFeedbackEnabled && !value.playoutPredictionEnabled) {
+        return fail("playout_smoothness_feedback_enabled requires playout_prediction_enabled");
+    }
+    if (value.playoutReadinessDrivenAdaptation && !value.playoutPredictionEnabled) {
+        return fail("playout_readiness_driven_adaptation requires playout_prediction_enabled");
+    }
+    if (value.playoutNativeHitchAdaptation &&
+            (!value.playoutSmoothnessFeedbackEnabled || !value.playoutReadinessDrivenAdaptation)) {
+        return fail("playout_native_hitch_adaptation requires smoothness feedback and readiness prediction");
+    }
+    if (value.playoutPredictionEnabled && (!value.playoutHistoryEnabled || !value.timestampPlayoutEnabled || !value.playoutDelayAdaptive)) {
+        return fail("playout_prediction_enabled requires adaptive timestamp history playout");
     }
     if (value.playoutDelayMinimumUs > value.playoutDelayMaximumUs) {
         return fail("playout_delay_minimum_us must not exceed playout_delay_maximum_us");

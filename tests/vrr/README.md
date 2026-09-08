@@ -1,5 +1,126 @@
 # VRR deterministic tests
 
+Linux Vulkan on Wayland now attaches presentation-time feedback to each native
+surface submission and feeds correlated compositor timestamps into the same
+native-hitch padding policy as DXGI. GPU/CPU submission completion is not used
+as a substitute. The Vulkan swapchain's fixed mode does not change when the
+controller requests a per-frame DXGI latch mode. Clock uncertainty is recorded
+in the optional schema-5 `presentation_uncertainty_us` trace column and replayed.
+Gaming Mode retains its X11/HDR Gamescope WSI path. On that path, the Vulkan
+proc-address bridge tags libplacebo's native presents with IDs and obtains actual
+presentation times through Gamescope's `VK_GOOGLE_display_timing` implementation.
+It preserves the original extension chain, semaphore waits, present results, and
+HDR swapchain. Desired presentation time remains zero, so the observer does not
+introduce a second scheduler. Gamescope timestamps are converted from monotonic
+time into the worker clock, with bounded uncertainty. Unknown IDs, stale results,
+failed presents, and the first sample after swapchain resets cannot establish a
+cadence interval. Regular X11 without the Gamescope WSI layer is still unsupported.
+Missing platform timing support leaves native-hitch adaptation unavailable and
+produces a startup warning.
+
+`tst_vulkantiming` tests this dispatch bridge with fake Vulkan entry points,
+including delayed completion IDs, clock conversion, swapchain errors, unchanged
+presentation arguments, unrelated devices, and device teardown. Build it with
+the other VRR tests when Vulkan headers are available. It does not replace a
+Gaming Mode/HDR session test against the installed Gamescope layer.
+
+`tst_waylandfeedback` uses a private in-process Wayland server, without a real
+window or GPU. It checks commit association, IDs, timestamp conversion, VRR's
+zero refresh interval, discarded frames, reset cleanup, bounded pending objects,
+timeouts, and unsupported clocks. It is built when wayland-server and SDL2 are
+available. The timing-controller suite compares delayed Wayland and DXGI feedback
+and requires identical padding and sample counts plus actual hitch-driven growth.
+These checks do not replace validation during a real compositor streaming session.
+
+`tst_incomingframetiming` checks the overlay's last-30-interval population
+variance and soft score `100 / (1 + (standardDeviationMs / 6)^4)`. It covers
+low jitter remaining essentially smooth, increasing variance and stall count,
+stable 120/60/50/30/29.97 FPS, 60-to-50 transitions, exact window expiry,
+large-stall numerical stability, missing frames, timestamp resets/wrap, and
+unavailable coverage. This diagnostic does not change the controller or buffer.
+
+`tst_dxgipresent` tests the shared D3D11 native-call boundary with a fake
+swapchain, without Windows or Qt dependencies. It verifies synchronized
+`Present(1, 0)`, adaptive `Present(0, ALLOW_TEARING)`, mode transitions, legacy
+interval-zero calls, telemetry parameter agreement, and result propagation.
+It does not replace a Windows renderer build or a live scanout test.
+
+Production `controller.playout_preserve_dxgi_feedback=1` preserves pending DXGI
+present IDs and refresh anchors when native presentation mode changes. Latency
+samples and freshness remain separate for each mode, and the controller selects
+the lead for the mode it has just chosen. Native interval/flag telemetry supplies
+mode attribution when valid; otherwise the prior requested-mode fallback remains.
+Matched samples retain their submission's mode epoch: delayed adjacent samples
+within an epoch remain eligible after a newer submission switches mode, while
+cross-epoch pairs cannot grow padding. Late older matches cannot rewind the
+smoothness sequence. Real lifecycle and clock resets still clear the state.
+
+The flag defaults to zero when absent, preserving old captures' feedback-reset
+behavior under `--require-exact-baseline`. The new path applies only to DXGI;
+Vulkan feedback and the persisted calibration profile version are unchanged.
+The correction does not change native Present arguments, waits, or source-spacing
+policy, but recovered observations can alter the predicted floor and learned
+padding. Deterministic coverage of this feedback contract does not establish a
+display-specific tearing fix.
+
+`tst_vrrpresentationfeedback` covers delayed identity matching across mode
+changes, independent mode latency and freshness, cancelled observations,
+matched-frame epochs, uncertainty, resets, and bounded history. It has no Qt,
+SDL, or Windows dependency and can also be built directly:
+
+```sh
+c++ -std=c++17 tests/vrr/tst_vrrpresentationfeedback.cpp -o /tmp/tst_vrrpresentationfeedback
+/tmp/tst_vrrpresentationfeedback
+```
+
+The FPS picker offers native VRR rates and preserves saved custom values; the
+reduced-rate Low Latency VRR recommendation has been removed. The worker no
+longer generates gap-fill repeats when new frames are unavailable.
+
+Production preserves the game's relative RTP intervals and caps playout padding
+at 16 ms. Its gain smoother is disabled; historical policies remain replayable.
+For controller accuracy, use `simulation.sender_cadence.spacing_accuracy_percent`
+and `spacing_errors_over_2ms`: both long and short spacing errors count. The
+existing sender/arrival stall exclusions and denominator are unchanged. Raw
+presented jerk also includes game-driven cadence changes and is reported
+separately; it is not the controller's 99.95% acceptance criterion.
+`configs/game-spacing-validation.json` gates the nominal production scenario
+at 99.95%, 16 ms maximum padding, p99 decode-to-submission <= 30 ms and zero
+modeled interval violations. Its injected fault scenarios gate latency and
+interval safety separately; they do not claim 99.95% under post-target faults.
+The all-arrival queue simulator uses the capture's `can_latch_present` capability;
+forcing it off invents software-floor backlog on a latch-capable session.
+
+Production increases padding only after matched native presentation timing
+confirms a client-added interval error strictly greater than 3 ms. Errors at
+or below 3 ms, readiness estimates, and CPU-only submission errors cannot grow
+padding. Native cadence is compared with the mapped source clock, so genuine
+game cadence changes are not client hitches. Missing or ambiguous native timing
+is unavailable evidence, not a success or failure.
+
+Padding may shrink gradually with recent smooth native evidence, retaining
+3 ms above the readiness p99.95 estimate. A rising readiness estimate can stop
+release but cannot authorize growth. Version-17 profiles isolate this release
+floor from older calibration. The frame queue and 16 ms padding cap are unchanged.
+The captured `playout_native_hitch_adaptation` flag selects this policy; when
+absent it defaults to zero for exact replay of older captures. Existing readiness,
+stable-reference, and preparation-lead flags retain their historical semantics.
+`--require-exact-baseline` selects that captured policy; an ordinary replay or
+the `session-policy` scenario selects the current production policy instead.
+The spacing lifecycle audit accepts a zero correction floor only when the
+reconstructed controller also disables that software floor. It still validates
+the deficit, wait ordering, and any required nonzero floor.
+
+For a 3 ms sweep, report `simulation.sender_cadence.client_spacing_pairs`,
+`client_spacing_errors_over_3ms`, `client_spacing_accuracy_percent`, and
+`client_spacing_error_us`. These additive fields preserve the older 2 ms metrics.
+They exclude source gaps over 25 ms (reported as `source_stall_pairs`) but include
+long network/decode arrival gaps. They score submission timing, not confirmed
+native display intervals; report native sample/miss coverage separately before
+making a 99.95% visible-smoothness claim. Use gameplay captures for gameplay
+optimization, not desktop/idle sessions. Hold publication if a requested latency
+and smoothness target has not been established.
+
 The VRR test tree is opt-in so regular application and package builds do not
 gain test targets. From an out-of-tree build directory, configure it with:
 
@@ -7,6 +128,8 @@ gain test targets. From an out-of-tree build directory, configure it with:
 & C:\Users\Chase\sources\.tools\Qt\6.11.1\msvc2022_64\bin\qmake.exe `
     ..\tests\tests.pro CONFIG+=tests
 nmake
+.\vrr\release\tst_vrrpresentationfeedback.exe
+.\vrr\release\tst_dxgipresent.exe
 .\vrr\release\tst_vrrtimingcontroller.exe
 .\vrr\release\tst_vrrratepolicy.exe
 .\vrr\release\tst_vrrpacingworker.exe

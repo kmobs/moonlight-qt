@@ -937,7 +937,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     // Keep the existing fixed/unpaced behavior intact while sharing the same
     // preparation and final Present helpers used by the opt-in VRR backend.
     bool prepared = prepareFrameForPresent(frame);
-    HRESULT hr = prepared ? presentPreparedFrame(legacyPresentFlags()) : E_FAIL;
+    HRESULT hr = prepared ? presentPreparedFrame({0, legacyPresentFlags()}) : E_FAIL;
 
     if (m_DecodeDevice == m_RenderDevice) {
         // Release the context lock
@@ -2273,13 +2273,14 @@ bool D3D11VARenderer::waitForVrrPresentReady()
     return true;
 }
 
-HRESULT D3D11VARenderer::presentPreparedFrame(UINT flags)
+HRESULT D3D11VARenderer::presentPreparedFrame(
+    const DxgiPresentParameters& parameters)
 {
     if (m_SwapChain == nullptr) {
         return E_FAIL;
     }
 
-    return m_SwapChain->Present(0, flags);
+    return parameters.present(*m_SwapChain.Get());
 }
 
 UINT D3D11VARenderer::legacyPresentFlags() const
@@ -2425,19 +2426,15 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         }
     }
 
-    // A latched near-refresh request omits ALLOW_TEARING, selecting DXGI's
-    // non-tearing path. Sync interval 0 still has flip-queue semantics and
-    // does not prove which v-blank displays the image; frame statistics below
-    // remain the authority for that observation. The flag is a per-present
-    // choice on this swapchain, so no recreation is involved.
-    constexpr UINT presentSyncInterval = 0;
-    const UINT presentFlags = request.latchedPresentation ?
-        0 : DXGI_PRESENT_ALLOW_TEARING;
+    // The risk decision is per frame. Sync interval 1 holds a risky frame for
+    // the next scanout; safe frames retain the immediate VRR presentation path.
+    const auto presentParameters = DxgiPresentParameters::adaptive(
+        request.latchedPresentation, DXGI_PRESENT_ALLOW_TEARING);
     feedback.nativeBackendValid = true;
     feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
     feedback.nativePresentParametersValid = true;
-    feedback.nativePresentSyncInterval = presentSyncInterval;
-    feedback.nativePresentFlags = presentFlags;
+    feedback.nativePresentSyncInterval = presentParameters.syncInterval;
+    feedback.nativePresentFlags = presentParameters.flags;
     feedback.nativeVrrStateValid = true;
     feedback.nativeTearingSupported = m_VrrTearingSupported;
     feedback.nativeBorderlessFlipModel = m_VrrBorderlessFlipModel;
@@ -2552,7 +2549,7 @@ VrrPresentFeedback D3D11VARenderer::presentAdaptive(
         feedback.nativeRasterBeforePresent = sampleVrrRaster();
     }
     const uint64_t submissionTimeUs = LiGetMicroseconds();
-    HRESULT hr = presentPreparedFrame(presentFlags);
+    HRESULT hr = presentPreparedFrame(presentParameters);
     const uint64_t nativePresentEndUs = LiGetMicroseconds();
     if (request.collectDiagnostics &&
             m_VrrRasterSamplingRequested &&
@@ -3328,4 +3325,18 @@ bool D3D11VARenderer::setupTexturePoolViews(AVHWFramesContext* framesContext)
     }
 
     return true;
+}
+
+QString D3D11VARenderer::getCalibrationIdentity()
+{
+    ComPtr<IDXGIDevice> device;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC desc{};
+    LARGE_INTEGER driver{};
+    if (!m_RenderDevice || FAILED(m_RenderDevice.As(&device)) ||
+        FAILED(device->GetAdapter(&adapter)) || FAILED(adapter->GetDesc(&desc)) ||
+        FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver))) return {};
+    return QString("D3D11|%1|%2|%3|%4|%5|%6")
+        .arg(desc.VendorId).arg(desc.DeviceId).arg(desc.SubSysId).arg(desc.Revision)
+        .arg(driver.QuadPart).arg(m_DecodeDevice == m_RenderDevice);
 }

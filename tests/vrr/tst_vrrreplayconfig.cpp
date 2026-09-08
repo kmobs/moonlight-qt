@@ -12,6 +12,8 @@ class VrrReplayConfigTest : public QObject
 
 private slots:
     void defaultsRoundTrip();
+    void nativeHitchPolicyRoundTrip();
+    void dxgiFeedbackPolicyRoundTrip();
     void inheritanceAndOverride();
     void controllerSnapshotIsAtomic();
     void rejectsInvalidInput();
@@ -39,6 +41,8 @@ private slots:
 void VrrReplayConfigTest::defaultsRoundTrip()
 {
     VrrTimingParameters productionParameters;
+    QCOMPARE(productionParameters.playoutNativeHitchAdaptation, uint64_t(0));
+    QCOMPARE(productionParameters.playoutPreserveDxgiFeedback, uint64_t(0));
     productionParameters.playoutSmoothingSnapPerMille = 3000;
     QString validationError;
     QVERIFY2(validateVrrTimingParameters(
@@ -448,6 +452,68 @@ void VrrReplayConfigTest::controllerSnapshotIsAtomic()
              uint64_t(3));
     QCOMPARE(parameters.latchedPresentationExitHeadroomPeriodNumerator,
              uint64_t(13));
+}
+
+void VrrReplayConfigTest::nativeHitchPolicyRoundTrip()
+{
+    VrrTimingParameters parameters;
+    parameters.playoutReadinessDrivenAdaptation = 1;
+    parameters.playoutSmoothnessFeedbackEnabled = 1;
+    parameters.playoutPredictionEnabled = 1;
+    parameters.playoutHistoryEnabled = 1;
+    parameters.timestampPlayoutEnabled = 1;
+    parameters.playoutDelayAdaptive = 1;
+    QString error;
+    QJsonObject snapshot{{"playout_native_hitch_adaptation", 1}};
+    QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(1));
+    snapshot["playout_native_hitch_adaptation"] = 2;
+    QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
+    QCOMPARE(parameters.playoutNativeHitchAdaptation, uint64_t(1));
+    parameters.playoutSmoothnessFeedbackEnabled = 0;
+    QVERIFY(!validateVrrTimingParameters(parameters, error));
+}
+
+void VrrReplayConfigTest::dxgiFeedbackPolicyRoundTrip()
+{
+    QString error;
+    for (uint64_t enabled : {0ULL, 1ULL}) {
+        VrrTimingParameters parameters;
+        parameters.playoutPreserveDxgiFeedback = enabled;
+        const auto snapshot = vrrTimingParametersToJson(parameters);
+        QCOMPARE(snapshot.value("playout_preserve_dxgi_feedback").toInteger(),
+                 qint64(enabled));
+        VrrTimingParameters restored;
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error),
+                 qPrintable(error));
+        QCOMPARE(restored.playoutPreserveDxgiFeedback, enabled);
+    }
+
+    VrrTimingParameters parameters;
+    parameters.playoutPreserveDxgiFeedback = 1;
+    const auto unchanged = vrrTimingParametersToJson(parameters);
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        QJsonObject{{"playout_preserve_dxgi_feedback", 2}}, parameters, error));
+    QCOMPARE(vrrTimingParametersToJson(parameters), unchanged);
+
+    // Older snapshots/configs omit the field and retain the legacy policy.
+    auto legacySnapshot = unchanged;
+    legacySnapshot.remove("playout_preserve_dxgi_feedback");
+    VrrTimingParameters legacy;
+    QVERIFY2(applyVrrReplayControllerSnapshot(legacySnapshot, legacy, error),
+             qPrintable(error));
+    QCOMPARE(legacy.playoutPreserveDxgiFeedback, uint64_t(0));
+    auto root = vrrDefaultReplayConfigurationJson();
+    auto sections = root.value("parameters").toObject();
+    sections["controller"] = legacySnapshot;
+    root["parameters"] = sections;
+    VrrReplayConfiguration config;
+    QVERIFY2(loadVrrReplayConfiguration(QJsonDocument(root).toJson(), config, error),
+             qPrintable(error));
+    QCOMPARE(config.scenarios.front().controller.playoutPreserveDxgiFeedback,
+             uint64_t(0));
+    QVERIFY(vrrReplayParameterNames().contains(
+        "controller.playout_preserve_dxgi_feedback"));
 }
 
 void VrrReplayConfigTest::rasterEnvelope()
@@ -1341,6 +1407,20 @@ void VrrReplayConfigTest::spacingCorrectionAudit()
 
 void VrrReplayConfigTest::spacingLifecycleTimingAudit()
 {
+    // Latched presentation can disable the software floor while retaining
+    // deficit telemetry and a zero-deadline correction wait.
+    auto latched = evaluateVrrSpacingLifecycleTiming(
+        true, true, 1000, 100, 1050, 0, 0,
+        1050, 1050, 1060, 40, 40, true,
+        0, 1061, 1062, 1063);
+    QVERIFY(latched.relationshipValid);
+    QCOMPARE(latched.expectedRecheckDeficitUs, uint64_t(40));
+    auto missingFloor = evaluateVrrSpacingLifecycleTiming(
+        true, true, 1000, 100, 1050, 0, 1120,
+        1050, 1050, 1060, 40, 40, true,
+        0, 1061, 1120, 1121);
+    QVERIFY(!missingFloor.relationshipValid);
+
     VrrSpacingLifecycleTimingAudit audit =
         evaluateVrrSpacingLifecycleTiming(
             true, false, 0, 100, 1000, 0, 0,

@@ -269,6 +269,7 @@ ffmpeg {
 
     HEADERS += \
         streaming/video/ffmpeg.h \
+        streaming/video/incomingframetiming.h \
         streaming/video/ffmpeg-renderers/renderer.h \
         streaming/video/ffmpeg-renderers/genhwaccel.h \
         streaming/video/ffmpeg-renderers/sdlvid.h \
@@ -278,6 +279,8 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h
 }
@@ -368,6 +371,10 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
         streaming/video/ffmpeg-renderers/plvk.h
+    linux {
+        SOURCES += streaming/video/ffmpeg-renderers/vulkantiming.cpp
+        HEADERS += streaming/video/ffmpeg-renderers/vulkantiming.h
+    }
 
     macx {
         SOURCES += streaming/video/ffmpeg-renderers/plvk_objc.mm
@@ -420,6 +427,7 @@ win32:!winrt {
     HEADERS += \
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
+        streaming/video/ffmpeg-renderers/dxgipresent.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }
 macx {
@@ -464,6 +472,9 @@ wayland {
 
     DEFINES += HAS_WAYLAND
     SOURCES += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.cpp
+    SOURCES += streaming/video/ffmpeg-renderers/waylandfeedback/wayland.cpp \
+               streaming/video/ffmpeg-renderers/protocols/presentation-time-protocol.c
+    HEADERS += streaming/video/ffmpeg-renderers/waylandfeedback/wayland.h
     HEADERS += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.h
 }
 !disable-h264bitstream {
@@ -601,3 +612,5 @@ macx {
 
 VERSION = "$$BASE_VERSION"
 DEFINES += VERSION_STR=\\\"$$MOONLIGHT_VERSION\\\"
+
+SOURCES += $$PWD/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp

@@ -32,10 +32,30 @@ VrrSessionConfig config(int streamRateHz = 60, int displayRefreshHz = 120)
     return value;
 }
 
+// Keep existing VRR13/metronome regression fixtures on their recorded policy.
+VrrTimingParameters legacyPlayoutParameters(const VrrSessionConfig& session)
+{
+    auto policy = vrrTimingParametersForSession(session);
+    policy.playoutReadinessDrivenAdaptation = 0;
+    policy.playoutNativeHitchAdaptation = 0;
+    policy.playoutStableSmoothnessReference = 0;
+    policy.renderStartPreserveLearnedLead = 0;
+    policy.playoutPredictionEnabled = 0;
+    policy.playoutPreserveDxgiFeedback = 0;
+    policy.playoutSmoothnessFeedbackEnabled = 0;
+    policy.playoutSmoothingGainPerMille = session.smoothFrameTiming ? 200 : 0;
+    policy.playoutDelayMaximumUs = 8000;
+    policy.playoutDelayMaximumPeriodPerMille = 950;
+    policy.playoutDelayAttackUs = 50;
+    return policy;
+}
+
 // The retired metronome, for the tests that keep it replayable.
 VrrTimingParameters metronomePolicy(const VrrSessionConfig& session)
 {
-    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingParameters policy = legacyPlayoutParameters(session);
+    policy.playoutHistoryEnabled = 0;
+    policy.playoutPerFrameLatch = 0;
     policy.playoutSmoothingGainPerMille = 150;
     policy.playoutMetronomeEnabled = 1;
     policy.playoutMotionDeadbandEnabled = 0;
@@ -174,9 +194,9 @@ void testSourcePlayoutDelayOffsetsProjectedTargets()
     VrrSessionConfig smoothness = lowLatency;
     smoothness.allowAdditionalQueuedFrame = true;
     const VrrTimingParameters lowLatencyPolicy =
-        vrrTimingParametersForSession(lowLatency);
+        legacyPlayoutParameters(lowLatency);
     const VrrTimingParameters smoothnessPolicy =
-        vrrTimingParametersForSession(smoothness);
+        legacyPlayoutParameters(smoothness);
     expect(lowLatencyPolicy.timestampPlayoutEnabled == 1 &&
                lowLatencyPolicy.playoutDelayAdaptive == 1 &&
                lowLatencyPolicy.sourcePlayoutDelayUs == 3000 &&
@@ -237,7 +257,7 @@ void testTimestampModePreservesUnevenHostIntervals()
     // this real source variation while absorbing separate delivery jitter.
     VrrSessionConfig session = config(60, 120);
     session.smoothFrameTiming = false;
-    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingParameters policy = legacyPlayoutParameters(session);
     expect(policy.timestampPlayoutEnabled == 1 &&
                policy.playoutDelayAdaptive == 1 &&
                policy.playoutMetronomeEnabled == 0 &&
@@ -373,7 +393,7 @@ void testTimestampModeStillBoundsCatchUpBursts()
 {
     VrrSessionConfig session = config(116, 120);
     session.smoothFrameTiming = false;
-    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingParameters policy = legacyPlayoutParameters(session);
     policy.playoutDelayAdaptive = 0;
     VrrTimingController controller(session, false, policy);
     const uint64_t epochUs = 1000000;
@@ -421,7 +441,7 @@ void testCadenceSmoothingEvensJitteredSource()
     };
     const auto run = [&](uint64_t gainPerMille, double& spreadUs,
                          int64_t& maximumLagUs, unsigned int& resets) {
-        VrrTimingParameters policy = vrrTimingParametersForSession(session);
+        VrrTimingParameters policy = legacyPlayoutParameters(session);
         policy.playoutDelayAdaptive = 0;
         policy.sourcePlayoutDelayUs = 8000;
         policy.playoutSmoothingGainPerMille = gainPerMille;
@@ -486,7 +506,9 @@ void testCadenceSmoothingEvensJitteredSource()
 void testAdaptivePlayoutDelaySlewsAcrossBands()
 {
     VrrSessionConfig session = config(116, 120);
-    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingParameters policy = legacyPlayoutParameters(session);
+    policy.playoutHistoryEnabled = 0;
+    policy.playoutPerFrameLatch = 0;
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     const auto rtpFor = [](int i, int rateHz) {
@@ -614,7 +636,7 @@ void testPrepareOnArrivalSpendsTheCushion()
     // preparation at once: the render start sits a whole playout delay
     // before the usual lead, at the frame's mapped slot.
     VrrSessionConfig session = config(116, 120);
-    VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingParameters policy = legacyPlayoutParameters(session);
     policy.playoutPrepareOnArrival = 1;
     policy.renderStartAfterSubmissionUs = 0;
     VrrTimingController controller(session, true, policy);
@@ -642,7 +664,7 @@ void testRenderStartKeepsClearOfPreviousPresent()
     // the previous present, but it must keep the minimum lead before the
     // target when the interval is too short for both.
     VrrSessionConfig session = config(116, 120);
-    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    const VrrTimingParameters policy = legacyPlayoutParameters(session);
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     VrrTimingDecision decision;
@@ -685,7 +707,7 @@ void testShortHitchDoesNotRefitSourceRate()
     // The fitted rate, the metronome period and the delay must hold; a real
     // cutscene that keeps the slow cadence for longer is still accepted.
     VrrSessionConfig session = config(116, 120);
-    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    const VrrTimingParameters policy = legacyPlayoutParameters(session);
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     int frameNumber = 0;
@@ -709,6 +731,9 @@ void testShortHitchDoesNotRefitSourceRate()
         decision = controller.schedule(frame(++frameNumber, timestamp, true, decodedUs), decodedUs);
         controller.noteSubmission(true, false, decision.targetUs);
         refitted = refitted || decision.sourceRateChanged;
+        maximumDelayStepUs = std::max(maximumDelayStepUs,
+            uint64_t(std::abs(int64_t(decision.playoutDelayUs) - int64_t(previousDelayUs))));
+        previousDelayUs = decision.playoutDelayUs;
     }
     for (int i = 0; i < 100; ++i) {
         timestamp += 776;
@@ -1020,8 +1045,10 @@ void testHighRefreshCalibrationBandsHaveNoCadenceCliff()
              rateHz <= sweep.maximumSourceRateHz; ++rateHz) {
             const VrrSessionConfig session = config(
                 rateHz, sweep.displayRefreshHz);
-            const VrrTimingParameters policy =
-                vrrTimingParametersForSession(session);
+            VrrTimingParameters policy =
+                legacyPlayoutParameters(session);
+            policy.playoutHistoryEnabled = 0;
+            policy.playoutPerFrameLatch = 0;
             VrrTimingController controller(session, true, policy);
             std::vector<uint64_t> jerksUs;
             uint64_t previousTargetUs = 0;
@@ -1201,8 +1228,10 @@ void testReported120HzBandBoundarySlewsCalibration()
         return result;
     };
 
-    const VrrTimingParameters production =
-        vrrTimingParametersForSession(config(127, 144));
+    VrrTimingParameters production =
+        legacyPlayoutParameters(config(127, 144));
+    production.playoutHistoryEnabled = 0;
+    production.playoutPerFrameLatch = 0;
     const Result current = run(production);
 
     VrrTimingParameters vrr12Like = production;
@@ -2374,7 +2403,8 @@ void testBurstExclusionKeepsDelayAfterStall()
     // seven frames at once. Their lateness is the stall's backlog, not the
     // link's jitter, and must not pin the cushion at its cap.
     VrrSessionConfig session = config(116, 120);
-    const VrrTimingParameters policy = vrrTimingParametersForSession(session);
+    VrrTimingParameters policy = legacyPlayoutParameters(session);
+    policy.playoutHistoryEnabled = 0;
     VrrTimingController controller(session, true, policy);
     const uint64_t epochUs = 1000000;
     const auto rtpFor = [](int i) {
@@ -2419,7 +2449,7 @@ void testLatchedPresentationDropsSoftwareFloor()
     // flip queue instead, so the production policy reports no floor there.
     VrrSessionConfig session = config(120, 120);
     VrrTimingController production(session, true,
-                                   vrrTimingParametersForSession(session));
+                                   legacyPlayoutParameters(session));
     VrrTimingController legacy(session, true, VrrTimingParameters {});
     const uint64_t startUs = 1000000;
     for (int i = 0; i < 10; ++i) {
@@ -2431,8 +2461,8 @@ void testLatchedPresentationDropsSoftwareFloor()
         const VrrTimingDecision legacyDecision =
             legacy.schedule(frame(i + 1, timestamp, true, decodedUs), decodedUs);
         legacy.noteSubmission(true, false, legacyDecision.targetUs);
-        expect(produced.latchedPresentation && legacyDecision.latchedPresentation,
-               "a source at the refresh rate must request latched presentation");
+        if (i > 0) expect(produced.latchedPresentation && legacyDecision.latchedPresentation,
+               "a source at the refresh rate must request latched presentation after its first frame");
     }
     expect(production.earliestSubmissionUs() == 0,
            "latched production presentation must not impose a software spacing floor");
@@ -2456,10 +2486,769 @@ void testRuntimeParametersChangePolicy()
            "controller must retain its resolved parameter set");
 }
 
+void testPerFrameLatchAtNativeMaximum()
+{
+    for (int rate : {109, 112, 116, 119, 120}) {
+        auto session = config(rate, 120);
+        auto policy = legacyPlayoutParameters(session);
+        VrrTimingController controller(session, true, policy);
+        unsigned latched = 0;
+        for (int i = 0; i < 600; ++i) {
+            const uint32_t rtp = uint32_t(uint64_t(i) * 90000 / rate);
+            const uint64_t at = 1000000 + uint64_t(rtp) * 1000 / 90 + (i % 9) * 30;
+            const auto prior = controller.lastSubmissionUs();
+            const auto d = controller.schedule(frame(i, rtp, true, at), at);
+            if (i > 100) latched += d.latchedPresentation;
+            if (prior && !d.latchedPresentation)
+                expect(d.targetUs >= prior + controller.displayPeriodUs(),
+                       "every immediate submission must satisfy the display interval");
+            controller.noteSubmission(true, false, d.targetUs);
+        }
+        if (rate <= 116) expect(latched == 0, "small jitter at 109..116 FPS must not trigger conservative latching");
+        if (rate == 120) expect(latched > 400, "120 FPS must use native scanout protection without reducing the stream cap");
+    }
+    auto session = config(120, 120);
+    VrrTimingController noLatch(session, false, legacyPlayoutParameters(session));
+    for (int i = 0; i < 100; ++i) {
+        auto at = 1000000 + uint64_t(i) * 8333;
+        auto prior = noLatch.lastSubmissionUs();
+        auto d = noLatch.schedule(frame(i, uint32_t(i * 750), true, at), at);
+        expect(!d.latchedPresentation && (!prior || d.targetUs >= prior + noLatch.displayPeriodUs()),
+               "backends without per-frame native latching must retain the software floor");
+        noLatch.noteSubmission(true, false, d.targetUs);
+    }
+}
+
+void testProcessingEpisodeClassification()
+{
+    using R = Vrr13::Reserve;
+    R history;
+    Vrr13::WorkloadEpisode episode;
+    episode.observe(history, 8000000, 10000000, R::Second, 30000, 16667);
+    expect(history.evidence() == 0, "a work episode must remain provisional until recovery");
+    episode.observe(history, 1000000, 10000000, R::Second + 16667000, 0, 16667);
+    expect(history.evidence() == 2 && history.common() == 8000000,
+           "a transient decoder backlog must teach its tail after draining");
+    const auto before = history.evidence();
+    for (int i = 0; i < 240; ++i)
+        episode.observe(history, 90000000, 10000000,
+                        2 * R::Second + int64_t(i) * 16667000, 100000, 16667);
+    episode.observe(history, 1000000, 10000000, 7 * R::Second, 0, 16667);
+    expect(history.evidence() == before + 1 && history.common() == 8000000,
+           "sustained processing overload must not inflate the receiver jitter buffer");
+}
+
+void testRollingPlayoutHistory()
+{
+    using R = Vrr13::Reserve;
+    R memory;
+    for (int i = 0; i <= 600; ++i)
+        memory.observe(i % 100 == 0 ? 8000000 : 1000000, 9000000,
+                       R::Second + int64_t(i) * R::Second / 120);
+    expect(memory.common() == 8000000, "five-minute history must retain recurring receiver tails");
+    const auto checkpoint = memory.checkpoint();
+    R restored;
+    expect(restored.restore(checkpoint), "a checkpoint must restore the complete histogram and expiration clock");
+    for (int i = 1; i <= 300; ++i) {
+        const auto at = 6 * R::Second + int64_t(i) * R::Second / 30;
+        memory.observe(1000000, 9000000, at);
+        restored.observe(1000000, 9000000, at);
+    }
+    expect(memory.checkpoint() == restored.checkpoint(), "checkpoint continuation must be exact across an FPS change");
+    expect(memory.common() == 8000000, "30 FPS must not discard the jitter learned at 120 FPS");
+    memory.observe(1000000, 9000000, 307 * R::Second);
+    expect(memory.common() == 1000000, "expired evidence must not pin latency forever");
+    R prior;
+    expect(prior.loadProfile(restored.profile()), "compatible jitter profiles must load");
+    expect(prior.evidence() == 0 && !prior.canRelease(), "cached history is not fresh validation");
+    prior.age(14);
+    expect(prior.cachedEvidence() < restored.evidence(), "offline aging must reduce prior evidence");
+    auto invalid = restored.profile(); invalid[0] = 12;
+    expect(!prior.loadProfile(invalid), "VRR14 recovery-budget profiles must not be accepted by VRR13");
+}
+
+void testHistoryPreservesVrr13Scheduling()
+{
+    const auto session = config(60, 144);
+    auto policy = legacyPlayoutParameters(session);
+    expect(policy.playoutMetronomeEnabled == 0 && policy.playoutSmoothingGainPerMille == 200,
+           "historical replay must retain VRR13's gain smoother");
+    auto legacy = policy;
+    legacy.playoutHistoryEnabled = 0;
+    // Equal fixed buffers isolate the scheduling mechanism from its learner.
+    policy.playoutDelayAdaptive = legacy.playoutDelayAdaptive = 0;
+    VrrTimingController current(session, true, policy), before(session, true, legacy);
+    for (int i = 0; i < 1000; ++i) {
+        uint32_t rtp = uint32_t(i * 1500 + (i % 2 ? 90 : 0));
+        uint64_t at = 1000000 + uint64_t(rtp) * 1000 / 90 + (i % 7) * 250;
+        auto x = current.schedule(frame(i, rtp, true, at), at);
+        auto y = before.schedule(frame(i, rtp, true, at), at);
+        expect(x.targetUs == y.targetUs && x.cadenceSmoothingUs == y.cadenceSmoothingUs &&
+               x.renderStartUs == y.renderStartUs, "buffer-only changes must leave the VRR13 scheduler identical");
+        current.noteSubmission(true, false, x.targetUs);
+        before.noteSubmission(true, false, y.targetUs);
+    }
+}
+
+void testHistoryLearningAndQueueCapacity()
+{
+    for (int rate : {30, 60, 120, 240}) {
+        auto session = config(rate, 360);
+        auto policy = legacyPlayoutParameters(session);
+        VrrTimingController controller(session, true, policy);
+        for (int i = 0; i < rate * 12; ++i) {
+            auto rtp = uint32_t(uint64_t(i) * 90000 / rate);
+            auto at = 1000000 + uint64_t(rtp) * 1000 / 90;
+            auto d = controller.schedule(frame(i, rtp, true, at), at);
+            expect(d.playoutDelayUs <= controller.playoutQueueLimitUs(),
+                   "buffer plus preparation and smoothing must leave a slot for the next arrival");
+            controller.noteSubmission(true, false, d.targetUs);
+        }
+        expect(controller.playoutHistory().evidence() >= uint64_t(rate * 10),
+               "low FPS is not a host stall and must warm the same histogram");
+        expect(controller.playoutDelayUs() <= policy.playoutDelayMinimumUs + 500,
+               "clean startup must release in wall time at every source FPS");
+    }
+    auto session = config(60, 144);
+    auto policy = legacyPlayoutParameters(session);
+    VrrTimingController controller(session, true, policy);
+    for (int i = 0; i < 800; ++i) {
+        auto rtp = uint32_t(i * 1500);
+        // Steady sender, receiver stall. The original deadline must survive.
+        auto at = 1000000 + uint64_t(rtp) * 1000 / 90 + (i == 799 ? 35000 : 0);
+        auto d = controller.schedule(frame(i, rtp, true, at), at);
+        if (i == 799) {
+            expect(d.originalTargetUs < at && d.targetUs >= at,
+                   "readiness clamps must never rewrite the original deadline");
+            expect(controller.playoutHistory().common() >= 30000000,
+                   "a steady sender's delivery stall must enter receiver jitter history");
+        }
+        controller.noteSubmission(true, false, d.targetUs);
+    }
+}
+
 } // namespace
+
+void testVrr14Prediction()
+{
+    using R = Vrr13::Reserve;
+    R reserve(14);
+    for (int i = 0; i <= 600; ++i)
+        reserve.observe(9000000, 6000000, R::Second + int64_t(i) * R::Second / 120);
+    expect(reserve.misses() == 0, "exactly 3 ms over available buffer is tolerated");
+    expect(reserve.target(100000000, 0, 0) == 6000000, "native ceiling retains tail minus 3 ms tolerance");
+    expect(reserve.target(100000000, 0, 4000000) == 2000000, "free recovery room must reduce queued protection");
+    expect(reserve.target(100000000, 0, 10000000) == 0, "headroom credit cannot make protection negative");
+    R old;
+    expect(!old.loadProfile(reserve.profile()), "VRR13 must reject combined-readiness history");
+    R restored(14);
+    expect(restored.restore(reserve.checkpoint()), "VRR14 checkpoints must restore their tolerance and history");
+    reserve.observe(9000001, 6000000, 7 * R::Second);
+    restored.observe(9000001, 6000000, 7 * R::Second);
+    expect(reserve.misses() == 1 && reserve.checkpoint() == restored.checkpoint(), "a miss beyond 3 ms and checkpoint continuation must agree");
+
+    Vrr13::ReadinessPrediction workload;
+    R ready(14);
+    Vrr13::ReadinessPrediction::Probe probe{1001000, 1000000, 16667, 1000, 1000, 8334, 300, 0, true};
+    workload.observe(ready, probe, 3000, 500);
+    expect(ready.common() == 3500000, "combined readiness learns receiver jitter plus excess service and scheduling");
+    expect(ready.misses() == 0, "miss accounting includes the same recovery credit as target selection");
+    const auto evidence = ready.evidence();
+    for (int i = 1; i < 180; ++i) {
+        probe.decoded = 1001000 + uint64_t(i) * 16667;
+        probe.expected = probe.decoded - 1000;
+        probe.decoderQueue = 50000;
+        workload.observe(ready, probe, 1000, 0);
+    }
+    probe.decoderQueue = 0; probe.decoded += 16667; probe.expected += 16667;
+    workload.observe(ready, probe, 1000, 0);
+    expect(ready.evidence() == evidence + 1, "sustained decoder overload must not become permanent buffer history");
+
+    Vrr13::PresentationPrediction presentation;
+    Vrr13::PresentationObservation o;
+    o.submitted = o.idValid = o.sampleValid = o.dxgi = true;
+    o.id = o.sampleId = 1; o.submission = 1000000; o.ready = 999000;
+    o.deadline = 1004000; o.observed = 1005000; o.sampleTime = 1002000;
+    o.presentRefresh = 11; o.syncRefresh = 10;
+    presentation.observe(o);
+    expect(presentation.measured() == 0, "unrelated DXGI sync timestamps must not teach presentation latency");
+    o.submitted = false; o.syncRefresh = 11; o.sampleTime = 1004000;
+    presentation.observe(o);
+    expect(presentation.measured() == 1 && presentation.lead(1005000) == 4000,
+           "matching refresh identity must learn compositor lead");
+    expect(presentation.misses() == 0 && presentation.floor(1005000, 8333, 100) == 1012433,
+           "original scanout deadline and physical display spacing are independent measurements");
+    expect(presentation.lead(1200000) == 0 && presentation.floor(1200000, 8333, 100) == 0,
+           "stale native feedback must stop controlling predictions");
+    presentation.reset();
+    o.submitted = true; o.submission = 1006000; o.sampleTime = 1004000;
+    presentation.observe(o);
+    expect(presentation.measured() == 0, "even equal refresh counters cannot timestamp a present that happened afterward");
+
+    uint64_t delays[2]{};
+    for (int k = 0; k < 2; ++k) {
+        const int rate = k ? 60 : 120;
+        const auto session = config(rate, 120);
+        auto policy = legacyPlayoutParameters(session);
+        policy.playoutPredictionEnabled = 1;
+        VrrTimingController controller(session, true, policy);
+        for (int i = 0; i < 2400; ++i) {
+            const uint32_t rtp = uint32_t(uint64_t(i) * 90000 / rate);
+            const auto decoded = decodedTimeForRtp(1000000, rtp) + (i % 10 == 9 ? 7000 : 0);
+            const auto d = controller.schedule(frame(i, rtp, true, decoded), decoded);
+            controller.notePreparationDuration(1000);
+            controller.noteSchedulerDelays(0, 0, true);
+            controller.noteSubmission(true, false, std::max(d.targetUs, decoded + 1000));
+            delays[k] = d.playoutDelayUs;
+            expect(d.predictedScanoutUs == d.targetUs + d.compositorLeadUs,
+                   "predicted scanout must include learned compositor lead exactly once");
+        }
+    }
+    expect(delays[1] + 2000 < delays[0], "the same receiver jitter must require less queued delay at 60 FPS than at 120 FPS");
+    {
+        const auto session = config(60, 120);
+        auto policy = legacyPlayoutParameters(session);
+        policy.playoutPredictionEnabled = 1;
+        VrrTimingController clean(session, true, policy), late(session, true, policy);
+        for (int i = 0; i < 180; ++i) {
+            const uint32_t rtp = uint32_t(i * 1500);
+            const auto at = decodedTimeForRtp(1000000, rtp);
+            const auto lateAt = at + (i == 170 ? 15000 : 0);
+            const auto a = clean.schedule(frame(i, rtp, true, at), at);
+            const auto b = late.schedule(frame(i, rtp, true, lateAt), lateAt);
+            if (i == 171) expect(std::abs(int64_t(a.originalTargetUs) - int64_t(b.originalTargetUs)) <= 200,
+                "a late execution must not re-anchor the smoothed source clock and consume free recovery headroom");
+            clean.notePreparationDuration(1000); late.notePreparationDuration(1000);
+            clean.noteSubmission(true, false, a.targetUs); late.noteSubmission(true, false, b.targetUs);
+        }
+    }
+    {
+        auto session = config(60, 120);
+        VrrTimingController controller(session, true, vrrTimingParametersForSession(session));
+        for (int i = 0; i < 20; ++i) {
+            const auto at = uint64_t(1000000 + i * 16667);
+            const auto d = controller.schedule(frame(i, uint32_t(i * 1500), true, at), at);
+            if (i > 2) expect(d.compositorLeadUs == 2000,
+                "the live controller must use matched native feedback in subsequent scanout predictions");
+            controller.notePreparationDuration(i == 15 ? 6000 : 1000);
+            controller.noteSubmission(true, false, d.targetUs);
+            Vrr13::PresentationObservation sample;
+            sample.submitted = sample.idValid = sample.sampleValid = true;
+            sample.id = sample.sampleId = uint64_t(i + 1);
+            sample.submission = sample.ready = d.targetUs;
+            sample.sampleTime = d.targetUs + 2000; sample.observed = sample.sampleTime;
+            sample.deadline = d.originalScanoutUs; sample.latched = d.latchedPresentation;
+            controller.notePresentation(sample);
+        }
+        expect(controller.typicalRenderUs() == 1000 && controller.renderLeadUs() > controller.typicalRenderUs(),
+               "one render tail must increase preparation lead without becoming the normal playout offset");
+    }
+}
+
+void testSmoothnessFeedback()
+{
+    using Feedback = Vrr13::SmoothnessFeedback;
+    using R = Vrr13::Reserve;
+    R raw(15);
+    for (int i = 0; i < 400; ++i) raw.observe(8000000, 5000000, R::Second + int64_t(i) * 16667000);
+    expect(raw.target(100000000, 0, 2000000) == 6000000,
+           "8 ms required protection minus 2 ms headroom must give 6 ms buffer; tolerance is not a credit");
+    expect(raw.misses() == 400, "version 15 must count exactly 3 ms as a violation");
+    R restored(15);
+    expect(restored.restore(raw.checkpoint()) && restored.checkpoint() == raw.checkpoint(),
+           "new readiness semantics must preserve exact versioned checkpoints");
+    for (uint64_t error : {2999ULL, 3000ULL, 3001ULL}) {
+        Feedback f;
+        f.observe({1, 1000000, 1000000, 6000, 2000, 0, true}, 1000000);
+        f.observe({2, 1016667 + error, 1016667, 6000, 2000, 0, true}, 1025000);
+        expect(f.samples() == 1 && f.misses() == (error >= 3000), "smoothness threshold must be inclusive at 3 ms");
+        expect((f.protectionUs() > 8000) == (error >= 3000), "only a true interval violation must raise required protection");
+    }
+    Feedback stable;
+    for (uint64_t i = 0; i < 200; ++i)
+        stable.observe({i, 1010000 + i * 16667, 1000000 + i * 16667, 6000, 2000, 0, true}, 1010000 + i * 16667);
+    expect(stable.samples() == 199 && stable.misses() == 0 && !stable.protectionUs(),
+           "constant 10 ms lateness is smooth and must not cause buffer growth");
+    Feedback missing;
+    missing.observe({1, 1000000, 1000000, 6000, 2000, 0, true}, 1000000);
+    missing.observe({3, 1040000, 1033334, 6000, 2000, 0, true}, 1040000);
+    missing.observe({2, 1016667, 1016667, 6000, 2000, 0, true}, 1040000);
+    expect(!missing.samples(), "missing and out-of-order native samples cannot manufacture success or failure");
+    Feedback delayed;
+    delayed.observe({1, 1000000, 1000000, 6000, 2000, 0, true}, 1100000);
+    delayed.observe({2, 1022667, 1016667, 6000, 2000, 0, true}, 1100000);
+    const auto demanded = delayed.protectionUs();
+    delayed.observe({3, 1033334, 1033334, 30000, 2000, 0, true}, 1100000);
+    expect(delayed.misses() == 2 && delayed.protectionUs() == demanded,
+           "catch-up and delayed feedback must charge the late frame's original protection, not today's larger buffer");
+    Feedback uncertain;
+    uncertain.observe({1, 1000000, 1000000, 6000, 2000, 100, true}, 1000000);
+    uncertain.observe({2, 1019667, 1016667, 6000, 2000, 100, true}, 1020000);
+    expect(!uncertain.samples(), "an uncertain threshold crossing must remain unavailable evidence");
+    Feedback capped;
+    capped.observe({1, 1000000, 1000000, 100000, 0, 0, true}, 1000000);
+    capped.observe({2, 1026667, 1016667, 100000, 0, 0, true}, 1026667);
+    expect(capped.misses() == 1, "histogram saturation must not hide a smoothness failure");
+
+    const auto session = config(60, 120);
+    auto policy = vrrTimingParametersForSession(session);
+    // Preserve the historical feedback law for exact replay regression coverage.
+    policy.playoutNativeHitchAdaptation = 0;
+    policy.playoutReadinessDrivenAdaptation = 0;
+    VrrTimingController controller(session, true, policy);
+    uint64_t before = 0, after = 0, lateMisses = 0, samples = 0;
+    for (int i = 0; i < 4000; ++i) {
+        const auto at = decodedTimeForRtp(1000000, uint32_t(i * 1500));
+        const auto d = controller.schedule(frame(i, uint32_t(i * 1500), true, at), at);
+        if (i == 299) before = d.playoutDelayUs;
+        // Delay occurs outside the readiness predictor: only actual timing can teach it.
+        const auto submitted = std::max(d.targetUs, at + (i >= 300 && i % 10 == 9 ? 15000 : 1000));
+        controller.notePreparationDuration(1000);
+        controller.noteSubmission(true, false, submitted);
+        if (i == 2000) { lateMisses = d.submissionSmoothnessMisses; samples = d.submissionSmoothnessSamples; }
+        if (i == 3999) {
+            after = d.playoutDelayUs;
+            expect(d.submissionSmoothnessSamples > samples + 1900 && d.submissionSmoothnessMisses == lateMisses,
+                   "closed-loop correction must eliminate repeated interval misses after learning");
+            expect(d.smoothnessProtectionUs > 0 && !d.playoutCapacityLimited,
+                   "feedback must request real protection within available queue capacity");
+        }
+    }
+    expect(after > before + 3000, "actual misses must grow the live buffer even when readiness predicts success");
+
+    VrrTimingController native(session, true, policy);
+    uint64_t nativeProtection = 0;
+    for (int i = 0; i < 60; ++i) {
+        const auto at = decodedTimeForRtp(2000000, uint32_t(i * 1500));
+        const auto d = native.schedule(frame(i, uint32_t(i * 1500), true, at), at);
+        native.notePreparationDuration(1000);
+        native.noteSubmission(true, false, d.targetUs);
+        Vrr13::PresentationObservation o;
+        o.smoothness = native.smoothnessSample(d);
+        o.submitted = o.idValid = o.sampleValid = true;
+        o.id = o.sampleId = uint64_t(i + 1);
+        o.submission = o.ready = d.targetUs;
+        o.sampleTime = d.targetUs + (i == 40 ? 8000 : 2000);
+        o.observed = o.sampleTime;
+        o.deadline = d.originalScanoutUs; o.latched = d.latchedPresentation;
+        native.notePresentation(o);
+        if (i == 59) {
+            nativeProtection = d.smoothnessProtectionUs;
+            expect(d.nativeSmoothnessSamples > 40 && d.nativeSmoothnessMisses > 0,
+                   "matched native presentation intervals must feed back into the live controller");
+        }
+    }
+    expect(nativeProtection > 0, "native-only misses must create protection demand");
+}
+
+void testStableNativeSmoothnessReference()
+{
+    const auto session = config(60, 120);
+    auto policy = vrrTimingParametersForSession(session);
+    auto legacyPolicy = policy;
+    legacyPolicy.playoutStableSmoothnessReference = 0;
+    legacyPolicy.playoutNativeHitchAdaptation = 0;
+    VrrTimingController current(session, true, policy);
+    VrrTimingController legacy(session, true, legacyPolicy);
+    Vrr13::SmoothnessFeedback stable, moving;
+    // Recorded frames 7540/7541: the estimated compositor lead appeared
+    // between frames, while observed presentation stayed close to cadence.
+    VrrTimingDecision a, b;
+    a.frameNumber = 7540; b.frameNumber = 7541;
+    a.cadenceEligible = b.cadenceEligible = true;
+    a.sourcePeriodUs = b.sourcePeriodUs = 9000;
+    a.sourceIntervalUs = b.sourceIntervalUs = 9000;
+    a.playoutDelayUs = b.playoutDelayUs = 16000;
+    a.originalTargetUs = a.originalScanoutUs = 1000000;
+    b.originalTargetUs = 1008698;
+    a.sourceTimeUs = a.originalTargetUs;
+    b.sourceTimeUs = b.originalTargetUs;
+    b.originalScanoutUs = b.originalTargetUs + 4974;
+    for (auto* controller : {&current, &legacy}) {
+        auto first = controller->smoothnessSample(a);
+        auto second = controller->smoothnessSample(b);
+        first.at = 1005000; second.at = first.at + 8287;
+        auto& feedback = controller == &current ? stable : moving;
+        feedback.observe(first, first.at);
+        feedback.observe(second, second.at);
+    }
+    expect(stable.samples() == 1 && stable.misses() == 0 && stable.protectionUs() == 0,
+           "a changing compositor estimate must not manufacture native protection demand");
+    expect(moving.misses() == 1 && moving.protectionUs() > 16000,
+           "legacy replay must retain the captured moving-reference miss");
+
+    // Also exercise the native predictor acquiring its first latency sample.
+    for (int i = 0; i < 100; ++i) {
+        const auto at = decodedTimeForRtp(2000000, uint32_t(i * 1500));
+        const auto d = current.schedule(frame(i, uint32_t(i * 1500), true, at), at);
+        current.notePreparationDuration(1000);
+        current.noteSubmission(true, false, d.targetUs);
+        Vrr13::PresentationObservation o;
+        o.smoothness = current.smoothnessSample(d);
+        o.submitted = o.idValid = o.sampleValid = true;
+        o.id = o.sampleId = uint64_t(i + 1);
+        o.submission = o.ready = d.targetUs;
+        o.sampleTime = d.targetUs + 5000;
+        o.observed = o.sampleTime;
+        o.deadline = d.originalScanoutUs; o.latched = d.latchedPresentation;
+        current.notePresentation(o);
+        if (i == 99) {
+            expect(d.nativeSmoothnessSamples > 80 && d.nativeSmoothnessMisses == 0,
+                   "learning a constant native latency must preserve smooth cadence");
+        }
+    }
+}
+
+void testPreparationKeepsLearnedLead()
+{
+    const auto session = config(120, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    VrrTimingController controller(session, true, policy);
+    uint64_t previousSubmission = 0;
+    bool sawLargerLead = false;
+    for (int i = 0; i < 300; ++i) {
+        const auto decoded = decodedTimeForRtp(1000000, uint32_t(i * 750));
+        const auto now = std::max(decoded, previousSubmission + 100);
+        const auto d = controller.schedule(frame(i, uint32_t(i * 750), true, decoded), now);
+        if (i > 20) {
+            expect(d.targetUs - d.renderStartUs >= d.renderLeadUs + d.renderWakeLeadUs,
+                   "post-present spacing must not truncate learned preparation lead");
+            if (i > 160 && d.renderLeadUs >= 5000) sawLargerLead = true;
+        }
+        const uint64_t work = i < 150 ? 3500 : 5000;
+        const auto ready = std::max(now, d.renderStartUs) + work;
+        controller.notePreparationDuration(work);
+        previousSubmission = std::max(ready, d.targetUs);
+        controller.noteSubmission(true, false, previousSubmission);
+    }
+    expect(sawLargerLead, "longer preparation must earn rendering time, not only a later target");
+}
+
+void testReadinessDrivenPadding()
+{
+    // Identical FIFO and three-frame capacity throughout. Only time padding
+    // changes. Native/submission delay after readiness must remain visible,
+    // without becoming a demand for still more padding on the next frame.
+    for (int faultKind : {0, 1, 2, 3}) {
+        for (uint64_t cap : {8000ULL, 16000ULL}) {
+            const auto session = config(60, 120);
+            auto policy = vrrTimingParametersForSession(session);
+            policy.playoutNativeHitchAdaptation = 0;
+            policy.playoutDelayMaximumUs = cap;
+            VrrTimingController controller(session, true, policy);
+            uint64_t previousActual = 0, previousIntended = 0;
+            uint64_t badPairs = 0, finalDelay = 0, misses = 0;
+            for (int i = 0; i < 3000; ++i) {
+                const uint64_t source = 1000000 + uint64_t(i) * 1000000 / 60;
+                const bool fault = i >= 180 && i % 10 == 9;
+                const uint64_t decoded = source + (faultKind == 1 && fault ? 12000 : 0);
+                const auto d = controller.schedule(frame(i, uint32_t(i * 1500), true, decoded), decoded);
+                const uint64_t work = faultKind == 3 && fault ? 13000 : 1000;
+                const auto ready = decoded + work;
+                const auto submitted = std::max(d.targetUs, ready) +
+                    (faultKind == 2 && fault ? 5000 : 0);
+                controller.notePreparationDuration(work);
+                controller.noteSubmission(true, false, submitted);
+                Vrr13::PresentationObservation o;
+                o.smoothness = controller.smoothnessSample(d);
+                o.submitted = o.idValid = o.sampleValid = true;
+                o.id = o.sampleId = uint64_t(i + 1);
+                o.submission = submitted; o.ready = ready;
+                o.sampleTime = submitted + 2000 + (faultKind == 0 && fault ? 5000 : 0);
+                o.observed = o.sampleTime;
+                o.deadline = d.originalScanoutUs; o.latched = d.latchedPresentation;
+                controller.notePresentation(o);
+                if (i >= 2000) {
+                    const auto error = int64_t(o.sampleTime - previousActual) -
+                                       int64_t(d.originalTargetUs - previousIntended);
+                    badPairs += error >= 3000 || error <= -3000;
+                }
+                previousActual = o.sampleTime; previousIntended = d.originalTargetUs;
+                finalDelay = d.playoutDelayUs;
+                misses = d.nativeSmoothnessMisses;
+                expect(d.playoutDelayUs <= cap, "applied padding must respect its time cap");
+            }
+            if (faultKind == 0 || faultKind == 2) {
+                expect(finalDelay == policy.playoutDelayMinimumUs,
+                       "post-ready jitter must not ratchet padding or block its release");
+                expect(badPairs > 100 && misses > 100,
+                       "post-ready jitter must remain visible in measured cadence");
+            }
+            else if (cap == 16000) {
+                expect(finalDelay >= 12000 && finalDelay < cap && badPairs == 0,
+                       "arrival or preparation jitter must learn enough padding without subtracting future recovery time");
+            }
+            else {
+                expect(finalDelay == cap && badPairs > 100,
+                       "insufficient padding must respect the cap and retain evidence of misses");
+            }
+        }
+    }
+}
+
+void testDelayedWaylandAndDxgiFeedbackAgree()
+{
+    const auto session = config(60, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    VrrTimingController linuxController(session, true, policy);
+    VrrTimingController windowsController(session, true, policy);
+    std::array<Vrr13::PresentationObservation, 3> delayed{};
+    uint64_t beforeHitch = 0, maximumAfterHitch = 0;
+    for (uint64_t i = 1; i < 700; ++i) {
+        const uint64_t source = decodedTimeForRtp(1000000, uint32_t(i * 1500));
+        const auto linuxDecision = linuxController.schedule(frame(i, uint32_t(i * 1500), true, source), source);
+        const auto windowsDecision = windowsController.schedule(frame(i, uint32_t(i * 1500), true, source), source);
+        expect(linuxDecision.playoutDelayUs == windowsDecision.playoutDelayUs &&
+               linuxDecision.nativeSmoothnessSamples == windowsDecision.nativeSmoothnessSamples,
+               "delayed Wayland timestamps and matched DXGI refresh timestamps must drive the same padding");
+        linuxController.notePreparationDuration(1000);
+        windowsController.notePreparationDuration(1000);
+        linuxController.noteSubmission(true, false, linuxDecision.targetUs);
+        windowsController.noteSubmission(true, false, windowsDecision.targetUs);
+        Vrr13::PresentationObservation current;
+        current.smoothness = linuxController.smoothnessSample(linuxDecision);
+        current.submitted = current.idValid = true;
+        current.id = i;
+        current.submission = linuxDecision.targetUs;
+        current.ready = source + 1000;
+        current.deadline = linuxDecision.originalScanoutUs;
+        current.observed = linuxDecision.targetUs + 100;
+        current.uncertainty = 10;
+        // Real feedback arrives three submissions later, with IDs belonging to
+        // that older image, not to the frame currently being submitted.
+        const auto older = delayed[i % delayed.size()];
+        if (older.id) {
+            current.sampleValid = true;
+            current.sampleId = older.id;
+            current.sampleTime = older.submission + 2000 + (older.id == 300 ? 6000 : 0);
+            current.presentRefresh = current.syncRefresh = older.id;
+        }
+        delayed[i % delayed.size()] = current;
+        linuxController.notePresentation(current);
+        current.dxgi = true;
+        windowsController.notePresentation(current);
+        if (i == 299) beforeHitch = linuxDecision.playoutDelayUs;
+        if (i > 303) maximumAfterHitch = std::max(maximumAfterHitch, linuxDecision.playoutDelayUs);
+    }
+    expect(maximumAfterHitch > beforeHitch,
+           "delayed compositor feedback must actually enable native-hitch buffer growth");
+}
+
+void testDxgiFeedbackPolicyAndSelectedModeLead()
+{
+    const auto session = config(100, 144);
+    auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutPreserveDxgiFeedback == 1 &&
+               VrrTimingParameters{}.playoutPreserveDxgiFeedback == 0 &&
+               legacyPlayoutParameters(session).playoutPreserveDxgiFeedback == 0,
+           "production must opt into preserved DXGI feedback while absent fields and legacy fixtures retain historical behavior");
+    // Hold padding constant so mode-specific native service is the only
+    // changing prediction. Native observations deliberately exercise the
+    // feedback contract independently of the earlier requested latch mode.
+    policy.playoutDelayMinimumUs = policy.playoutDelayMaximumUs;
+    VrrTimingController controller(session, true, policy);
+    Vrr13::PresentationObservation previous;
+    for (uint64_t i = 1; i <= 5; ++i) {
+        const uint64_t source = 1000000 + (i - 1) * 10000;
+        const auto decision = controller.schedule(
+            frame(int(i), uint32_t((i - 1) * 900), true, source),
+            std::max(source, previous.observed));
+        if (i == 5) {
+            expect(!decision.latchedPresentation && decision.compositorLeadUs == 600,
+                   "the first adaptive decision after latched native submissions must use the adaptive lead, not the last submitted mode's lead");
+        }
+        controller.noteSubmission(true, false, decision.targetUs);
+        Vrr13::PresentationObservation current;
+        current.submitted = current.idValid = current.dxgi = true;
+        current.id = i;
+        current.submission = current.ready = decision.targetUs;
+        current.deadline = decision.targetUs;
+        current.observed = decision.targetUs + 100;
+        current.latched = i == 3 || i == 4;
+        if (previous.id) {
+            current.sampleValid = true;
+            current.sampleId = previous.id;
+            current.sampleTime = previous.submission + (previous.latched ? 4000 : 600);
+            current.presentRefresh = current.syncRefresh = previous.id;
+        }
+        controller.notePresentation(current);
+        previous = current;
+    }
+}
+
+void testDelayedDxgiSmoothnessUsesPresentedModeEpoch()
+{
+    for (uint64_t preserve : {0ULL, 1ULL}) {
+        const auto session = config(100, 144);
+        auto policy = vrrTimingParametersForSession(session);
+        policy.playoutPreserveDxgiFeedback = preserve;
+        policy.playoutDelayMinimumUs = policy.playoutDelayMaximumUs;
+        VrrTimingController controller(session, true, policy);
+        Vrr13::PresentationObservation previous;
+        for (uint64_t i = 1; i <= 6; ++i) {
+            const uint64_t source = 1000000 + (i - 1) * 10000;
+            const auto decision = controller.schedule(
+                frame(int(i), uint32_t((i - 1) * 900), true, source),
+                std::max(source, previous.observed));
+            if (i == 6) {
+                expect(decision.nativeSmoothnessSamples == (preserve ? 2 : 1) &&
+                           decision.nativeSmoothnessMisses == 0,
+                       "delayed same-mode pairs must survive newer mode changes without learning a false hitch across the native mode boundary; legacy replay must retain its lost pair");
+                break;
+            }
+            controller.noteSubmission(true, false, decision.targetUs);
+            Vrr13::PresentationObservation current;
+            current.smoothness = {i, 0, source, 6000, 0, 0, true};
+            current.submitted = current.idValid = current.dxgi = true;
+            current.id = i;
+            current.submission = current.ready = decision.targetUs;
+            current.deadline = decision.targetUs;
+            current.observed = decision.targetUs + 100;
+            current.latched = i <= 2;
+            if (previous.id) {
+                current.sampleValid = true;
+                current.sampleId = previous.id;
+                // Each mode has smooth 10 ms intervals. The 5 ms service
+                // change between them must not be learned as buffer demand.
+                current.sampleTime = previous.submission + (previous.latched ? 1000 : 6000);
+                current.presentRefresh = current.syncRefresh = previous.id;
+            }
+            controller.notePresentation(current);
+            previous = current;
+        }
+    }
+}
+
+void testNativeHitchGatesPadding()
+{
+    for (uint64_t error : {2999ULL, 3000ULL, 3001ULL}) {
+        Vrr13::SmoothnessFeedback feedback;
+        feedback.observe({1, 1000000, 1000000, 6000, 0, 0, true}, 1000000, true);
+        const auto demand = feedback.observe(
+            {2, 1016667 + error, 1016667, 6000, 0, 0, true}, 1025000, true);
+        expect((demand != 0) == (error > 3000),
+               "native growth must require strictly more than 3 ms of client-added interval error");
+    }
+    Vrr13::SmoothnessFeedback gameCadence;
+    uint64_t intended = 1000000;
+    for (uint64_t i = 1; i < 100; ++i) {
+        intended += i % 2 ? 8333 : 16667;
+        expect(gameCadence.observe({i, intended + 10000, intended, 6000, 0, 0, true},
+                                   intended + 10000, true) == 0,
+               "game cadence changes and constant latency must not count as client hitches");
+    }
+    Vrr13::SmoothnessFeedback uncertain;
+    uncertain.observe({1, 1000000, 1000000, 6000, 0, 100, true}, 1000000, true);
+    expect(uncertain.observe({2, 1019867, 1016667, 6000, 0, 100, true}, 1020000, true) == 0 &&
+           uncertain.samples() == 0,
+           "a native error whose uncertainty reaches 3 ms cannot confirm a hitch");
+    const auto session = config(60, 120);
+    const auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutNativeHitchAdaptation == 1,
+           "production must require confirmed native hitches for buffer growth");
+    for (int scenario : {0, 1, 2, 3}) {
+        VrrTimingController controller(session, true, policy);
+        uint64_t initial = 0, beforeHitch = 0, maximumAfterHitch = 0, finalDelay = 0;
+        for (int i = 0; i < 1500; ++i) {
+            const uint64_t source = decodedTimeForRtp(1000000, uint32_t(i * 1500));
+            const uint64_t decoded = source + (scenario == 1 && i % 10 == 9 ? 12000 :
+                                               scenario == 3 && i % 10 == 9 ? 2000 : 0);
+            const auto d = controller.schedule(frame(i, uint32_t(i * 1500), true, decoded), decoded);
+            if (!i) initial = d.playoutDelayUs;
+            if (i == 299) beforeHitch = d.playoutDelayUs;
+            controller.notePreparationDuration(scenario == 1 && i % 10 == 9 ? 12000 : 1000);
+            // CPU submission jitter alone is not proof of displayed jitter.
+            const auto submitted = d.targetUs + (scenario == 0 && i % 10 == 9 ? 5000 : 0);
+            controller.noteSubmission(true, false, submitted);
+            if (scenario >= 2) {
+                Vrr13::PresentationObservation o;
+                o.smoothness = controller.smoothnessSample(d);
+                o.submitted = o.idValid = o.sampleValid = true;
+                o.id = o.sampleId = uint64_t(i + 1);
+                o.submission = submitted; o.ready = decoded + 1000;
+                o.sampleTime = submitted + 2000 + (scenario == 2 && i == 300 ? 6000 : 0);
+                o.observed = o.sampleTime; o.deadline = d.originalScanoutUs;
+                o.latched = d.latchedPresentation;
+                controller.notePresentation(o);
+            }
+            if (scenario < 2 || scenario == 3)
+                expect(d.playoutDelayUs <= initial,
+                       "readiness estimates and CPU jitter cannot authorize buffer growth");
+            if (i > 300) maximumAfterHitch = std::max(maximumAfterHitch, d.playoutDelayUs);
+            finalDelay = d.playoutDelayUs;
+        }
+        if (scenario < 2)
+            expect(finalDelay == initial, "missing native evidence must not authorize growth or release");
+        if (scenario == 2)
+            expect(maximumAfterHitch > beforeHitch + 2000,
+                   "a confirmed native interval hitch must authorize bounded buffer growth");
+        if (scenario == 3)
+            expect(finalDelay >= 5000 && finalDelay < initial,
+                   "smooth native presentation may release padding but must retain 3 ms above readiness demand");
+    }
+    Vrr13::Reserve previous(16);
+    for (int i = 0; i < 300; ++i)
+        previous.observe(15000000, 16000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
+    VrrTimingController controller(session, true, policy);
+    expect(!controller.loadPlayoutHistory(previous.profile()),
+           "a readiness-only calibration must not authorize startup buffer growth");
+    const auto initialProfile = controller.playoutHistory().profile();
+    expect(controller.loadPlayoutHistory(initialProfile),
+           "current trace initialization must accept its own versioned profile for exact replay");
+}
+
+void testProductionPreservesRelativeGameSpacing()
+{
+    const auto session = config(120, 120);
+    auto policy = vrrTimingParametersForSession(session);
+    expect(policy.playoutDelayMaximumUs == 16000,
+           "production padding must retain the explicit 16 ms cap");
+    // Hold padding constant to isolate the spacing contract from adaptation.
+    policy.playoutDelayMinimumUs = policy.playoutDelayMaximumUs;
+    VrrTimingController zeroEpoch(session, true, policy);
+    VrrTimingController shiftedEpoch(session, true, policy);
+    uint32_t ticks = 0;
+    uint64_t previousTarget = 0, previousSource = 0;
+    const uint32_t intervals[] = {750, 1500, 1000, 1250};
+    for (int i = 0; i < 500; ++i) {
+        ticks += intervals[i % 4];
+        const uint64_t source = uint64_t(ticks) * 1000 / 90;
+        const uint64_t decoded = 1000000 + source;
+        const auto a = zeroEpoch.schedule(frame(i, ticks, true, decoded), decoded);
+        const auto b = shiftedEpoch.schedule(frame(i, ticks + 0xffff0000U, true, decoded), decoded);
+        expect(a.targetUs == b.targetUs && a.originalTargetUs == b.originalTargetUs,
+               "an arbitrary RTP epoch or wrap must not alter the client deadline");
+        if (i > 32) {
+            const auto error = int64_t(a.originalTargetUs - previousTarget) -
+                               int64_t(source - previousSource);
+            expect(std::abs(error) <= 1 && a.cadenceSmoothingUs == 0,
+                   "variable game intervals must survive unchanged through fixed playout padding");
+        }
+        previousTarget = a.originalTargetUs; previousSource = source;
+        for (auto* controller : {&zeroEpoch, &shiftedEpoch}) {
+            controller->notePreparationDuration(1000);
+            controller->noteSubmission(true, false, a.targetUs);
+        }
+    }
+}
 
 int main()
 {
+    testNativeHitchGatesPadding();
+    testDelayedWaylandAndDxgiFeedbackAgree();
+    testDxgiFeedbackPolicyAndSelectedModeLead();
+    testDelayedDxgiSmoothnessUsesPresentedModeEpoch();
+    testProductionPreservesRelativeGameSpacing();
+    testReadinessDrivenPadding();
+    testStableNativeSmoothnessReference();
+    testPreparationKeepsLearnedLead();
+    testSmoothnessFeedback();
+    testVrr14Prediction();
+    testProcessingEpisodeClassification();
+    testPerFrameLatchAtNativeMaximum();
+    testRollingPlayoutHistory();
+    testHistoryPreservesVrr13Scheduling();
+    testHistoryLearningAndQueueCapacity();
     testRtpWrapResetAndFallback();
     testTimingFormulaeAndReserveCap();
     testSourcePlayoutDelayOffsetsProjectedTargets();

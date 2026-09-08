@@ -10,8 +10,17 @@
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
+#include "overlaycompletion.h"
 
 #include <atomic>
+
+#ifdef Q_OS_LINUX
+#include "vulkantiming.h"
+#endif
+
+#ifdef HAS_WAYLAND
+#include "waylandfeedback/wayland.h"
+#endif
 
 #ifdef Q_OS_DARWIN
 class MetalVulkanTextureFactory {
@@ -40,6 +49,7 @@ private:
 
 class PlVkRenderer : public IFFmpegRenderer, public IVrrFramePresenter {
 public:
+    QString getCalibrationIdentity() override;
     PlVkRenderer(AVHWDeviceType hwDeviceType = AV_HWDEVICE_TYPE_NONE, IFFmpegRenderer *backendRenderer = nullptr);
     virtual ~PlVkRenderer() override;
     virtual bool initialize(PDECODER_PARAMETERS params) override;
@@ -150,6 +160,16 @@ private:
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
     bool m_VrrRenderTimingActive = false;
+    uint64_t m_PresentationId = 0;
+    bool m_LoggedPresentationFeedback = false;
+#ifdef Q_OS_LINUX
+    std::unique_ptr<VulkanTiming> m_GamescopeTiming;
+#endif
+#ifdef HAS_WAYLAND
+    std::unique_ptr<Vrr13::WaylandFeedback> m_PresentationFeedback;
+#endif
+
+    std::unique_ptr<OverlayCompletion> m_OverlayCompletion;
 
     // Overlay state
     SDL_SpinLock m_OverlayLock = 0;

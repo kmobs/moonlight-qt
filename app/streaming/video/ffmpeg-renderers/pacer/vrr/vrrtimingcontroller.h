@@ -1,6 +1,9 @@
 #pragma once
 
 #include "vrrtypes.h"
+#include "reserve.h"
+#include "workload.h"
+#include "prediction.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +18,15 @@
 // headroom thresholds; non-zero ratios remain available to replay captures
 // made with display-scaled protection.
 #define VRR_TIMING_PARAMETER_FIELDS(X) \
+    X(uint64_t, playout_preserve_dxgi_feedback, playoutPreserveDxgiFeedback, 0) \
+    X(uint64_t, playout_native_hitch_adaptation, playoutNativeHitchAdaptation, 0) \
+    X(uint64_t, playout_readiness_driven_adaptation, playoutReadinessDrivenAdaptation, 0) \
+    X(uint64_t, playout_stable_smoothness_reference, playoutStableSmoothnessReference, 0) \
+    X(uint64_t, render_start_preserve_learned_lead, renderStartPreserveLearnedLead, 0) \
+    X(uint64_t, playout_smoothness_feedback_enabled, playoutSmoothnessFeedbackEnabled, 0) \
+    X(uint64_t, playout_prediction_enabled, playoutPredictionEnabled, 0) \
+    X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
+    X(uint64_t, playout_history_enabled, playoutHistoryEnabled, 0) \
     X(uint64_t, maximum_forward_movement_us, maximumForwardMovementUs, 1000000) \
     X(uint64_t, render_lead_floor_us, renderLeadFloorUs, 1000) \
     X(uint64_t, render_lead_ceiling_us, renderLeadCeilingUs, 0) \
@@ -165,6 +177,19 @@ struct VrrTimingDiagnostics {
 // types; the worker translates platform observations into neutral timing
 // feedback.
 struct VrrTimingDecision {
+    uint64_t frameNumber = 0;
+    uint64_t smoothnessProtectionUs = 0;
+    uint64_t requestedPlayoutDelayUs = 0;
+    uint64_t submissionSmoothnessSamples = 0, submissionSmoothnessMisses = 0;
+    uint64_t nativeSmoothnessSamples = 0, nativeSmoothnessMisses = 0;
+    bool playoutCapacityLimited = false;
+    uint64_t originalScanoutUs = 0;
+    uint64_t predictedScanoutUs = 0;
+    uint64_t compositorLeadUs = 0;
+    uint64_t recoveryHeadroomUs = 0;
+    // The original smoothed slot, before readiness and display-floor clamps.
+    // Observation only: a late frame must never rewrite its own deadline.
+    uint64_t originalTargetUs = 0;
     uint64_t sourceTimeUs = 0;
     uint64_t sourceIntervalUs = 0;
     uint64_t sourcePeriodUs = 0;
@@ -222,7 +247,8 @@ public:
 
     // Samples affect subsequent frames only. The current presentation target
     // never moves after rendering has begun.
-    void notePreparationDuration(uint64_t preparationDurationUs);
+    void notePreparationDuration(uint64_t preparationDurationUs,
+                                 uint64_t acquisitionWaitUs = 0);
     void noteSchedulerDelays(uint64_t renderDelayUs,
                              uint64_t targetDelayUs,
                              bool targetDelayValid);
@@ -236,6 +262,10 @@ public:
     // lifecycle result. The timing controller has no renderer/native types.
     void noteSubmission(bool submitted, bool cancelled,
                         uint64_t submissionUs);
+    void notePresentation(const Vrr13::PresentationObservation& observation);
+    Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision) const;
+    uint64_t typicalRenderUs() const;
+    uint64_t recoveryHeadroomUs() const;
 
     uint64_t timingBudgetUs() const;
     int64_t readinessBudgetUs() const;
@@ -260,9 +290,17 @@ public:
     uint64_t playoutBandSamples() const;
     const VrrTimingParameters& parameters() const;
     VrrTimingDiagnostics diagnostics() const;
+    const Vrr13::Reserve& playoutHistory() const { return m_PlayoutHistory; }
+    bool loadPlayoutHistory(const std::vector<int64_t>& profile) {
+        return !m_HaveTimeline && m_PlayoutHistory.loadProfile(profile);
+    }
+    uint64_t playoutQueueLimitUs() const;
 
 private:
     struct PendingFrame {
+        Vrr13::SmoothnessFeedback::Sample smoothness;
+        Vrr13::ReadinessPrediction::Probe prediction;
+        uint64_t renderSchedulerUs = 0;
         bool valid = false;
         bool cadenceEligible = false;
         bool hasPreparationDuration = false;
@@ -342,6 +380,9 @@ private:
     uint64_t playoutDelayStartUs() const;
     uint64_t playoutDelayMinimumUs() const;
     uint64_t playoutDelayMaximumUs() const;
+    void updatePlayoutHistory(const PacedFrame& frame,
+                              const CadenceObservation& cadence,
+                              bool rebased, int64_t requiredUs);
     static uint64_t scaledPerMille(uint64_t value, uint64_t perMille);
 
     void clearTimeline(bool retainLearnedBudgets);
@@ -359,6 +400,7 @@ private:
     bool acceptSourcePeriodQ16(uint64_t periodUsQ16);
     void anchorSourceTime(uint64_t sourceTimeUs);
     void updateLearnedBudgets();
+    void updateCadenceLatch(bool cadenceUnstable);
     void updateReadinessModel();
     void applyReadinessBudget(bool acquireReserve,
                               bool immediateAcquisition = false);
@@ -436,6 +478,14 @@ private:
     uint64_t m_PlayoutSamplesSeen = 0;
     bool m_TimestampPlayoutActive = false;
     std::map<unsigned int, PlayoutBand> m_PlayoutBands;
+    Vrr13::Reserve m_PlayoutHistory;
+    Vrr13::WorkloadEpisode m_WorkloadEpisode;
+    Vrr13::ReadinessPrediction m_ReadinessPrediction;
+    Vrr13::PresentationPrediction m_PresentationPrediction;
+    Vrr13::SmoothnessFeedback m_SubmissionSmoothness, m_NativeSmoothness;
+    uint64_t m_RequestedPlayoutDelayUs = 0;
+    bool m_FeedbackModeValid = false, m_FeedbackLatched = false;
+    uint64_t m_LastHistoryArrivalUs = 0;
     unsigned int m_PlayoutBandIndex = 0;
     bool m_PlayoutBandValid = false;
     uint64_t m_AppliedPlayoutDelayUs = 0;

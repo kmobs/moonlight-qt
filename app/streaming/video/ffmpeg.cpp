@@ -572,9 +572,11 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                  params->enableVsync,
                                  params->enableVrr,
                                  params->vrrDisplayRefreshHz,
-                                 params->enableVrrGapFill,
-                                 params->vrrGapFillMinimumHz,
-                                 params->smoothVrrFrameTiming)) {
+                                 params->smoothVrrFrameTiming,
+                                 m_FrontendRenderer->getCalibrationIdentity().isEmpty() ? QString() :
+                                 Session::get()->vrrCalibrationContext() + QString("|%1|%2|%3|%4|%5")
+                                     .arg(params->width).arg(params->height).arg(params->videoFormat)
+                                     .arg(m_FrontendRenderer->getCalibrationIdentity()).arg(decoder->name))) {
             return false;
         }
     }
@@ -843,8 +845,15 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalFrames += src.totalFrames;
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
+    // Keep the latest 30-interval snapshot instead of widening its window when
+    // merging the one-second overlay windows or whole-session log statistics.
+    // A newer unavailable snapshot must also replace older valid evidence.
+    if (src.incomingTimingSequence > dst.incomingTimingSequence) {
+        dst.incomingTimingSequence = src.incomingTimingSequence;
+        dst.incomingTimingVarianceTicksSquared = src.incomingTimingVarianceTicksSquared;
+        dst.incomingTimingValid = src.incomingTimingValid;
+    }
     dst.vrrPacingDroppedFrames += src.vrrPacingDroppedFrames;
-    dst.vrrGapFillFrames += src.vrrGapFillFrames;
     dst.vrrEligibleFrames += src.vrrEligibleFrames;
     dst.vrrPrepareLateFrames += src.vrrPrepareLateFrames;
     dst.vrrTargetWaitEntryLateFrames += src.vrrTargetWaitEntryLateFrames;
@@ -953,9 +962,6 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
     m_ActiveWndVideoStats.vrrPacingDroppedFrames +=
         delta(snapshot.vrrPacingDroppedFrames,
               m_LastPacerTelemetry.vrrPacingDroppedFrames);
-    m_ActiveWndVideoStats.vrrGapFillFrames +=
-        delta(snapshot.vrrGapFillFrames,
-              m_LastPacerTelemetry.vrrGapFillFrames);
     m_ActiveWndVideoStats.vrrEligibleFrames +=
         delta(snapshot.vrrEligibleFrames,
               m_LastPacerTelemetry.vrrEligibleFrames);
@@ -1191,6 +1197,22 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         offset += ret;
     }
 
+    if (stats.incomingTimingValid) {
+        const double smoothPercent = IncomingFrameTiming::smoothnessPercent(
+            stats.incomingTimingVarianceTicksSquared);
+        ret = snprintf(&output[offset], length - offset,
+                       "Incoming smoothness (host): %.2f%%\n", smoothPercent);
+    }
+    else {
+        ret = snprintf(&output[offset], length - offset,
+                       "Incoming smoothness (host): N/A\n");
+    }
+    if (ret < 0 || ret >= length - offset) {
+        SDL_assert(false);
+        return;
+    }
+    offset += ret;
+
     if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||
@@ -1210,12 +1232,10 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
             ret = snprintf(&output[offset],
                            length - offset,
-                           "VRR pacing: %s | Ready on time: %.1f%% | Dropped: %llu | Gap fills: %llu | Errors: %llu\n",
+                           "VRR pacing: %s | Client ready on time: %.1f%% | Dropped: %llu\n",
                            stats.vrrTelemetryActive ? "Active" : "Inactive",
                            readyOnTimePercent,
-                           static_cast<unsigned long long>(stats.vrrPacingDroppedFrames),
-                           static_cast<unsigned long long>(stats.vrrGapFillFrames),
-                           static_cast<unsigned long long>(stats.vrrPresentFailedFrames));
+                           static_cast<unsigned long long>(stats.vrrPacingDroppedFrames));
         }
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
@@ -2340,10 +2360,9 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             addVideoStats(m_LastWndVideoStats, lastTwoWndStats);
             addVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
 
-            stringifyVideoStats(lastTwoWndStats,
-                                Session::get()->getOverlayManager().getOverlayText(Overlay::OverlayDebug),
-                                Session::get()->getOverlayManager().getOverlayMaxTextLength());
-            Session::get()->getOverlayManager().setOverlayTextUpdated(Overlay::OverlayDebug);
+            char text[1024];
+            stringifyVideoStats(lastTwoWndStats, text, sizeof(text));
+            Session::get()->getOverlayManager().updateOverlayText(Overlay::OverlayDebug, text);
         }
 
         // Accumulate these values into the global stats
@@ -2354,6 +2373,14 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         SDL_zero(m_ActiveWndVideoStats);
         m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
     }
+
+    // Observe before decoding or pacing can shed a frame. The measurement owns
+    // its 30-interval window independently of the overlay's refresh interval.
+    const auto incoming = m_IncomingFrameTiming.observe(
+        static_cast<uint32_t>(du->frameNumber), du->rtpTimestamp);
+    m_ActiveWndVideoStats.incomingTimingSequence = incoming.sequence;
+    m_ActiveWndVideoStats.incomingTimingVarianceTicksSquared = incoming.varianceTicksSquared;
+    m_ActiveWndVideoStats.incomingTimingValid = incoming.valid;
 
     if (du->frameHostProcessingLatency != 0) {
         if (m_ActiveWndVideoStats.minHostProcessingLatency != 0) {

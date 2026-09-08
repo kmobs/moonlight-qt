@@ -15,11 +15,14 @@ typedef struct _VIDEO_STATS {
     uint32_t totalFrames;
     uint32_t networkDroppedFrames;
     uint32_t pacerDroppedFrames;
+    // Latest 30-frame-time source snapshot, independent of client delivery time.
+    uint64_t incomingTimingSequence;
+    double incomingTimingVarianceTicksSquared;
+    bool incomingTimingValid;
     // Pacer telemetry is merged into decoder-owned windows from coherent
     // cumulative snapshots. These remain zero on non-VRR pacing paths.
     bool vrrTelemetryActive;
     uint64_t vrrPacingDroppedFrames;
-    uint64_t vrrGapFillFrames;
     uint64_t vrrEligibleFrames;
     uint64_t vrrPrepareLateFrames;
     uint64_t vrrTargetWaitEntryLateFrames;
@@ -78,8 +81,6 @@ typedef struct _DECODER_PARAMETERS {
     // the session was not qualified for VRR; Pacer must not substitute a
     // legacy 60 Hz fallback when this path is requested.
     int vrrDisplayRefreshHz;
-    bool enableVrrGapFill;
-    int vrrGapFillMinimumHz;
     bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 

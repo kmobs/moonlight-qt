@@ -1,3 +1,5 @@
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profile.h"
+#include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profilecodec.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h"
 #include "vrrtestfakes.h"
 
@@ -119,6 +121,25 @@ void testCapabilityRejection()
     VrrPacingWorker unsupportedWorker(&backend, enabledConfig(), &telemetry);
     expect(!unsupportedWorker.start(),
            "worker must reject an unsupported VRR presentation backend");
+}
+
+void testEmptyQueueDoesNotRepeatFrames()
+{
+    resetFakeClock();
+    FakeVrrFramePresenter backend;
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime first;
+    TrackedFrameLifetime second;
+    VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+    expect(worker.start(), "worker must start for idle queue coverage");
+    worker.submit(frame(1, first));
+    expect(backend.waitForPresentCount(1), "first frame must present");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    expect(backend.presentCount() == 1,
+           "an empty queue must not generate repeated presentations");
+    worker.submit(frame(2, second));
+    expect(backend.waitForPresentCount(2),
+           "a new frame must wake the idle worker");
 }
 
 void testQueueCapacityAndDrops()
@@ -726,6 +747,10 @@ void testTraceCapturesEveryDeliveredFrame()
         WINDOW_STATE_CHANGE_INFO minimized {};
         minimized.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
         worker.notifyWindowChanged(&minimized);
+        // The fake publishes its present count before the worker writes the
+        // terminal trace. This fixture tests accounting, not intentional trace
+        // loss under producer/writer contention; let the preceding row drain.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         worker.submit(frame(6, lifetimes[5]));
 
         WINDOW_STATE_CHANGE_INFO restored {};
@@ -1258,8 +1283,16 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     PacerTelemetry telemetry;
     TrackedFrameLifetime first;
 
+    auto cachedConfig = enabledConfig();
+    cachedConfig.calibrationPath = traceDirectory.filePath("profile.json").toStdString();
+    cachedConfig.calibrationKey = "replay-test";
+    Vrr13::Reserve cachedHistory(17);
+    for (int i = 0; i < 256; ++i)
+        cachedHistory.observe(4000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
+    expect(Vrr13::saveProfile(QString::fromStdString(cachedConfig.calibrationPath),
+                             "replay-test", cachedHistory), "test calibration must save");
     {
-        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        VrrPacingWorker worker(&backend, cachedConfig, &telemetry);
         expect(worker.start(), "worker must start for deep diagnostics testing");
         worker.submit(frame(1, first));
         expect(backend.waitForPresentCount(1),
@@ -1278,6 +1311,18 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QByteArray row = lines.value(1);
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
+    expect(columns.contains("presentation_uncertainty_us") &&
+           fields.value(columns.indexOf("presentation_uncertainty_us")) == "0",
+           "trace must preserve non-DXGI clock uncertainty, defaulting to zero for legacy presenters");
+    std::vector<int64_t> profile;
+    expect(columns.contains("original_target_us") &&
+           decodeVrrPlayoutProfile(fields.value(columns.indexOf("playout_initial_profile")), profile),
+           "capture must carry its original deadline and complete starting calibration");
+    Vrr13::Reserve restored(17);
+    expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
+           "captured calibration must restore prior history without inventing fresh successes");
+    expect(fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "1",
+           "capture must identify the native-hitch policy for exact replay");
     expect(header.contains("frame_receive_us") &&
                header.contains("frame_reassembled_us") &&
                header.contains("decode_submit_us") &&
@@ -1374,6 +1419,39 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
 }
 
+void exportWarmHistoryReplayFixture()
+{
+    const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_WARM_TRACE");
+    if (!exportPath || !exportPath[0]) return;
+    resetFakeClock();
+    SDL_setenv("MOONLIGHT_VRR_TRACE", exportPath, 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "1", 1);
+    FakeVrrFramePresenter backend;
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime[180];
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "warm-history replay worker must start");
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 180; ++i) {
+            std::this_thread::sleep_until(start + std::chrono::microseconds(int64_t(i) * 16667));
+            if (i == 120) {
+                expect(backend.waitForPresentCount(120), "feedback fixture must drain before its controlled stall");
+                backend.blockPreparation();
+            }
+            worker.submit(frame(i + 1, lifetime[i]));
+            if (i == 120) {
+                expect(backend.waitForPrepareCount(121), "feedback fixture must enter preparation before its controlled stall");
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                backend.releasePreparation();
+            }
+        }
+        expect(backend.waitForPresentCount(180), "warm-history replay must drain every submitted frame");
+    }
+    SDL_setenv("MOONLIGHT_VRR_TRACE", "", 1);
+    SDL_setenv("MOONLIGHT_VRR_DEEP_TRACE", "0", 1);
+}
+
 } // namespace
 
 // VrrPacingWorker uses the common monotonic clock. The isolated test owns an
@@ -1394,6 +1472,7 @@ int main()
     }
 
     testCapabilityRejection();
+    testEmptyQueueDoesNotRepeatFrames();
     testQueueCapacityAndDrops();
     testLatePreparedFramePresentsImmediately();
     testQueuedStaleFrameYieldsToFreshSuccessor();
@@ -1415,6 +1494,7 @@ int main()
     testFailedCancellationNativeEvidenceIsTraced();
     testDeepTraceRequestsNativeObservationsWithoutChangingMode();
 
+    exportWarmHistoryReplayFixture();
     SDL_Quit();
     return failures == 0 ? 0 : 1;
 }
