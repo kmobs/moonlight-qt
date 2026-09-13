@@ -300,10 +300,9 @@ class IVrrFramePresenter {
 public:
     virtual ~IVrrFramePresenter() = default;
 
-    // Some backends select native protection per present; persistent Vulkan
-    // Mailbox already provides it. Vulkan Immediate/FIFO return false and keep
-    // the controller's software floor. A latch request must never recreate the
-    // swapchain or replace an acquired image to change presentation mode.
+    // Some adaptive backends can select a fixed-vsync latch for an individual
+    // present. A Vulkan backend may instead recreate its swapchain before
+    // preparation; it must not replace an already acquired image to do so.
     virtual bool canLatchAdaptivePresent() const
     {
         return false;

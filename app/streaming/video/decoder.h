@@ -91,7 +91,6 @@ typedef struct _DECODER_PARAMETERS {
     // VRR is an opt-in, session-snapshotted third pacing mode.
     bool enableVrr;
     int vrrLatencyMode = 0;
-    bool allowVrrTearing = true;
     bool gamescopeMailbox = false;
     bool gamescopeRepaint = false;
     bool smoothVrrFrameTiming;

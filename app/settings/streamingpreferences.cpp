@@ -24,7 +24,6 @@
 #define SER_FULLSCREEN "fullscreen"
 #define SER_VSYNC "vsync"
 #define SER_ENABLEVRR "enablevrr"
-#define SER_ALLOWVRRTEARING "allowvrrtearing"
 #define SER_VRRLATENCYFIX "vrrlatencyfix"
 #define SER_VRRLATENCYMODE "vrrlatencymode"
 #define SER_SMOOTHVRRFRAMETIMING "smoothvrrframetiming"
@@ -140,7 +139,6 @@ void StreamingPreferences::reload()
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
-    allowVrrTearing = settings.value(SER_ALLOWVRRTEARING, true).toBool();
     vrrLatencyMode = VLM_BALANCED;
     if (settings.contains(SER_VRRLATENCYMODE)) {
         bool validMode = false;
@@ -355,7 +353,6 @@ void StreamingPreferences::save()
     settings.setValue(SER_AUTOADJUSTBITRATE, autoAdjustBitrate);
     settings.setValue(SER_VSYNC, enableVsync);
     settings.setValue(SER_ENABLEVRR, enableVrr);
-    settings.setValue(SER_ALLOWVRRTEARING, allowVrrTearing);
     settings.setValue(SER_VRRLATENCYMODE, vrrLatencyMode);
     settings.remove("vrrlatencyoscillation");
     settings.remove("gamescopemailbox"); // Retired Mailbox A/B experiment.

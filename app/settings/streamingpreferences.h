@@ -137,7 +137,6 @@ public:
     Q_PROPERTY(bool autoAdjustBitrate MEMBER autoAdjustBitrate NOTIFY autoAdjustBitrateChanged)
     Q_PROPERTY(bool enableVsync MEMBER enableVsync NOTIFY enableVsyncChanged)
     Q_PROPERTY(bool enableVrr MEMBER enableVrr NOTIFY enableVrrChanged)
-    Q_PROPERTY(bool allowVrrTearing MEMBER allowVrrTearing NOTIFY allowVrrTearingChanged)
     Q_PROPERTY(int vrrLatencyMode MEMBER vrrLatencyMode NOTIFY vrrLatencyModeChanged)
     Q_PROPERTY(bool smoothVrrFrameTiming MEMBER smoothVrrFrameTiming NOTIFY smoothVrrFrameTimingChanged)
     Q_PROPERTY(bool gameOptimizations MEMBER gameOptimizations NOTIFY gameOptimizationsChanged)
@@ -187,7 +186,6 @@ public:
     bool autoAdjustBitrate;
     bool enableVsync;
     bool enableVrr;
-    bool allowVrrTearing;
     int vrrLatencyMode;
     // Re-present the last frame inside a host gap longer than the panel's
     // adaptive-refresh floor, so the panel never engages its own
@@ -233,7 +231,6 @@ signals:
     void autoAdjustBitrateChanged();
     void enableVsyncChanged();
     void enableVrrChanged();
-    void allowVrrTearingChanged();
     void vrrLatencyModeChanged();
     void smoothVrrFrameTimingChanged();
     void gameOptimizationsChanged();

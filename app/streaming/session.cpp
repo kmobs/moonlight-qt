@@ -285,8 +285,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
                             bool enableVrr, int vrrDisplayRefreshHz,
                             [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
-                            bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint,
-                            bool allowVrrTearing)
+                            bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint)
 {
     DECODER_PARAMETERS params = {};
 
@@ -305,7 +304,6 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.enableFramePacing = enableFramePacing;
     params.enableVrr = enableVrr;
     params.vrrLatencyMode = vrrLatencyMode;
-    params.allowVrrTearing = allowVrrTearing;
     params.gamescopeMailbox = gamescopeMailbox;
     params.gamescopeRepaint = gamescopeRepaint;
     params.smoothVrrFrameTiming = smoothVrrFrameTiming;
@@ -660,7 +658,6 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
     m_PresentationSettings.vrrLatencyMode = m_Preferences->vrrLatencyMode;
-    m_PresentationSettings.allowVrrTearing = m_Preferences->allowVrrTearing;
     m_PresentationSettings.gamescopeRepaint = false; // Retired repaint experiment.
     m_PresentationSettings.gamescopeMailbox = false; // Retired Mailbox experiment.
     m_PresentationSettings.smoothVrrFrameTiming = m_Preferences->smoothVrrFrameTiming;
@@ -2409,8 +2406,7 @@ void Session::exec()
                                m_PresentationSettings.smoothVrrFrameTiming,
                                m_PresentationSettings.gamescopeMailbox,
                                m_PresentationSettings.vrrLatencyMode,
-                               m_PresentationSettings.gamescopeRepaint,
-                               m_PresentationSettings.allowVrrTearing)) {
+                               m_PresentationSettings.gamescopeRepaint)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");

@@ -894,26 +894,22 @@ void PlVkRenderer::selectPresentationMode(PDECODER_PARAMETERS params)
     const auto mode = selectPlVkVrrPresentMode(surface, gamescopeWsi, params->gamescopeMailbox,
         [this](VkPresentModeKHR candidate) {
             return isPresentModeSupportedByPhysicalDevice(m_Vulkan->phys_device, candidate);
-        }, params->allowVrrTearing);
+        });
     if (mode) {
         m_VkPresentMode = *mode;
         m_VrrFallbackReason = VrrFallbackReason::NoFallback;
         if (surface == PlVkVrrSurface::Gamescope) {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Gamescope VRR selected %s application presentation (WSI requested: %s; Mailbox experiment: %s; allow tearing: %s); "
+                        "Gamescope VRR selected %s application presentation (WSI requested: %s; Mailbox experiment: %s); "
                         "display timing remains compositor-controlled",
                         vulkanPresentModeName(*mode), gamescopeWsi ? "yes" : "no",
-                        params->gamescopeMailbox ? "on" : "off", params->allowVrrTearing ? "on" : "off");
+                        params->gamescopeMailbox ? "on" : "off");
         }
         return;
     }
 
     // A FIFO fallback is deliberately not passed to the VRR worker: it would
     // move presentation timing downstream of the worker's target wait.
-    if (!params->allowVrrTearing) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Vulkan VRR without tearing has no qualified Mailbox mode; selecting fixed FIFO pacing");
-    }
     m_VkPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
 #endif
@@ -2086,11 +2082,8 @@ QString PlVkRenderer::getCalibrationIdentity()
     if (!m_Vulkan) return {};
     VkPhysicalDeviceProperties properties{};
     fn_vkGetPhysicalDeviceProperties(m_Vulkan->phys_device, &properties);
-    // Persistent presentation mode changes acquisition/native service, so
-    // Immediate and nontearing Mailbox must not seed each other's readiness.
-    return QString("Vulkan|%1|%2|%3|%4|present-mode=%5")
+    return QString("Vulkan|%1|%2|%3|%4")
         .arg(properties.vendorID).arg(properties.deviceID).arg(properties.driverVersion)
         .arg(QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(properties.pipelineCacheUUID),
-                                          VK_UUID_SIZE).toHex()))
-        .arg(static_cast<int>(m_VkPresentMode));
+                                          VK_UUID_SIZE).toHex()));
 }
