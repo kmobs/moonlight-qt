@@ -129,7 +129,11 @@ three-plane R8/R16 surfaces. The software-planar-format `AVFrame` holds a
 `PyroWaveFrameRef` with the surface and decode fence value; two shared D3D11
 fences carry decode completion and renderer release. `renderPyroWaveVideo()`
 queues `Wait()` on the decode fence, draws the planes and signals the release
-fence. `decoderOutputUs` is decode submission time, while VRR `waitForDecode()`
+fence. Windows capability validation now matches that actual client path: the
+adapter-matched Vulkan device must import D3D11 shared textures for the plane
+images and D3D12 fences for synchronization, but it is not rejected for unused
+Win32 external-memory handle types such as KMT or D3D12-resource image imports.
+`decoderOutputUs` is decode submission time, while VRR `waitForDecode()`
 observes completion. `captureDecodeBoundary()` stays 0 (single device).
 
 On Linux x86-64 with libplacebo, `initializePyroWave()` uses `PlVkRenderer`,

@@ -206,6 +206,13 @@ pyrowave_device_set_frame_contexts(pyrowave_device device, unsigned count);
 PYROWAVE_PUBLIC_API bool
 pyrowave_device_confirm_interop_support(pyrowave_device device);
 
+// Checks the Windows client decode path Moonlight uses: D3D11 shared-texture
+// plane import plus D3D12 fence timeline import. This is narrower than the
+// generic interop probe above, which may validate additional handle types for
+// other callers and tests.
+PYROWAVE_PUBLIC_API bool
+pyrowave_device_confirm_d3d11_interop_support(pyrowave_device device);
+
 // All encoders and decoders must have been destroyed before destroying the device.
 PYROWAVE_PUBLIC_API void pyrowave_device_destroy(pyrowave_device device);
 ////

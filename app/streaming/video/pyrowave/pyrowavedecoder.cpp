@@ -344,7 +344,7 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
         return false;
     }
 
-    if (!pyrowave_device_confirm_interop_support(impl->device)) {
+    if (!pyrowave_device_confirm_d3d11_interop_support(impl->device)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "PyroWave: the Vulkan driver cannot import D3D11 textures and fences");
         return false;

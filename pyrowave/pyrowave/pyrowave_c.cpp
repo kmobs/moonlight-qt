@@ -335,7 +335,10 @@ static bool pyrowave_device_confirm_external_semaphore_support(pyrowave_device d
 	return true;
 }
 
-static bool pyrowave_device_confirm_external_memory_support(pyrowave_device device)
+static bool pyrowave_device_confirm_external_memory_support_for_types(
+	pyrowave_device device,
+	const VkExternalMemoryHandleTypeFlagBits *required_external_types,
+	size_t required_external_type_count)
 {
 	VkExternalImageFormatProperties external_props = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
 	VkImageFormatProperties2 props2 = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &external_props };
@@ -348,24 +351,12 @@ static bool pyrowave_device_confirm_external_memory_support(pyrowave_device devi
 		return false;
 #endif
 
-	static const VkExternalMemoryHandleTypeFlagBits required_external_types[] = {
-#ifdef _WIN32
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT,
-#else
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-#endif
-	};
-
 	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info =
 		{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT };
 
-	for (auto type : required_external_types)
+	for (size_t i = 0; i < required_external_type_count; i++)
 	{
+		auto type = required_external_types[i];
 		external_format_info.handleType = type;
 		external_format_info.pNext = nullptr;
 
@@ -401,6 +392,27 @@ static bool pyrowave_device_confirm_external_memory_support(pyrowave_device devi
 	return true;
 }
 
+static bool pyrowave_device_confirm_external_memory_support(pyrowave_device device)
+{
+	static const VkExternalMemoryHandleTypeFlagBits generic_required_external_types[] = {
+#ifdef _WIN32
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT,
+#else
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+#endif
+	};
+
+	return pyrowave_device_confirm_external_memory_support_for_types(
+		device,
+		generic_required_external_types,
+		size_t(std::size(generic_required_external_types)));
+}
+
 bool pyrowave_device_confirm_interop_support(pyrowave_device device)
 {
 	Util::set_thread_logging_interface(&null_logger);
@@ -412,6 +424,30 @@ bool pyrowave_device_confirm_interop_support(pyrowave_device device)
 		return false;
 
 	return true;
+}
+
+bool pyrowave_device_confirm_d3d11_interop_support(pyrowave_device device)
+{
+#ifdef _WIN32
+	static const VkExternalMemoryHandleTypeFlagBits moonlight_d3d11_required_external_types[] = {
+		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+	};
+
+	Util::set_thread_logging_interface(&null_logger);
+	if (!device->device.get_device_features().supports_external)
+		return false;
+	if (!pyrowave_device_confirm_external_semaphore_support(device))
+		return false;
+	if (!pyrowave_device_confirm_external_memory_support_for_types(
+			device,
+			moonlight_d3d11_required_external_types,
+			size_t(std::size(moonlight_d3d11_required_external_types))))
+		return false;
+
+	return true;
+#else
+	return pyrowave_device_confirm_interop_support(device);
+#endif
 }
 
 pyrowave_result

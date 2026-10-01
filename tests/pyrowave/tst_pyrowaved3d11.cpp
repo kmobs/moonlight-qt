@@ -179,6 +179,21 @@ void runCase(int width, int height, bool chroma444, bool tenBit)
         expect(false, name + ": D3D11 device");
         return;
     }
+
+    pyrowave_device decodeDevice = nullptr;
+    const pyrowave_result compatResult = pyrowave_create_device_by_compat(
+        0, 0, nullptr, nullptr,
+        reinterpret_cast<const pyrowave_luid*>(&adapterDesc.AdapterLuid),
+        &decodeDevice);
+    expect(compatResult == PYROWAVE_SUCCESS && decodeDevice != nullptr,
+           name + ": Vulkan device for adapter");
+    if (decodeDevice == nullptr) {
+        return;
+    }
+    expect(pyrowave_device_confirm_d3d11_interop_support(decodeDevice),
+           name + ": D3D11 interop probe");
+    pyrowave_device_destroy(decodeDevice);
+
     ComPtr<ID3D11Device5> device5;
     ComPtr<ID3D11DeviceContext4> context4;
     device.As(&device5);

@@ -245,7 +245,7 @@ struct Renderer {
                 0, 0, nullptr, nullptr,
                 reinterpret_cast<const pyrowave_luid*>(&description.AdapterLuid),
                 &decodeDevice) == PYROWAVE_SUCCESS;
-            const bool interop = compatible && pyrowave_device_confirm_interop_support(decodeDevice);
+            const bool interop = compatible && pyrowave_device_confirm_d3d11_interop_support(decodeDevice);
             if (decodeDevice) pyrowave_device_destroy(decodeDevice);
             if (!interop) {
                 device.Reset();
