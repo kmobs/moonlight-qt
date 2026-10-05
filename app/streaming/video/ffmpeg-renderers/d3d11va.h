@@ -34,6 +34,7 @@ public:
     // DXGI can switch to interval one; composition always provides native
     // presentation ordering. Both can honor a protected slot without a CPU floor.
     virtual bool canLatchAdaptivePresent() const override { return true; }
+    bool alwaysSynchronizesAdaptivePresent() const override { return m_CompositionPresenter.active(); }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
     uint64_t waitForDecode(AVFrame* frame, uint64_t decodeBoundary) override;

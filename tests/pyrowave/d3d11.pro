@@ -5,6 +5,7 @@ CONFIG += console c++17 warn_off
 CONFIG -= app_bundle
 
 include($$PWD/../../pyrowave/pyrowave.pri)
+include($$PWD/../../pyrowave/compression/compression.pri)
 
 DEFINES += SDL_MAIN_HANDLED
 INCLUDEPATH += \
@@ -16,6 +17,7 @@ INCLUDEPATH += \
 
 SOURCES += \
     $$PWD/tst_pyrowaved3d11.cpp \
+    $$PWD/tst_pyrowavecompressiondecode.cpp \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/d3d11pyrowave.cpp \
     $$PWD/../../app/streaming/video/pyrowave/pyrowavedecoder.cpp \
     $$PWD/../../app/streaming/video/pyrowave/pyrowaveframing.cpp

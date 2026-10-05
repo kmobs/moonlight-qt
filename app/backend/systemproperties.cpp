@@ -7,6 +7,10 @@
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
 
+#ifdef Q_OS_DARWIN
+#include "streaming/video/ffmpeg-renderers/macdisplaytiming.h"
+#endif
+
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -104,8 +108,8 @@ SystemProperties::SystemProperties()
     hasDiscordIntegration = false;
 #endif
 
-    // PyroWave has a D3D11 path on Windows and a Vulkan path on Linux.
-#if defined(HAVE_PYROWAVE) && (defined(Q_OS_WIN32) || defined(Q_OS_LINUX))
+    // PyroWave uses Vulkan decoding with each platform's GPU surface renderer.
+#if defined(HAVE_PYROWAVE) && (defined(Q_OS_WIN32) || defined(Q_OS_LINUX) || defined(Q_OS_DARWIN))
     hasPyroWave = true;
 #else
     hasPyroWave = false;
@@ -267,6 +271,13 @@ void SystemProperties::refreshDisplays()
                     }
                 }
             }
+
+#ifdef Q_OS_DARWIN
+            const auto nativeTiming = queryMacDisplayTimingForDisplay(displayIndex);
+            if (nativeTiming.hasValidTiming()) {
+                bestMode.refresh_rate = nativeTiming.maximumFramesPerSecond;
+            }
+#endif
 
             // Try to normalize values around our our standard refresh rates.
             // Some displays/OSes report values that are slightly off.

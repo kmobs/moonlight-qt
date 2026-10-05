@@ -79,13 +79,15 @@ struct PyroWaveFrameRef {
     }
 };
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <vulkan/vulkan.h>
 
-// Linux contract: the renderer shares its own VkDevice with the decoder and
-// lends it plane images it owns. Timeline semaphores order the renderer's
-// transition into VK_IMAGE_LAYOUT_GENERAL, the decode, and the renderer's
-// later reads, so neither side waits on the CPU.
+// Vulkan-pool contract: Linux lends libplacebo's VkDevice and plane images;
+// macOS lends a MoltenVK device whose planes are exported to the Metal
+// presenter. Timeline semaphores order the initial transition and decode.
+// Linux imports the completion semaphore into its rendering work. Metal
+// observes completion before sampling and retains the frame until its GPU
+// read finishes, preventing premature reuse of an exported plane.
 struct PyroWaveVulkanDevice {
     PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
     VkInstance instance = VK_NULL_HANDLE;

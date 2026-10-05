@@ -39,6 +39,31 @@ public:
     Reports& reports;
 };
 
+// Use the production ingress and priority logic without a worker. USB/IP
+// delivers silent audio continuously while a game's audio endpoint is open.
+static void testAdmission() {
+    struct InputBackend final : Backend { void notify() override {} } backend;
+    std::array<uint8_t, 960> pcm {};
+    backend.receive(UINT32_MAX - 1, pcm.data(), 240);
+    require(!backend.playing() && backend.queue.empty(), "silent endpoint must not suppress ordinary rumble");
+    MlHapticsWrite16(pcm.data(), 0x8000);
+    backend.receive(UINT32_MAX, pcm.data(), 240);
+    require(backend.playing() && backend.queue.size() == 1, "nonzero waveform takes priority");
+    backend.receive(UINT32_MAX, pcm.data(), 240);
+    backend.receive(UINT32_MAX - 1, pcm.data(), 240);
+    require(backend.queue.size() == 1, "late and duplicate packets rejected before playback");
+    backend.receive(0, pcm.data(), 240);
+    require(backend.queue.size() == 2, "sequence wrap accepts the next waveform");
+    backend.queue.clear();
+    pcm.fill(0);
+    backend.receive(1, pcm.data(), 240);
+    backend.receive(0, pcm.data(), 240);
+    require(!backend.playing() && backend.queue.empty(), "idle silence stays inactive across sequence wrap");
+    MlHapticsWrite16(pcm.data(), 1);
+    backend.receive(0, pcm.data(), 240);
+    require(backend.queue.empty(), "idle silence still advances sequence; late waveform cannot restart playback");
+}
+
 static void testTriggers() {
     uint8_t left[DS_EFFECT_PAYLOAD_SIZE], right[DS_EFFECT_PAYLOAD_SIZE];
     for (unsigned i = 0; i < DS_EFFECT_PAYLOAD_SIZE; ++i) {
@@ -88,6 +113,7 @@ int main() {
     SDL_Init(SDL_INIT_GAMECONTROLLER);
     struct QuitSDL { ~QuitSDL() { SDL_Quit(); } } quitSDL;
     try {
+        testAdmission();
         testTriggers();
         require(!DualSenseHaptics::attach(16, nullptr), "invalid controller slot");
         require(!DualSenseHaptics::attach(0, nullptr), "missing waveform controller");
@@ -118,6 +144,7 @@ int main() {
         { std::lock_guard<std::mutex> lock(registryMutex); registry[0] = playback; }
         bool leftNonzero = false, rightNonzero = false;
         unsigned reports = 0;
+        bool gotSilence = false;
         std::array<uint8_t, 960> wave {};
         // 120 Hz left-only tone, then right-only tone, separated by silence.
         for (unsigned packet = 0; packet < 120; ++packet) {
@@ -138,6 +165,9 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             while (recorded.pop(report)) {
                 ++reports;
+                if (packet > 110 && std::all_of(report + 13, report + 77,
+                                              [](uint8_t sample) { return sample == 0; }))
+                    gotSilence = true;
                 for (unsigned i = 0; i < 32; ++i) {
                     if (packet < 40) {
                         leftNonzero |= report[13 + i * 2] != 0;
@@ -153,18 +183,40 @@ int main() {
         require(leftNonzero && rightNonzero && reports > 20, "rendered both actuators");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         require(!DualSenseHaptics::playing(0), "idle timeout");
-        bool gotSilence = false;
         while (recorded.pop(report)) {
             gotSilence = true;
             for (unsigned i = 13; i < 77; ++i) require(report[i] == 0, "idle silence");
         }
         require(gotSilence, "stop report");
+        // Exercise the Bluetooth worker with a native effect followed by an
+        // endpoint that keeps submitting zeros. It must stop emitting reports
+        // and release rumble priority without waiting for audio to close.
+        wave.fill(0);
+        for (unsigned frame = 0; frame < 240; ++frame)
+            MlHapticsWrite16(wave.data() + frame * 4, 16000);
+        for (unsigned packet = 120; packet < 124; ++packet) {
+            DualSenseHaptics::receive(0, packet, wave.data(), 240);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        wave.fill(0);
+        for (unsigned packet = 124; packet < 164; ++packet) {
+            DualSenseHaptics::receive(0, packet, wave.data(), 240);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (packet == 153) {
+                require(!DualSenseHaptics::playing(0), "continuous silence releases rumble priority");
+                while (recorded.pop(report)) {}
+            }
+        }
+        require(!DualSenseHaptics::playing(0) && !recorded.pop(report),
+                "silent endpoint must not restart waveform output");
+
         // Overload without a worker: queue must remain bounded and retain latest.
         { std::lock_guard<std::mutex> lock(playback->mutex); playback->stopped = true; }
         playback->wake.notify_all(); playback->worker.join();
         { std::lock_guard<std::mutex> lock(playback->mutex); playback->stopped = false; }
-        for (unsigned i = 0; i < 1000; ++i) DualSenseHaptics::receive(0, i, wave.data(), 240);
-        require(playback->queue.size() <= 8 && playback->queue.back().sequence == 999, "bounded backlog");
+        MlHapticsWrite16(wave.data(), 1);
+        for (unsigned i = 0; i < 1000; ++i) DualSenseHaptics::receive(0, 164 + i, wave.data(), 240);
+        require(playback->queue.size() <= 8 && playback->queue.back().sequence == 1163, "bounded backlog");
         DualSenseHaptics::detach(0);
         DualSenseHaptics::receive(0, 1001, wave.data(), 240); // harmless after removal
         playback.reset();
@@ -201,7 +253,7 @@ int main() {
         require(playback->queue.empty(), "failed output rejects more PCM");
         DualSenseHaptics::detach(0);
         playback.reset();
-        std::puts("DualSense: trigger dispatch, packet CRC, stereo resampling, loss/duplicates, idle/removal silence, bounded queue and output failure passed");
+        std::puts("DualSense: trigger dispatch, packet CRC, stereo resampling, loss/duplicates, silent endpoint rumble coexistence, idle/removal silence, bounded queue and output failure passed");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

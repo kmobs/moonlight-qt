@@ -2,7 +2,6 @@ import QtQuick 2.9
 import QtQuick.Controls 2.2
 
 import SdlGamepadKeyNavigation 1.0
-import SystemProperties 1.0
 
 // https://stackoverflow.com/questions/45029968/how-do-i-set-the-combobox-width-to-fit-the-largest-item
 ComboBox {
@@ -11,6 +10,14 @@ ComboBox {
     property int maximumWidth : parent.width
 
     implicitWidth: desiredWidth < maximumWidth ? desiredWidth : maximumWidth
+
+    // Keep the menu opaque, including software-rendered Qt Quick previews.
+    // The Material elevation layer can otherwise hide the menu background.
+    popup.background: Rectangle {
+        color: "#383838"
+        radius: 6
+        border.color: "#707070"
+    }
 
     TextMetrics {
         id: popupMetrics
@@ -39,12 +46,6 @@ ComboBox {
     popup.onAboutToShow: {
         // Switch to normal navigation for combo boxes
         SdlGamepadKeyNavigation.setUiNavMode(false)
-
-        // Override the popup color to improve contrast with the overridden
-        // Material 2 background color set in main.qml.
-        if (SystemProperties.usesMaterial3Theme) {
-            popup.background.color = "#424242"
-        }
     }
 
     popup.onAboutToHide: {
@@ -52,10 +53,10 @@ ComboBox {
     }
 
     Keys.onLeftPressed: {
-        decrementCurrentIndex()
+        if (!popup.visible) decrementCurrentIndex()
     }
 
     Keys.onRightPressed: {
-        incrementCurrentIndex()
+        if (!popup.visible) incrementCurrentIndex()
     }
 }

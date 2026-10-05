@@ -45,6 +45,7 @@ constexpr uint64_t kCapturedWorkerQueueCapacity = 3;
 constexpr uint64_t kNativeBackendDxgi = 1;
 constexpr uint64_t kNativeBackendVulkan = 2;
 constexpr uint64_t kNativeBackendComposition = 3;
+constexpr uint64_t kNativeBackendMetal = 4;
 constexpr uint64_t kSdlWindowFullscreenDesktop = 0x00001001ULL;
 constexpr uint64_t kDisplayConfigPathActive = 0x00000001ULL;
 constexpr uint64_t kDisplayConfigPathBoostRefreshRate = 0x00000010ULL;
@@ -1760,6 +1761,7 @@ struct Metrics {
     uint64_t nativePresentAttemptRows = 0;
     uint64_t nativeDxgiPresentAttemptRows = 0;
     uint64_t nativeVulkanPresentAttemptRows = 0;
+    uint64_t nativeMetalPresentAttemptRows = 0;
     uint64_t nativePresentResultValidRows = 0;
     uint64_t nativePresentParametersValidRows = 0;
     uint64_t nativeVrrStateValidRows = 0;
@@ -4172,6 +4174,8 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         static_cast<qint64>(metrics.nativeDxgiPresentAttemptRows);
     nativeOutcomeIntegrity["vulkan_present_attempt_rows"] =
         static_cast<qint64>(metrics.nativeVulkanPresentAttemptRows);
+    nativeOutcomeIntegrity["metal_present_attempt_rows"] =
+        static_cast<qint64>(metrics.nativeMetalPresentAttemptRows);
     nativeOutcomeIntegrity["native_present_result"] = validityObject(
         metrics.nativePresentResultValidRows,
         metrics.nativePresentAttemptRows);
@@ -4365,9 +4369,9 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
     nativeOutcomeIntegrity["single_desktop_monitor"] =
         singleDesktopMonitorReady;
     nativeOutcomeIntegrity["result_semantics"] =
-        "DXGI records signed HRESULT and only S_OK (0) is treated as a displayed submission; positive statuses such as occlusion and negative failures are retained as not presented. Vulkan maps libplacebo boolean submit to 0 success or -1 failure";
+        "DXGI records signed HRESULT and only S_OK (0) is treated as a displayed submission; positive statuses such as occlusion and negative failures are retained as not presented. Vulkan and Metal map presentation acceptance to 0 success or -1 failure";
     nativeOutcomeIntegrity["backend_semantics"] =
-        "1=DXGI, 2=Vulkan; strict raster diagnostics require every normal present attempt to be DXGI";
+        "1=DXGI, 2=Vulkan, 3=Composition, 4=Metal; strict raster diagnostics require every normal present attempt to be DXGI";
     nativeOutcomeIntegrity["present_contract"] =
         "Unlatched DXGI Presents require sync interval 0 and flags 512 when session_allow_tearing is true (including historical captures without the field), otherwise flags 0. Latched Presents require flags 0 and sync interval 0 or 1 for historical compatibility. Disabling session permission does not remove swapchain tearing capability. Renderer eligibility must remain valid with no fallback; adapter LUIDs must remain stable and match.";
     nativeOutcomeIntegrity["frame_statistics_topology_scope"] =
@@ -5008,7 +5012,7 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
         metrics.gpuReadyNativeResultTelemetryAvailable &&
         metrics.gpuReadyNativeResultRelationshipMismatchRows == 0;
     gpuReadyNativeOperations["result_semantics"] =
-        "D3D11 Signal and SetEventOnCompletion retain signed HRESULT; the bounded fence wait records aggregate completion (0), timeout (258), or failure (4294967295), with completion requiring the requested fence value. Vulkan texture-poll rows use 0 for idle completion, 1 for the bounded timeout, and 2 for interruption or GPU failure. D3D11 stage validity follows HRESULT success (nonnegative); presented rows require the backend's successful completion result for strict coverage";
+        "D3D11 Signal and SetEventOnCompletion retain signed HRESULT; the bounded fence wait records aggregate completion (0), timeout (258), or failure (4294967295), with completion requiring the requested fence value. Vulkan texture-poll and Metal command-completion rows use 0 for completion, 1 for the bounded timeout, and 2 for interruption or GPU failure. D3D11 stage validity follows HRESULT success (nonnegative); presented rows require the backend's successful completion result for strict coverage";
     telemetryCoverage["gpu_ready_native_operations"] =
         gpuReadyNativeOperations;
     QJsonObject gpuReadyStageTiming;
@@ -9061,13 +9065,19 @@ int main(int argc, char* argv[])
                 fields, columns.nativeBackendValid) != 0;
         const uint64_t nativeBackend = optionalUnsignedField(
             fields, columns.nativeBackend);
-        // Vulkan reports image-local libplacebo completion polling through
-        // the shared readiness fields. Historical asynchronous hardware rows
-        // can leave those fields unavailable. D3D11 signal/event/fence fields stay
-        // absent on every Vulkan row. Native backend identity is captured on
-        // each Vulkan submission, including neutral cancellation submits.
-        const bool gpuReadyVulkanPoll =
-            nativeBackendDeclared && nativeBackend == kNativeBackendVulkan;
+        // Vulkan and Metal report image-local GPU completion through the
+        // shared readiness fields, without D3D11 signal/event/fence stages.
+        // Historical asynchronous hardware rows can leave these unavailable.
+        const bool gpuReadyNativeCompletion =
+            (nativeBackendDeclared &&
+             (nativeBackend == kNativeBackendVulkan || nativeBackend == kNativeBackendMetal)) ||
+            // A failed preparation or dropped drawable never attempts native
+            // presentation, so it cannot name a presentation backend. Its
+            // completion wait still has a verifiable no-D3D stage contract.
+            (!nativeBackendDeclared && !presented && cancelled &&
+             (disposition == "preparation_failed" || disposition == "interrupted") &&
+             gpuReadyAttempted && gpuReadyWaitResultDeclared &&
+             !gpuReadySignalResultDeclared && !gpuReadySetEventResultDeclared);
         const bool nativePresentResultDeclared =
             optionalUnsignedField(
                 fields, columns.nativePresentResultValid) != 0;
@@ -9528,10 +9538,10 @@ int main(int argc, char* argv[])
             metrics.gpuReadyAttemptedRows +=
                 gpuReadyAttempted ? 1 : 0;
             bool gpuReadyNativeSuccess = false;
-            if (gpuReadyVulkanPoll) {
-                // libplacebo texture polling has no D3D11 HRESULT/event/fence
-                // stages. Its result is the shared wait result (0 means the
-                // output texture became idle; nonzero means cancellation,
+            if (gpuReadyNativeCompletion) {
+                // libplacebo texture polling and Metal command completion have
+                // no D3D11 HRESULT/event/fence stages. Their shared wait result
+                // is 0 for completion; nonzero means cancellation,
                 // timeout, or a failed GPU observation).
                 const bool noD3dStages =
                     !gpuReadySignalResultDeclared &&
@@ -9715,13 +9725,17 @@ int main(int argc, char* argv[])
             const bool nativeBackendKnown =
                 nativeBackend == kNativeBackendDxgi ||
                 nativeBackend == kNativeBackendVulkan ||
-                nativeBackend == kNativeBackendComposition;
+                nativeBackend == kNativeBackendComposition ||
+                nativeBackend == kNativeBackendMetal;
             const bool nativeDxgiPresentAttempt =
                 nativeBackendDeclared &&
                 nativeBackend == kNativeBackendDxgi;
             const bool nativeVulkanPresentAttempt =
                 nativeBackendDeclared &&
                 nativeBackend == kNativeBackendVulkan;
+            const bool nativeMetalPresentAttempt =
+                nativeBackendDeclared &&
+                nativeBackend == kNativeBackendMetal;
             const bool nativePresentationAccepted =
                 nativePresentResultDeclared &&
                 nativePresentResult == 0;
@@ -9739,6 +9753,8 @@ int main(int argc, char* argv[])
                 nativeDxgiPresentAttempt ? 1 : 0;
             metrics.nativeVulkanPresentAttemptRows +=
                 nativeVulkanPresentAttempt ? 1 : 0;
+            metrics.nativeMetalPresentAttemptRows +=
+                nativeMetalPresentAttempt ? 1 : 0;
             if (nativeBackendDeclared) {
                 ++metrics.nativeBackendCounts[
                     QByteArray::number(nativeBackend)];
@@ -9789,11 +9805,13 @@ int main(int argc, char* argv[])
                       (!metrics.qpcCorrelationTelemetryAvailable ||
                        qpcCorrelationDeclared)));
             }
-            else if (nativeBackendDeclared && nativeBackend == kNativeBackendComposition) {
-                // The presentation manager has its own present IDs and verified
+            else if (nativeBackendDeclared &&
+                     (nativeBackend == kNativeBackendComposition || nativeMetalPresentAttempt)) {
+                // Composition and Metal have their own serial present IDs and
                 // display events. None of the DXGI query or flag fields apply.
                 nativeOutcomeRelationshipValid = nativeOutcomeRelationshipValid &&
                     normalPresentAttempt && (presented == submissionIdValid) &&
+                    (!nativeMetalPresentAttempt || nativePresentResult == 0 || nativePresentResult == -1) &&
                     !submissionIdQueryResultDeclared && !frameStatsQueryResultDeclared &&
                     !rawSyncQpcDeclared && !qpcCorrelationDeclared &&
                     (!latchSampleValid ||
@@ -11750,6 +11768,16 @@ int main(int argc, char* argv[])
                 capturedParameters.latencyFixAllRates == 0;
             capturedConfig.latencyMode = capturedParameters.latencyFixAllRates != 0 ?
                 (capturedParameters.latencyFixDelayPeriodPerMille == 0 ? 2 : 1) : 0;
+            if (capturedParameters.playoutIntervalToleranceUs != 0) {
+                // The explicit tolerance identifies customizable sessions. Replay
+                // their actual values rather than guessing the last preset name.
+                capturedConfig.timingOptions = {
+                    int(capturedParameters.playoutDelayMaximumPeriodPerMille),
+                    int(capturedParameters.playoutOnTimeTargetPerMillion / 100),
+                    int(capturedParameters.playoutReadinessWindowUs / 1000000),
+                    int(capturedParameters.playoutIntervalToleranceUs)
+                };
+            }
             simulatedConfig = capturedConfig;
             // Current policy is shared across backends. Exact replay below
             // still uses the captured parameters, including the retired Linux policy.
@@ -11775,7 +11803,9 @@ int main(int argc, char* argv[])
                     simulatedConfig.latencyMode = 1;
                 }
                 scenario.controller = vrrTimingParametersForSession(
-                    simulatedConfig);
+                    simulatedConfig, simulatedCanLatch &&
+                        (capturedParameters.nativeSynchronizedPresentation != 0 ||
+                         (nativeBackendDeclared && nativeBackend == kNativeBackendComposition)));
                 // The start seed came from this machine's cache, not policy.
                 scenario.controller.playoutDelayStartSeedUs =
                     capturedParameters.playoutDelayStartSeedUs;
@@ -13758,7 +13788,7 @@ int main(int argc, char* argv[])
         timelineDetails.recordedGpuReadyTimingValid =
             gpuReadyTimingValid;
         if (metrics.gpuReadyStageTimingTelemetryAvailable &&
-                !gpuReadyVulkanPoll) {
+                !gpuReadyNativeCompletion) {
             const VrrGpuReadyStageTimingAudit stageTimingAudit =
                 evaluateVrrGpuReadyStageTiming(
                     recordedPreparationStartUs,
@@ -13805,7 +13835,7 @@ int main(int argc, char* argv[])
             metrics.gpuReadyNativeResultTelemetryAvailable ?
                 gpuReadyWaitResultDeclared : gpuReadyTimingValid;
         if (metrics.gpuReadyBoundsTelemetryAvailable &&
-                !gpuReadyVulkanPoll && gpuReadySetEventSucceeded) {
+                !gpuReadyNativeCompletion && gpuReadySetEventSucceeded) {
             // A final check replaces the preparation poll in current D3D11
             // traces. Audit either observation independently of a successful
             // completion, including a failed final poll on device removal.
@@ -13854,7 +13884,7 @@ int main(int argc, char* argv[])
                          nativePresentStartUs) :
                      gpuReadyTimeUs <= recordedPreparationEndUs);
             if (metrics.gpuReadyBoundsTelemetryAvailable &&
-                    !gpuReadyVulkanPoll) {
+                    !gpuReadyNativeCompletion) {
                 gpuReadyOrderValid =
                     gpuReadyOrderValid &&
                     gpuReadySignalStartUs != 0 &&
@@ -13862,7 +13892,7 @@ int main(int argc, char* argv[])
                     gpuReadyPollEndUs >= gpuReadyPollStartUs &&
                     gpuReadyWaitStartUs >= gpuReadyPollEndUs;
             }
-            else if (gpuReadyVulkanPoll && gpuReadyAttempted) {
+            else if (gpuReadyNativeCompletion && gpuReadyAttempted) {
                 gpuReadyOrderValid =
                     gpuReadyOrderValid &&
                     gpuReadyPollStartUs != 0 &&
@@ -13881,7 +13911,7 @@ int main(int argc, char* argv[])
                 ++metrics.gpuReadyDurationMismatchRows;
             }
             if (metrics.gpuReadyBoundsTelemetryAvailable &&
-                    !gpuReadyVulkanPoll) {
+                    !gpuReadyNativeCompletion) {
                 const VrrGpuCompletionBounds expectedBounds =
                     evaluateVrrGpuCompletionBounds(
                         recordedPreparationStartUs,
@@ -13917,9 +13947,9 @@ int main(int argc, char* argv[])
                                 gpuReadySignalStartUs);
                 }
             }
-            else if (gpuReadyVulkanPoll) {
+            else if (gpuReadyNativeCompletion) {
                 // The writer derives the shared completion bracket directly
-                // from the texture-poll interval. Validate that derivation
+                // from the native-completion interval. Validate that derivation
                 // without applying the D3D11 fence-value relationship.
                 const bool boundsValid =
                     gpuReadyCompletionLowerBoundUs ==
@@ -14796,7 +14826,8 @@ int main(int argc, char* argv[])
             observation.dxgi = field("native_backend") == kNativeBackendDxgi;
             const bool fixedPresentationMode = traceHeader.contains("presentation_uncertainty_us") &&
                 (field("native_backend") == kNativeBackendVulkan ||
-                 field("native_backend") == kNativeBackendComposition);
+                 field("native_backend") == kNativeBackendComposition ||
+                 field("native_backend") == kNativeBackendMetal);
             if (fixedPresentationMode) observation.latched = false;
             const uint64_t frequency = field("latch_raw_sync_qpc_frequency_hz");
             observation.sampleValid = field("latch_valid") &&

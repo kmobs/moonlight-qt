@@ -2,10 +2,11 @@
 
 This fork streams [PyroWave](https://github.com/Themaister/pyrowave), Hans-Kristian
 Arntzen's intra-only GPU wavelet codec, over the normal Sunshine video stream.
-Every frame is independently decodable, so a lost frame costs one frame and never
-needs a keyframe request. PyroWave trades bandwidth for latency: encode and decode
-take well under a millisecond, but a clean picture needs hundreds of Mbps, so it is
-meant for wired LANs.
+Every frame decodes independently. Optional fast LZ4 compression packs detail
+records into independent groups; it preserves coefficients and partial-frame
+recovery without references to earlier frames or acknowledgements. PyroWave needs substantial
+bandwidth and is intended for wired LANs; processing and delivery costs depend on
+the device, format, and scene.
 
 The same document lives in both repositories (`moonlight-qt/docs/pyrowave-protocol.md`
 and `vibeshine/docs/pyrowave-protocol.md`). Change both together.
@@ -21,8 +22,9 @@ host advertises the vendored commit (below) and the client warns on a mismatch.
 |---|---|
 | `PYROWAVE_BITSTREAM_ID` | `186f0393` (first 8 hex digits of the vendored pyrowave commit) |
 
-Local patches (buffer pool, 4:4:4 payload sizing, zero-length block guard) do not
-change the bitstream.
+Local patches retain the native bitstream layout. The deterministic-padding encoder patch
+initializes unused sign bits and word-alignment bytes so identical coefficients
+produce identical records; decoded coefficient values remain unchanged.
 
 ## Negotiation
 
@@ -36,21 +38,22 @@ different frame framing; see "Compatibility".
 The host ORs these bits into `ServerCodecModeSupport` when PyroWave encoding works
 on the capture adapter:
 
+A PyroWave-capable host can advertise `PyroWaveCompressionVersion=1`. Moonlight's
+compression setting and session opt-in were removed on 2026-10-01; production
+sessions use ordinary PyroWave and discard saved compression/Hybrid preferences.
+The compression contract below remains implemented in shared protocol code and
+framing tests, but production sessions do not request it.
+
 For a paired HTTPS `/serverinfo` request, a capable host also returns
 `PyroWaveHostLinkMbps` (zero if its outbound route is not a known physical wired
 link) and `PyroWaveBandwidthProbeBytes=33554432`. The link number is the host's
 local transmit speed, not measured end-to-end throughput. Linux and Windows
 resolve the route to the requesting client; Linux ignores virtual, wireless,
-half-duplex and inactive interfaces. The host refreshes its streaming pace from
-that route every two seconds.
+half-duplex and inactive interfaces.
 
-The paired client can GET `/pyrowave-bandwidth-probe` over its pinned HTTPS
-connection. It receives exactly 32 MiB of fixed binary payload
-to time. The client discards a warm-up and uses the slowest of three measurements,
-then reserves 20% for protocol overhead and contention. The result is a bulk
-host-to-client throughput estimate. It does not prove that live UDP bursts will
-avoid packet loss, so calibration remains a recommendation rather than a stream
-quality guarantee.
+The legacy 32 MiB HTTPS download probe remains available for old clients.
+New calibration uses authenticated UDP probes to measure loss and stability;
+see [FEC-inclusive recommendations](#fec-inclusive-recommendations-and-udp-calibration).
 
 | Bit | Value | Meaning |
 |---|---|---|
@@ -102,21 +105,29 @@ needs a wired link with hundreds of Mbps to spare.
 | `x-ss-video[0].pyrowaveAdaptiveFec` | `0` (Aurora attribute; its presence selects record framing) |
 | `x-ss-video[0].pyrowaveAdaptiveBitrate` | `0` (Aurora attribute) |
 | `x-ss-video[0].pyrowaveFeatures` | bitmask, below |
+| `x-ss-video[0].pyrowaveCompression` | `1` only when compression version 1 is enabled and advertised |
 
 `pyrowaveFeatures` bits:
 
 | Bit | Name | Meaning |
 |---|---|---|
 | `0x1` | `PYROWAVE_FEATURE_RECORD_FRAMING` | Client parses record framing with padding records. |
+| `0x8` | `PYROWAVE_FEATURE_COMPRESSION` | Client expands independent LZ4 detail groups. |
 
-`0x2` was once reserved for partial-frame decoding. No bit is needed: record-framed
-frames are always laid out for it (see "Partial frames"), and hosts ignore `0x2`.
+`0x2` was once reserved for partial-frame decoding. No bit is needed: ordinary
+record-framed frames use the partial-recovery layout when the negotiated packet size supports
+record alignment (see "Record framing"), and hosts ignore `0x2`.
 
 The host rejects `bitStreamFormat=3` with `400 BAD REQUEST` when PyroWave is
-unavailable, like HEVC/AV1.
+unavailable, like HEVC/AV1. Compression requests require the exact version `1`,
+record framing, and feature `0x8`; unsupported combinations are rejected. A
+compression client sends features `0x9`. The old Hybrid feature `0x4` and
+`pyrowaveHybrid` attribute are retired; explicit nonzero Hybrid requests are
+rejected instead of reinterpreting their incompatible wire format.
 
 Colour: the stock `x-nv-video[0].encoderCscMode` selects range and SDR matrix
-exactly as for the other codecs. 10-bit streams on an HDR display are BT.2020 PQ.
+exactly as for the other codecs. 10-bit streams on an HDR display use BT.2020 PQ
+unless 10-bit SDR is preferred or SDR is forced; those streams use the SDR matrix.
 The host keeps sending the usual HDR mode and metadata control messages.
 
 ## Frames
@@ -126,41 +137,88 @@ PyroWave frames ride the stock Sunshine video path unchanged: RTP, the
 AES-GCM, and the 8-byte short frame header in front of the first payload. The frame
 header `frameType` is always `2` (IDR). moonlight-common-c trims the last payload
 to `lastPayloadLen` as it does for AV1. The host ignores IDR and
-reference-invalidation requests for PyroWave sessions.
+reference-invalidation requests for all PyroWave sessions, including compression.
 
-Every frame is independent, so a lost packet costs at most that frame, and with
-record framing usually only the detail it carried (see "Partial frames"). The one
-part a client cannot do without is PyroWave's coarsest wavelet level, which record
-framing puts first (see "Layout"): the "critical" packets, a few percent of a
-frame (3-6% in our tests). Only they get parity (`fec_percentage` does not apply
-to PyroWave):
+Every PyroWave frame is independent, so a lost packet costs at most
+that frame, and with record framing usually only the detail it carried (see
+"Partial frames"). The coarsest wavelet level is required for decoding. With aligned record framing and
+`pyrowave_critical_fec_percentage > 0`, its leading shards receive parity at that
+percentage, with at least two parity shards. Protection is skipped if the critical
+data and parity cannot fit in one Reed-Solomon block of 255 shards. Length-prefixed
+frames and ordinary record frames without shard alignment have no critical prefix and
+receive no parity. `fec_percentage` does not apply to PyroWave. Finer detail
+normally has no parity, but the host can protect it alongside the critical data
+when sustained low frame rates make loss-induced flicker more visible.
 
-- FEC block 0 is exactly the critical packets, with Reed-Solomon parity at the
-  host's `pyrowave_critical_fec_percentage` (default 20%, at least 2 parity
-  packets, in `fecInfo` as for any block). The rest of the frame follows in up to
-  three blocks without parity, each at most 255 packets like the blocks of the other
-  codecs. With the setting at 0, for length-prefixed framing, or when block 0 would
-  exceed a Reed-Solomon block (255 packets with parity), the whole frame goes in up
-  to four blocks without parity.
-- The last two bytes of the 8-byte short frame header (little-endian, unused by
-  stock Sunshine) carry the number of critical packets, 0 when unknown. Clients
-  that do not know it ignore these bytes.
-- In record framing, `NV_VIDEO_PACKET.extraFlags` bit `0x80` marks each packet
-  whose frame data starts with a record (the first packet always does). Clients
-  that do not know it ignore the bit; stock Sunshine only uses `0x1` (LTR).
+For record framing with `pyrowave_critical_fec_percentage > 0`, the encoded image
+budget is capped at the encoder bitrate divided by the negotiated frame rate.
+At session setup, the host derives the encoder bitrate from the client's requested
+bandwidth budget after allowing for audio, packet overhead and control traffic.
+A frame-rate drop leaves bandwidth available for protection instead of making
+each encoded image larger. For example, an encoder bitrate of 800 Mbps at 120 FPS
+allows about 0.83 MB of encoded data per frame; that ceiling remains about 0.83 MB
+at 60 or 30 FPS. Faster-than-negotiated submissions still receive a smaller
+elapsed-time budget.
 
-Parity on the rest would add bytes, send time and encode time to every frame for
-what is only a blurred area; PyroWave is meant for wired LANs where loss is rare.
-A block holds at most 1023 packets, so the host caps a frame at 3000 packets (about
-4.1 MB with 1392-byte packets) when critical FEC is on and 4000 (about 5.5 MB) when
-it is off. It paces PyroWave packets at its `pyrowave_send_rate_mbps` setting, by
-default twice the stream bitrate and at least 800 Mbps; the other codecs keep FEC
-and the stock 800 Mbps.
+The adaptive policy requires at least 250 ms of frames below negotiated FPS with at
+least 75% unchanged encoded record bytes. It compares records by block ID,
+ignoring sequence numbers, padding and packing order. This is a conservative
+proxy for picture activity, not a pixel motion measurement: changes in encoder
+quantization count as changes too. A 1% timing tolerance ignores small cadence
+noise. The requested detail parity percentage is
+`min(50, 100 * (negotiated FPS / observed FPS - 1))`. Thus a 120 FPS session
+requests about 9% at 110 FPS, 20% at 100 FPS, 33% at 90 FPS and 50% at 80 FPS or
+below. This cap is independent of the critical block's configured parity rate;
+the critical rate remains unchanged. Motion or a return to negotiated cadence disables extra
+protection immediately; cadence smoothing and the entry delay avoid reacting to
+isolated hitches.
+
+Extra parity uses only unused bytes from the current bitrate allowance, after
+accounting for data, baseline parity, network headers and encryption. The
+allowance uses the smaller of the current and smoothed frame intervals, capped
+at 50 ms, without accumulating idle credit. A frame that already fills its
+allowance gets no extra parity. This limits overhead against the configured
+bitrate; it does not estimate available downstream network capacity.
+Unused bandwidth beyond useful parity is left idle; the sender does not try to
+fill the configured bitrate after a cadence drop.
+
+The 50% cap corresponds to an ideal one-third missing-packet tolerance within a
+fully protected block, not a guarantee at one-third average network loss. The
+planner may select less parity or protect only part of the detail to satisfy
+the wire budget and the four-block limit.
+
+The planner prefers protecting all finer detail, reducing its parity percentage
+if necessary. Frames too large for that receive partial coverage: first by
+extending the critical block, then adding protected detail blocks where space
+allows. Every protected block stays within the Reed-Solomon limit of 255 data
+plus parity packets, and the frame still fits four blocks. The announced
+critical packet count continues to describe only the required coarse data.
+No new client protocol is needed. Setting `pyrowave_critical_fec_percentage=0`
+also disables adaptive detail FEC; length-prefixed clients keep their existing
+behavior. The debug statistic `PyroWave: detail packets protected` reports actual
+coverage after budget and block limits, rather than just the requested rate.
+
+The last two bytes of the 8-byte short frame header carry the little-endian
+critical-packet count, zero when unknown. In record framing,
+`NV_VIDEO_PACKET.extraFlags` bit `0x80` marks payloads beginning with a record;
+the first packet always does. Unknown clients ignore these extensions.
+
+The frame is split into at most four blocks. The host caps a frame at 3000
+packets when critical FEC is on and 4000 when it is off. The codec budget and
+record padding honor this limit and the negotiated packet size. PyroWave
+refreshes the routed link speed every two seconds for pacing; if it is unavailable,
+pacing follows packet demand and stream bitrate. `pyrowave_send_rate_mbps`
+is ignored. Other codecs retain their existing pacing and FEC settings.
+
+When sending falls behind, a newly encoded PyroWave frame replaces that
+session's pending frame in the send queue. The frame already being sent
+completes, and other sessions keep their queue positions.
 
 ### Record framing (host default for PyroWave-aware clients)
 
-Used when the client sent `x-ss-video[0].pyrowaveAdaptiveFec` or
-`pyrowaveFeatures & 0x1`. The frame payload is a concatenation of 32-bit
+Used when the client sent
+`x-ss-video[0].pyrowaveAdaptiveFec` or `pyrowaveFeatures & 0x1`. The frame payload
+is a concatenation of 32-bit
 little-endian records:
 
 1. A PyroWave `BitstreamSequenceHeader` (8 bytes, `extended = 1`, `code = 0`),
@@ -176,8 +234,11 @@ little-endian records:
 
 Layout: the RTP layer splits the frame into payloads of `packetSize - 16` bytes
 (1376 for the usual 1392-byte packets); the first payload also carries the 8-byte
-frame header, so its frame data ends 8 bytes early. After the sequence header our
-host sends two groups:
+frame header, so its frame data ends 8 bytes early. Alignment requires this payload
+size to be a multiple of four and at least 24 bytes. Otherwise (for example, with
+1390-byte packets), the host copies the encoder's records without reordering or
+padding and reports no critical prefix. The layout below applies when alignment
+is available. After the sequence header our host sends two groups:
 
 1. PyroWave's coarsest wavelet level: block indices below
    `12 * ceil(W / 32) * ceil(H / 32)`, where `W` and `H` are the frame's width and
@@ -228,6 +289,52 @@ Our client detects the framing per frame: a record-framed frame starts with a
 sequence header, whose first word has bit 31 (`extended`) set, while a packet count
 never does.
 
+### Independent compression version 1
+
+After native encoding and ordinary record framing, the host preserves the sequence
+header and the entire coarse-data prefix byte for byte. Detail records are grouped
+into at most 64 KiB and compressed with fast LZ4 (acceleration 1). A 4 KiB sample
+skips full compression when savings look unlikely. There is no XOR against old
+frames, omitted unchanged detail, retained reference cache, frame ID or ACK.
+
+Every compressed group starts on an RTP shard boundary and carries four
+little-endian u32 words, followed by compressed bytes padded to four bytes:
+
+| Offset | Field |
+|---|---|
+| 0 | magic `0xFFFFFFFE` (distinct from padding `0xFFFFFFFF`) |
+| 4 | compressed payload byte count |
+| 8 | native group byte count, nonzero, word-aligned, at most 65,536 |
+| 12 | CRC32C of the exact native group bytes |
+
+Expanded groups contain only complete ordinary native detail records, with the
+current frame's sequence value. Sequence headers, padding, coarse records, nested
+compression and records outside the negotiated geometry are rejected. CRC32C uses
+the Castagnoli polynomial, with runtime SSE4.2 acceleration and a portable
+slicing-by-eight fallback. LZ4 decoding validates exact output size before GPU use.
+
+Groups that do not save their header/alignment overhead use native records. If
+repacking erases the total gain, the original frame is sent verbatim. Output never
+exceeds the original framed bytes; image quality and bitrate budget are unchanged.
+The encoder still initializes unused sign/alignment bits to avoid needless entropy.
+If compression cannot transform a native frame, the host sends that frame normally.
+This also handles native framing's unpadded fallback at the transport ceiling,
+where no protected coarse prefix is available for grouping.
+
+Unrepaired loss skips only affected detail records/groups. When a group header is
+lost, the receiver resumes at the next received shard marked as a record start.
+No damaged group reaches the GPU. The intact coarse prefix still permits a partial
+image; the next intact intra frame restores every coefficient immediately. A group
+may span several packets, so one lost shard can remove up to 64 KiB of detail.
+Critical FEC remains unchanged. Optional detail-FEC observation runs on native
+records before compression, and parity is assigned to the resulting wire shards.
+
+The shared implementation and wire contract are in
+`pyrowave/compression/` in Moonlight and `src/pyrowave_compression/` in Vibeshine;
+the shared C++ files and vendored LZ4 must match. This adds no future-frame
+lookahead or pacing delay. Compression/decompression still consume CPU time;
+savings and live-link delivery time depend on content and device.
+
 ## Decoding
 
 The decoder is cleared before every frame (`pyrowave_decoder_clear`), all records
@@ -237,8 +344,10 @@ discarding frames after four or more consecutive network drops.
 
 ### Partial frames
 
-Our client decodes a record-framed frame that lost packets. moonlight-common-c
-first repairs what parity can (the critical packets). It does not drop a PyroWave
+Our client decodes a record-framed frame that lost packets, including independently
+compressed detail groups.
+moonlight-common-c
+first repairs what parity can (critical packets and any protected detail). It does not drop a PyroWave
 frame whose FEC block cannot complete: once the next block or frame starts
 arriving, each missing data packet is replaced by zeros and delivered as a
 `BUFFER_TYPE_LOST` buffer. Once its final data packet has arrived, a final block
@@ -294,18 +403,23 @@ Output planes are three single-channel UNORM images (R8 for 8-bit streams, R16 f
 
 The client's configured bitrate (`x-ml-video.configuredBitrateKbps`) is used exactly
 as for the other codecs; the host subtracts audio and control overhead, but not
-FEC: the critical packets' parity is well under 1% of the frame at the default. The
-per-frame byte budget is `bitrate / capture rate / 8`, where the capture rate is
-measured (a game at 60 fps in a 120 fps stream gets twice the bytes per frame),
-bounded to at most twice the nominal per-frame budget. PyroWave's rate control never
-exceeds that budget. Padding records are counted against the wire bitrate, not the
-budget.
+FEC. The initial per-frame byte budget uses the negotiated frame rate. With record
+framing and FEC enabled, subsequent image budgets use the smaller of that interval
+and the elapsed time between encoding attempts, including repeated images.
+Slower submissions therefore keep the same encoded image ceiling and make room
+for adaptive detail FEC. Disabling FEC or using length-prefixed compatibility
+framing retains elapsed-time image budgets. Dynamic bitrate changes update the
+ceiling using the new bitrate and the original negotiated FPS. The negotiated
+transport capacity also bounds the budget. Budgets are rounded
+down to codec words; a budget too small for the codec headers skips that attempt.
+Framing and network headers still add overhead to the codec bitrate.
 
-When no new capture arrives, the host re-encodes the last image at the minimum FPS
-target (`minimum_fps_target`, by default a fifth of the stream rate and at least 10
-fps), so a static screen recovers from a lost frame. Repeats do not count as captures,
-and the default is low enough that a game rendering below the stream rate is never
-padded out with repeats at its enlarged per-frame budget.
+When no new capture arrives, the host re-encodes the last image. By default the
+wait is one negotiated frame interval, so a static screen can recover promptly
+from a lost frame. An explicit `minimum_fps_target` can reduce the repeat cadence
+and is capped at the negotiated frame rate. Capture mutex waits are also bounded
+by the negotiated frame interval. Packetizer storage follows the codec's reported
+bitstream buffer size plus its sequence header.
 
 Guidance: the client's default bitrate follows Themaister's objective regression
 (`eval-results/objective-bitrate-evaluation.md` in the PyroWave repository) at 35 dB
@@ -322,3 +436,85 @@ HDR10. At 60 fps that is about 220 Mbps for 1080p and 290 Mbps for 1440p and 4K 
 | Xbox / azafrob-protocol client, our host | Negotiates PyroWave, length-prefixed framing. Bitstream compatibility depends on their PyroWave commit. |
 | Our client, dimizago Vibepollo host | Negotiates PyroWave from the SCM bits; length-prefixed framing is detected per frame. |
 | Stock Moonlight | Never sees PyroWave; negotiates H.264/HEVC/AV1 as before. |
+
+## FEC-inclusive recommendations and UDP calibration
+
+Paired server info advertises `PyroWaveWireBudgetVersion=1`,
+`PyroWaveCriticalFecPercentage`, `PyroWaveMinParityShards=2`, and
+`PyroWaveUdpProbeVersion=1`. The bitrate applied by calibration is a total
+wire allowance. `pyrowavebandwidth.h` (Moonlight) and `pyrowave_bandwidth.h`
+(Vibeshine) share the conversion between it and the image allowance: reserve
+one maximum feasible critical FEC block, packet rounding, IPv6, encryption,
+Ethernet overhead, and 3572 kbps for up to eight high-quality audio channels,
+audio parity and control. Adaptive detail parity spends unused cadence budget
+inside this allowance; it is not another blanket 50% charge. Quality labels
+use the remaining image allowance against the author's 35 dB recommendation.
+
+The paired client requests `/pyrowave-udp-probe?kbps=...&port=...&packetsize=...&token=...`
+over pinned HTTPS. Parameters are 5000–3000000 kbps, a nonprivileged UDP port,
+a 256–1392 byte packet size, and a fresh 32-character lowercase hex token.
+The destination IP is always the authenticated HTTPS peer's IP; this is a
+LAN probe, and a NAT/firewall blocking its UDP port produces no recommendation.
+The host refuses probes during stream activity and serializes them with stream
+operations on the existing blocking worker. Each probe lasts two seconds and
+paces whole packets in 1 ms groups. Its UDP payload is `packetsize + 48` bytes:
+ASCII token at bytes 0–31, big-endian sequence at bytes 32–35, then filler.
+Each packet is charged `packetsize + 134` wire bytes, matching the conservative
+IPv6/encrypted streaming budget. HTTPS returns XML `expected`, `sent`, and
+`elapsedMs`; reliable counts include lost final packets. Duplicates, foreign
+packets, and previous probes cannot inflate delivery. Sequence IDs tolerate
+reordering; a 100 ms drain still charges tail delay against the send schedule.
+
+Calibration uses two screens. Step one contains the host selector, four target
+cards and bandwidth test/stop controls. Controller left/right selects a target;
+opening the card starts no test. Next remains disabled until a successful fresh
+network test finishes for the selected host and target. Next starts decoder and
+rendering stress testing on step two, using that same in-session confirmed wire
+budget. Format choices become available when stress testing finishes. Closing
+calibration invalidates the budget; a cancelled test requires fresh bandwidth
+measurement. Changing host or target blocks results for another combination.
+
+Calibration offers four targets: Minimum is half the developer's recommended
+image bitrate rounded down to 5 Mbps (at least 5 Mbps), Recommended is the full
+image recommendation, Moderate allows 60% of measured stable wire bandwidth,
+and Maximum uses the full stable budget. Applied rates include FEC and overhead;
+Moderate's 60% includes those costs.
+
+The UDP search starts at the ceiling bounded by known routed endpoint link
+speeds and the 3 Gbps UI limit. For Minimum and Recommended, the ceiling also
+stops at the largest quality target in the matrix, allowing applied rounding
+and the 5% confirmation margin. Failed ceilings are bisected to 5 Mbps. A pass requires all planned packets sent,
+no more than 0.1% aggregate loss or 1% loss in any 100 ms window, p99 transit
+variation at most 4 ms, delay growth at most 2 ms, and sender duration within
+2% of the requested duration. These are calibration policy thresholds, not FEC
+recovery guarantees. The highest passing rate is reduced by 5% where possible
+and measured twice afresh. Failed confirmation reduces the rate by 20% and
+retests; persistent loss, blocked UDP, malformed responses, or an unsupported
+host do not produce a rate. Cancellation abandons the current result.
+
+Each GPU format tests its chosen image target directly within that confirmed
+wire budget. A passing ceiling stops the search; no lower successful probes are
+needed first. After a failure, the author guide can establish a lower bracket
+for bandwidth targets. The existing lower-quality floor probe and 10% GPU-cost
+saving check govern recovery below the guide. At most six bitrate bisections
+refine the device boundary. Every passing candidate uses the same full timed
+measurement as before (at least 300 frames or three seconds of frames, p99),
+with the same warmup and system-stall retry. UDP duration, loss/delay thresholds,
+5 Mbps search precision and two fresh confirmations are unchanged.
+Results show the applied total Mbps, visible reduced/low quality, and image Mbps
+in the details. Format measurements use the selected packet size and respect
+the sender's frame capacity. Rates round up to 5 Mbps only when they still fit
+the confirmed budget. The default uncalibrated author guide is unchanged.
+
+Moonlight announces `x-ss-video[0].pyrowaveLinkMbps` when the routed client wired
+link speed is known. Host packet pacing uses the smaller known host/client link
+speed, preventing a faster host from sending oversized groups into a slower
+receiver. The host limits the total budget at physical link capacity; it no
+longer silently applies a second 20% reduction to an already tested allowance.
+Calibration results are not cached or silently reapplied at a later launch.
+
+This tests fresh UDP delivery and synthetic GPU work separately. It does not
+prove sustained gameplay smoothness, host encoding speed, frame-burst delivery,
+or physical scanout. The older 32 MiB HTTPS download endpoint remains available
+for older clients; new calibration does not use its loss-hidden throughput as
+proof of stability.

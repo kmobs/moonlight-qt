@@ -11,7 +11,7 @@ win32 {
         SDL_ARCH = x64
     }
     INCLUDEPATH += ../../libs/windows/include/$$SDL_ARCH/SDL2
-    LIBS += -L$$PWD/../../libs/windows/lib/$$SDL_ARCH -lSDL2 -lhid
+    LIBS += -L$$PWD/../../libs/windows/lib/$$SDL_ARCH -lSDL2 -lhid -lole32 -lcfgmgr32
 } else:macx {
     INCLUDEPATH += ../../libs/mac/include/SDL2
     LIBS += -L$$PWD/../../libs/mac/lib -lSDL2

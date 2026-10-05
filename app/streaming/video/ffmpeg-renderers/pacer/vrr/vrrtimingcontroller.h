@@ -45,6 +45,9 @@
     X(uint64_t, playout_recent_pressure_release, playoutRecentPressureRelease, 0) \
     /* Zero preserves historical burst recovery. Production starts at 2 percent. */ \
     X(uint64_t, playout_catchup_per_mille, playoutCatchupPerMille, 0) \
+    /* Rescue bounded late frames and recover from actual submission lateness. */ \
+    X(uint64_t, playout_late_recovery, playoutLateRecovery, 0) \
+    X(uint64_t, playout_interval_tolerance_us, playoutIntervalToleranceUs, 0) \
     /* Historical captures retain the one-second/two-interval warmup. */ \
     X(uint64_t, playout_interval_initial_warmup_us, playoutIntervalInitialWarmupUs, 1000000) \
     X(size_t, playout_interval_initial_minimum_samples, playoutIntervalInitialMinimumSamples, 2) \
@@ -72,6 +75,8 @@
     X(uint64_t, playout_prediction_enabled, playoutPredictionEnabled, 0) \
     /* 0: historical cadence latch; 1: slot only; 2: slot plus safety headroom. */ \
     X(uint64_t, playout_per_frame_latch, playoutPerFrameLatch, 0) \
+    /* Constant native synchronization is a presenter capability, not a latch choice. */ \
+    X(uint64_t, native_synchronized_presentation, nativeSynchronizedPresentation, 0) \
     X(uint64_t, playout_adaptive_only, playoutAdaptiveOnly, 0) \
     X(uint64_t, playout_rate_protection_enabled, playoutRateProtectionEnabled, 0) \
     X(uint64_t, playout_history_enabled, playoutHistoryEnabled, 0) \
@@ -221,7 +226,8 @@
     X(uint64_t, playout_epoch_rate_ratio_per_mille, playoutEpochRateRatioPerMille, 0) \
     X(uint64_t, playout_epoch_sustain_us, playoutEpochSustainUs, 0) \
     X(uint64_t, playout_delay_decrease_slew_us, playoutDelayDecreaseSlewUs, 0) \
-    X(uint64_t, playout_epoch_confirm_us, playoutEpochConfirmUs, 0)
+    X(uint64_t, playout_epoch_confirm_us, playoutEpochConfirmUs, 0) \
+    X(uint64_t, playout_smoothing_readiness_bound, playoutSmoothingReadinessBound, 0)
 
 // Every value that changes VRR policy remains replaceable by replay without
 // rebuilding the controller. Production callers use these defaults.
@@ -235,7 +241,7 @@ struct VrrTimingParameters {
 // Resolve mode-dependent production policy once for both the live worker and
 // the replay baseline. Candidate replay configs may still override any field.
 VrrTimingParameters vrrTimingParametersForSession(
-    const VrrSessionConfig& config);
+    const VrrSessionConfig& config, bool nativeSynchronizedPresentation = false);
 
 struct VrrTimingDiagnostics {
     int64_t readinessPhaseUs = 0;
@@ -376,7 +382,11 @@ public:
     uint64_t estimatedCadenceHitches() const { return m_EstimatedCadenceHitches; }
     uint64_t nativeCadenceHitches() const { return m_NativeCadenceHitches; }
     Vrr13::SmoothnessFeedback::Sample smoothnessSample(const VrrTimingDecision& decision) const;
-    Vrr13::IntervalBuffer::Stats intervalStats() const { return m_IntervalBuffer.stats(); }
+    Vrr13::IntervalBuffer::Stats intervalStats() const {
+        auto stats = m_IntervalBuffer.stats();
+        stats.present = m_PresentTiming.stats();
+        return stats;
+    }
     uint64_t typicalRenderUs() const;
     uint64_t recoveryHeadroomUs() const;
 
@@ -675,6 +685,7 @@ private:
     uint64_t m_EpochCandidateMilliHz = 0;
     uint64_t m_EpochCandidateSinceUs = 0;
     Vrr13::PresentationPrediction m_PresentationPrediction;
+    Vrr13::PresentTiming m_PresentTiming;
     Vrr13::SmoothnessFeedback m_SubmissionSmoothness, m_NativeSmoothness;
     // Lifetime counters for decoder-owned reporting windows. These do not
     // expire with the controller's rolling adaptation histogram.

@@ -324,7 +324,9 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
         scheduledAge.values.push_back(ageUs);
         appliedDelay.values.push_back(decision.playoutDelayUs);
         if (!queue.empty() && VrrFrameDropPolicy::beforeRender(decision,
-                controller.displayPeriodUs(), ageUs, metronome, active)) {
+                controller.displayPeriodUs(), ageUs, metronome, active,
+                scenario.controller.playoutLateRecovery ? decision.playoutDelayUs : 0,
+                scenario.controller.playoutLateRecovery != 0)) {
             ++staleDrops;
             dropped[inputIndex] = true;
             controller.noteSubmission(false, false, 0);
@@ -341,7 +343,8 @@ QJsonObject simulate(const Capture& capture, VrrReplayScenario scenario,
             std::max(decisionEndUs, decision.renderStartUs), renderWakeDelay);
         admitThrough(renderStartUs);
         if (!queue.empty() && VrrFrameDropPolicy::afterRenderWait(decision,
-                ageOrigin, renderStartUs, metronome, active)) {
+                ageOrigin, renderStartUs, metronome, active, 0,
+                scenario.controller.playoutLateRecovery ? decision.playoutDelayUs : 0)) {
             ++staleDrops;
             dropped[inputIndex] = true;
             if (metronome || active) controller.noteSubmission(false, false, 0);

@@ -1,5 +1,6 @@
 #include <Limelight.h>
 #include "ffmpeg.h"
+#include "videothreadpriority.h"
 #include "utils.h"
 #include "streaming/session.h"
 #include "diagnostics/gputrace.h"
@@ -73,6 +74,23 @@ extern "C" {
 
 #define FAILED_DECODES_RESET_THRESHOLD 20
 
+static void updateStatsOutputSize(SDL_Window* window)
+{
+    if (window == nullptr) return;
+    int width = 0, height = 0;
+#if SDL_VERSION_ATLEAST(2, 26, 0)
+    SDL_GetWindowSizeInPixels(window, &width, &height);
+#else
+    // Older bundled SDLs lack the generic drawable-size query. OpenGL has
+    // provided one for longer; other old backends retain their window size.
+    if (SDL_GetWindowFlags(window) & SDL_WINDOW_OPENGL)
+        SDL_GL_GetDrawableSize(window, &width, &height);
+    else
+        SDL_GetWindowSize(window, &width, &height);
+#endif
+    Session::get()->getOverlayManager().setOutputSize(width, height);
+}
+
 bool FFmpegVideoDecoder::isHardwareAccelerated()
 {
     // PyroWave decodes on the GPU in Vulkan compute
@@ -105,6 +123,8 @@ bool FFmpegVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
         WINDOW_STATE_CHANGE_SIZE |
         WINDOW_STATE_CHANGE_DISPLAY;
     const WINDOW_STATE_CHANGE_INFO originalInfo = *info;
+    if (originalInfo.stateChangeFlags & deferredPacerFlags)
+        updateStatsOutputSize(originalInfo.window);
 
     // Suspension must reach the worker immediately so it cannot submit
     // another frame after a minimize/background notification. Geometry and
@@ -140,8 +160,7 @@ int FFmpegVideoDecoder::getDecoderCapabilities()
                     capabilities);
     }
     else if (m_PyroWaveActive) {
-        // Every PyroWave frame is intra-coded: there are no references to
-        // invalidate and the codec has no slices.
+        // PyroWave's GPU reconstruction is intra-coded and has no slices.
         capabilities = 0;
     }
     else {
@@ -633,7 +652,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
     m_OriginalVideoHeight = params->height;
     m_StreamFps = params->frameRate;
     m_VideoFormat = params->videoFormat;
-    m_VrrLatencyMode = params->vrrLatencyMode;
+    m_VrrUsesMaximumBuffer = params->vrrTimingOptions.resolved(params->vrrLatencyMode).bufferPerMille >= 4000;
     m_CurrentTestMode = testMode;
 
     // Don't bother initializing Pacer if we're not actually going to render
@@ -650,7 +669,7 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
                                      .arg(params->width).arg(params->height).arg(params->videoFormat)
                                      .arg(m_FrontendRenderer->getCalibrationIdentity())
                                      .arg(decoder != nullptr ? decoder->name : "pyrowave"),
-                                 params->vrrLatencyMode)) {
+                                 params->vrrLatencyMode, params->vrrTimingOptions)) {
             return false;
         }
     }
@@ -903,6 +922,7 @@ bool FFmpegVideoDecoder::finishRenderInitialization(PDECODER_PARAMETERS params)
     }
 
     // Tell overlay manager to use this frontend renderer
+    updateStatsOutputSize(params->window);
     Session::get()->getOverlayManager().setOverlayRenderer(m_FrontendRenderer);
 
     // Allow the renderer to perform final preparations for rendering
@@ -1185,7 +1205,7 @@ void FFmpegVideoDecoder::syncPacerTelemetry()
         interval.qualityPercent());
     Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::ClientPacing,
         ClientPacingWarning::message(warning, (m_VideoFormat & VIDEO_FORMAT_MASK_AV1) != 0,
-            Session::get()->hevcPacingAlternative(), m_VrrLatencyMode == 0));
+            Session::get()->hevcPacingAlternative(), m_VrrUsesMaximumBuffer));
     m_LastPacerTelemetry = snapshot;
 }
 
@@ -1509,26 +1529,48 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 if (interval.averageValid)
                     snprintf(average, sizeof(average), "%.3f ms", interval.averageErrorUs / 1000.0);
                 else snprintf(average, sizeof(average), "collecting");
+                // Display timing added after submission. The buffer cannot
+                // correct it, so it is reported apart from Smoothness.
+                char presentTiming[160];
+                const auto& present = interval.present;
+                const uint64_t nowUs = LiGetMicroseconds();
+                const auto fresh = [nowUs](uint64_t at) { return at && nowUs >= at && nowUs - at <= 1000000; };
+                if (present.intervals && fresh(present.lastObservedUs)) {
+                    snprintf(presentTiming, sizeof(presentTiming),
+                        "%.2f%% (%llu/%llu intervals) | Hitches: %llu | Worst: +%.1f ms",
+                        present.issuePercent(),
+                        static_cast<unsigned long long>(present.misses),
+                        static_cast<unsigned long long>(present.intervals),
+                        static_cast<unsigned long long>(present.hitches),
+                        present.worstAddedUs / 1000.0);
+                }
+                else if (fresh(present.lastPausedUs))
+                    snprintf(presentTiming, sizeof(presentTiming), "paused below VRR range");
+                else snprintf(presentTiming, sizeof(presentTiming), "unavailable");
                 if (advancedStats) {
                     ret = snprintf(&output[offset], length - offset,
                         "Client timing: %s (target %.2f%% over %s)\n"
-                        "Timing error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n",
+                        "Timing error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n"
+                        "Present timing issues (30s): %s\n",
                         score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
                         scoreWindow, average,
                         interval.toleranceUs / 1000.0,
-                        static_cast<unsigned long long>(readiness.dropped));
+                        static_cast<unsigned long long>(readiness.dropped),
+                        presentTiming);
                 }
                 else {
                     ret = snprintf(&output[offset], length - offset,
                         "VRR pacing: %s | Smoothness (%s): %s / %.2f%% target%s\n"
-                        "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n",
+                        "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n"
+                        "Present timing issues (30s): %s\n",
                         stats.vrrTelemetryActive ? "Active" : "Inactive",
                         scoreWindow, score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
                         stats.vrrBufferAtLimit ? " (buffer limit)" : "", average,
                         interval.toleranceUs / 1000.0,
-                        static_cast<unsigned long long>(readiness.dropped));
+                        static_cast<unsigned long long>(readiness.dropped),
+                        presentTiming);
                 }
             }
             else if (readiness.meanMissPolicy) {
@@ -1620,6 +1662,12 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
+            // The adaptive presenter lives in Metal. Use the same renderer
+            // during the startup probe so range/HDR negotiation matches playback.
+            if ((params->enableVrr || params->preferVrrRenderer) &&
+                    params->renderer == StreamingPreferences::RS_AUTO) {
+                return VTMetalRendererFactory::createRenderer(true);
+            }
             // Prefer the libplacebo (on MoltenVK) renderer unless explicitly opted out
 #ifdef HAVE_LIBPLACEBO_VULKAN
             if (params->renderer == StreamingPreferences::RS_AUTO || params->renderer == StreamingPreferences::RS_VULKAN) {
@@ -2248,6 +2296,8 @@ bool FFmpegVideoDecoder::initializePyroWave(PDECODER_PARAMETERS params)
 
 #ifdef Q_OS_WIN32
     m_BackendRenderer = new D3D11VARenderer(0);
+#elif defined(Q_OS_DARWIN)
+    m_BackendRenderer = VTMetalRendererFactory::createRenderer(false);
 #elif defined(Q_OS_LINUX) && defined(HAVE_LIBPLACEBO_VULKAN)
     m_BackendRenderer = new PlVkRenderer();
 #else
@@ -2276,6 +2326,15 @@ bool FFmpegVideoDecoder::initializePyroWave(PDECODER_PARAMETERS params)
     config.tenBit = (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0;
 #ifndef Q_OS_WIN32
     config.vulkanPool = m_BackendRenderer->getPyroWaveVulkanPool();
+#ifdef Q_OS_DARWIN
+    // The Mac path requires shared GPU planes; a failed interop setup cannot
+    // silently turn a high-bandwidth GPU codec into CPU readback and upload.
+    config.requireSharedOutput = true;
+    if (config.vulkanPool == nullptr) {
+        reset();
+        return false;
+    }
+#endif
 #endif
 
     m_PyroWave = std::make_unique<PyroWaveDecoder>();
@@ -2338,8 +2397,7 @@ int FFmpegVideoDecoder::sendPyroWaveFrame(int length, uint32_t rtpTimestamp)
         av_frame_free(&frame);
         m_PyroWaveRejectedFrames++;
 
-        // Every frame is independent, so there is nothing to request from the
-        // host: the next frame replaces this one. Log at most once a second.
+        // The next independent frame replaces this one. Log at most once a second.
         const uint64_t nowUs = LiGetMicroseconds();
         if (nowUs - m_PyroWaveLastErrorLogUs >= 1000000) {
             m_PyroWaveLastErrorLogUs = nowUs;
@@ -2594,6 +2652,8 @@ int FFmpegVideoDecoder::decoderThreadProcThunk(void *context)
 
 void FFmpegVideoDecoder::decoderThreadProc()
 {
+    const VideoThreadPriority priority("FFDecoder");
+
     while (!SDL_AtomicGet(&m_DecoderThreadShouldQuit)) {
         if (m_FramesIn == m_FramesOut) {
             VIDEO_FRAME_HANDLE handle;
@@ -2808,8 +2868,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
                                                        decodeSubmitUs);
                         pacedFrame.setDecodeHoldUs(decodeHoldUs);
 #ifdef HAVE_PYROWAVE
-                        // Shared-surface output (Linux Vulkan, Windows D3D11
-                        // interop) returns at submission, not completion.
+                        // Shared-surface output (Vulkan, D3D11 or Metal interop)
+                        // returns at submission, not completion.
                         if (m_PyroWaveActive) {
                             pacedFrame.setDecoderOutputComplete(
                                 !m_PyroWave->hasAsynchronousOutput());
@@ -2903,6 +2963,14 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 
     m_BwTracker.AddBytes(du->fullLength);
 
+    // The stats text changes once per second; the timing graph scrolls at 10 Hz.
+    const uint64_t graphNowUs = LiGetMicroseconds();
+    if (m_Pacer && graphNowUs - m_LastTimingGraphUs >= 100000 &&
+            Session::get()->getOverlayManager().isTimingGraphEnabled()) {
+        m_LastTimingGraphUs = graphNowUs;
+        Session::get()->getOverlayManager().updateTimingGraph(m_Pacer->timingGraphSnapshot());
+    }
+
     // Flip stats windows roughly every second
     if (LiGetMicroseconds() > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
         // Pacer producers publish cumulative snapshots. Merge the delta before
@@ -2910,14 +2978,16 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         syncPacerTelemetry();
 
         // Update overlay stats if it's enabled
-        if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
+        if (Session::get()->getOverlayManager().isStatsEnabled()) {
             VIDEO_STATS lastTwoWndStats = {};
             addVideoStats(m_LastWndVideoStats, lastTwoWndStats);
             addVideoStats(m_ActiveWndVideoStats, lastTwoWndStats);
 
             char text[4096];
             stringifyVideoStats(lastTwoWndStats, text, sizeof(text));
-            Session::get()->getOverlayManager().updateOverlayText(Overlay::OverlayDebug, text);
+            Session::get()->getOverlayManager().updateOverlayText(Overlay::OverlayDebug, text,
+                m_Pacer && Session::get()->getOverlayManager().isTimingGraphEnabled() ?
+                    m_Pacer->timingGraphSnapshot() : Overlay::TimingGraphSnapshot{});
         }
 
         // Accumulate these values into the global stats
@@ -2952,8 +3022,9 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     m_ActiveWndVideoStats.receivedFrames++;
     m_ActiveWndVideoStats.totalFrames++;
 
-    // Every PyroWave frame decodes on its own, so a frame that has waited
-    // more than two source frame periods while a newer one is queued is
+    // Every frame decodes independently, so unopened frames can safely be
+    // skipped. A frame that has waited more than two source frame
+    // periods while a newer one is queued is
     // dropped unopened. Decoding it would cost the GPU time the queue needs to
     // drain, and it would only be shown late or discarded by the pacer. Use
     // the source's actual cadence: below the negotiated rate, one brief decode

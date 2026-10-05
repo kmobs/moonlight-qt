@@ -6,6 +6,7 @@ CONFIG -= app_bundle
 DEFINES += SDL_MAIN_HANDLED
 INCLUDEPATH += $$PWD/../../app $$PWD/../../app/streaming/video
 SOURCES += $$PWD/tst_overlay.cpp $$PWD/../../app/streaming/video/overlaymanager.cpp $$PWD/../../app/path.cpp
+HEADERS += $$PWD/../../app/streaming/video/timinggraph.h
 win32 {
     VRR_ARCH = $$QT_ARCH
     contains(QT_ARCH, x86_64): VRR_ARCH = x64
@@ -13,7 +14,7 @@ win32 {
     LIBS += -L$$PWD/../../libs/windows/lib/$$VRR_ARCH -lSDL2 -lSDL2_ttf shell32.lib
 }
 macx:!disable-prebuilts {
-    INCLUDEPATH += $$PWD/../../libs/mac/include
+    INCLUDEPATH += $$PWD/../../libs/mac/include $$PWD/../../libs/mac/include/SDL2
     LIBS += -L$$PWD/../../libs/mac/lib -lSDL2 -lSDL2_ttf
 } else:unix {
     CONFIG += link_pkgconfig

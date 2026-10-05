@@ -5,6 +5,8 @@
 // by the legacy pacing path, while these values describe the frame as it
 // crossed the decoder/pacer boundary.
 
+#include "../../../../../settings/vrrtimingoptions.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -35,6 +37,7 @@ struct VrrSessionConfig {
     // 0: Smooth, 1: Balanced Target, 2: Low Latency, across all VRR rates.
     // The IDs are persisted and therefore remain stable across label changes.
     int latencyMode = 0;
+    VrrTimingOptions timingOptions;
     // Session-native A/B choice, recorded separately from controller timing.
     bool allowTearing = true;
     std::string calibrationKey;

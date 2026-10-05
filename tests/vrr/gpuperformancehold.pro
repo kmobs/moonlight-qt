@@ -1,0 +1,9 @@
+TEMPLATE = app
+TARGET = tst_gpuperformancehold
+QT -= gui
+CONFIG += console c++17 link_pkgconfig
+DEFINES += SDL_MAIN_HANDLED
+PKGCONFIG += sdl2
+INCLUDEPATH += $$PWD/../../app
+SOURCES += $$PWD/tst_gpuperformancehold.cpp $$PWD/../../app/streaming/gpuperformancehold.cpp
+HEADERS += $$PWD/../../app/streaming/gpuperformancehold.h

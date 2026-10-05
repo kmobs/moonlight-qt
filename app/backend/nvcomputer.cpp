@@ -159,6 +159,9 @@ NvComputer::NvComputer(NvHTTP& http, QString serverInfo)
     bool validLink = false;
     const auto hostLink = NvHTTP::getXmlString(serverInfo, "PyroWaveHostLinkMbps").toUInt(&validLink);
     this->pyrowaveHostLinkMbps = validLink && hostLink <= 400000 ? hostLink : 0;
+    bool validCompressionVersion = false;
+    const auto compressionVersion = NvHTTP::getXmlString(serverInfo, "PyroWaveCompressionVersion").toUInt(&validCompressionVersion);
+    this->pyrowaveCompressionVersion = validCompressionVersion ? compressionVersion : 0;
 
     QString maxLumaPixelsHEVC = NvHTTP::getXmlString(serverInfo, "MaxLumaPixelsHEVC");
     if (!maxLumaPixelsHEVC.isEmpty()) {
@@ -572,6 +575,7 @@ bool NvComputer::update(const NvComputer& that)
     ASSIGN_IF_CHANGED(pairState);
     ASSIGN_IF_CHANGED(serverCodecModeSupport);
     ASSIGN_IF_CHANGED(pyrowaveHostLinkMbps);
+    ASSIGN_IF_CHANGED(pyrowaveCompressionVersion);
     ASSIGN_IF_CHANGED(frameLimiterSupported);
     ASSIGN_IF_CHANGED(frameLimiterEnabled);
     ASSIGN_IF_CHANGED(virtualDisplayFrameLimiterEnabled);

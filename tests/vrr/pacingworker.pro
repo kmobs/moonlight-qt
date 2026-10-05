@@ -32,7 +32,8 @@ win32 {
 
 macx {
     !disable-prebuilts {
-        INCLUDEPATH += $$PWD/../../libs/mac/include
+        INCLUDEPATH += $$PWD/../../libs/mac/include \
+                       $$PWD/../../libs/mac/include/SDL2
         LIBS += -L$$PWD/../../libs/mac/lib -lavutil.60 -lSDL2
     } else {
         CONFIG += link_pkgconfig

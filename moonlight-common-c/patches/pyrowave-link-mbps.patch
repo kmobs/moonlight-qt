@@ -1,0 +1,30 @@
+diff --git a/src/Limelight.h b/src/Limelight.h
+index 2d60637..55ab55e 100644
+--- a/src/Limelight.h
++++ b/src/Limelight.h
+@@ -104,6 +104,10 @@ typedef struct _STREAM_CONFIGURATION {
+     // Request independent PyroWave compression only after checking host support.
+     // Zero preserves the normal intra-only PyroWave stream.
+     int pyrowaveCompression;
++
++    // Routed client wired-link speed in Mbps, used by PyroWave host pacing.
++    // Zero means unknown; other codecs do not advertise this value.
++    int pyrowaveLinkMbps;
+ } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
+ 
+ // Use this function to zero the stream configuration when allocated on the stack or heap
+diff --git a/src/SdpGenerator.c b/src/SdpGenerator.c
+index 9d9f043..a7c1419 100644
+--- a/src/SdpGenerator.c
++++ b/src/SdpGenerator.c
+@@ -448,6 +448,10 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
+             if (StreamConfig.pyrowaveCompression) {
+                 err |= addAttributeString(&optionHead, "x-ss-video[0].pyrowaveCompression", "1");
+             }
++            if (StreamConfig.pyrowaveLinkMbps > 0) {
++                snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.pyrowaveLinkMbps);
++                err |= addAttributeString(&optionHead, "x-ss-video[0].pyrowaveLinkMbps", payloadStr);
++            }
+         }
+         else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
+             err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "2");

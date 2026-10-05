@@ -5,6 +5,7 @@
 
 #ifdef Q_OS_DARWIN
 #include <ApplicationServices/ApplicationServices.h>
+#include "video/ffmpeg-renderers/macdisplaytiming.h"
 #endif
 
 #ifdef Q_OS_WINDOWS
@@ -179,6 +180,16 @@ bool StreamUtils::tryGetDisplayRefreshRate(SDL_Window* window, int& outHz)
                      "Failed to get display refresh rate: window is null");
         return false;
     }
+
+#ifdef Q_OS_DARWIN
+    // ProMotion's current SDL mode can have no fixed refresh. Use the native
+    // presentation maximum, rather than qualifying adaptive pacing at 60 Hz.
+    const auto nativeTiming = queryMacDisplayTiming(window);
+    if (nativeTiming.hasValidTiming()) {
+        outHz = nativeTiming.maximumFramesPerSecond;
+        return true;
+    }
+#endif
 
     int displayIndex = SDL_GetWindowDisplayIndex(window);
     if (displayIndex < 0) {

@@ -5,8 +5,12 @@
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
+#ifdef Q_OS_DARWIN
+#include "video/ffmpeg-renderers/macdisplaytiming.h"
+#endif
 #include "streaming/vrrratepolicy.h"
 #include "backend/richpresencemanager.h"
+#include "streaming/gpuperformancehold.h"
 #include "backend/networkbuffers.h"
 
 #include <Limelight.h>
@@ -284,7 +288,8 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
                             bool testOnly, IVideoDecoder*& chosenDecoder,
                             bool enableVrr, bool preferVrrRenderer, int vrrDisplayRefreshHz,
                             [[maybe_unused]] bool* effectiveVrr, bool smoothVrrFrameTiming,
-                            bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint)
+                            bool gamescopeMailbox, int vrrLatencyMode, bool gamescopeRepaint,
+                            VrrTimingOptions vrrTimingOptions)
 {
     DECODER_PARAMETERS params = {};
 
@@ -306,6 +311,7 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     // it can match that renderer/color policy without starting VRR presentation.
     params.preferVrrRenderer = preferVrrRenderer || enableVrr;
     params.vrrLatencyMode = vrrLatencyMode;
+    params.vrrTimingOptions = vrrTimingOptions;
     params.gamescopeMailbox = gamescopeMailbox;
     params.gamescopeRepaint = gamescopeRepaint;
     params.smoothVrrFrameTiming = smoothVrrFrameTiming;
@@ -674,11 +680,20 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
                                                m_Preferences->framePacing;
     m_PresentationSettings.enableVrr = false;
     m_PresentationSettings.vrrLatencyMode = m_Preferences->vrrLatencyMode;
+    m_PresentationSettings.vrrTimingOptions = m_Preferences->vrrTimingOptions();
     m_PresentationSettings.gamescopeRepaint = false; // Retired repaint experiment.
     m_PresentationSettings.gamescopeMailbox = false; // Retired Mailbox experiment.
     m_PresentationSettings.smoothVrrFrameTiming = m_Preferences->smoothVrrFrameTiming;
 
     if (requestedVrr) {
+        bool hasAdaptiveDisplay = true;
+#ifdef Q_OS_DARWIN
+        hasAdaptiveDisplay = queryMacDisplayTiming(window).supportsVariableRefresh();
+        if (!hasAdaptiveDisplay) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "VRR disabled: the current Mac display has no variable-refresh range");
+        }
+#endif
         const bool hasAdaptiveHeadroom = hasStrictRefreshRate &&
             VrrRatePolicy::hasAdaptiveHeadroom(m_StreamConfig.fps,
                                                strictRefreshRate);
@@ -697,7 +712,7 @@ void Session::snapshotPresentationSettings(SDL_Window* window)
                         m_StreamConfig.fps, strictRefreshRate);
         }
         if (hasStrictRefreshRate && m_PresentationSettings.effectiveVsync &&
-                hasAdaptiveHeadroom) {
+                hasAdaptiveHeadroom && hasAdaptiveDisplay) {
             m_PresentationSettings.enableVrr = true;
             m_PresentationSettings.effectiveWindowMode = StreamingPreferences::WM_FULLSCREEN_DESKTOP;
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -772,6 +787,14 @@ bool Session::initialize(QQuickWindow* qtWindow)
         // https://github.com/moonlight-stream/moonlight-qt/issues/1211
         // https://github.com/moonlight-stream/moonlight-qt/issues/1218
         SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, shouldUseFullScreenSpaces ? "1" : "0");
+    }
+
+    // SDL caches this hint when its Cocoa video driver starts. Adaptive-Sync
+    // presentation needs native fullscreen, including on an external display;
+    // the saved window preference or notch override must not select the older
+    // borderless path for a requested VRR session.
+    if (m_Preferences->enableVrr && m_Preferences->enableVsync) {
+        SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "1");
     }
 #endif
 
@@ -1168,15 +1191,15 @@ bool Session::validateLaunch(SDL_Window* testWindow)
         }
         else {
             const int hostLinkMbps = int(m_Computer->pyrowaveHostLinkMbps);
-            if (hostLinkMbps > 0 && m_StreamConfig.bitrate > hostLinkMbps * 800) {
-                emitLaunchWarning(tr("PyroWave is set to %1 Mbps, but the host's %2 Mbps wired link leaves room for only about %3 Mbps of video. Lower the bitrate or run calibration.")
-                                  .arg(m_StreamConfig.bitrate / 1000).arg(hostLinkMbps).arg(hostLinkMbps * 8 / 10));
+            if (hostLinkMbps > 0 && m_StreamConfig.bitrate > hostLinkMbps * 1000) {
+                emitLaunchWarning(tr("PyroWave is set to %1 Mbps, but the host's %2 Mbps wired link carries at most %3 Mbps including FEC and headers. Lower the bitrate or run calibration.")
+                                  .arg(m_StreamConfig.bitrate / 1000).arg(hostLinkMbps).arg(hostLinkMbps));
             }
             const int clientLinkMbps = NetworkBuffers::routedWiredLinkMbps(
                 QHostAddress(m_Computer->activeAddress.address()));
-            if (clientLinkMbps > 0 && m_StreamConfig.bitrate > clientLinkMbps * 800) {
-                emitLaunchWarning(tr("PyroWave is set to %1 Mbps, but this PC's %2 Mbps wired link leaves room for only about %3 Mbps of video. Lower the bitrate or run calibration.")
-                                  .arg(m_StreamConfig.bitrate / 1000).arg(clientLinkMbps).arg(clientLinkMbps * 8 / 10));
+            if (clientLinkMbps > 0 && m_StreamConfig.bitrate > clientLinkMbps * 1000) {
+                emitLaunchWarning(tr("PyroWave is set to %1 Mbps, but this PC's %2 Mbps wired link carries at most %3 Mbps including FEC and headers. Lower the bitrate or run calibration.")
+                                  .arg(m_StreamConfig.bitrate / 1000).arg(clientLinkMbps).arg(clientLinkMbps));
             }
             const QString bufferWarning = NetworkBuffers::launchWarning();
             if (!bufferWarning.isEmpty()) {
@@ -1934,6 +1957,10 @@ bool Session::startConnectionAsync()
         return VrrReceiveDeadline::deadlineUs(rtpTimestamp, LiGetMicroseconds());
     });
 
+    if (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) {
+        m_StreamConfig.pyrowaveLinkMbps = NetworkBuffers::routedWiredLinkMbps(
+            QHostAddress(m_Computer->activeAddress.address()));
+    }
     int err = LiStartConnection(&hostInfo, &m_StreamConfig, &k_ConnCallbacks,
                                 &m_VideoCallbacks, &m_AudioCallbacks,
                                 NULL, 0, NULL, 0);
@@ -1996,6 +2023,10 @@ void Session::start()
             {"vrr_qualified", m_PresentationSettings.enableVrr},
             {"display_refresh_hz", m_PresentationSettings.refreshRate},
             {"latency_mode", m_PresentationSettings.vrrLatencyMode},
+            {"vrr_buffer_per_mille", m_PresentationSettings.vrrTimingOptions.bufferPerMille},
+            {"vrr_target_hundredths", m_PresentationSettings.vrrTimingOptions.targetHundredths},
+            {"vrr_history_seconds", m_PresentationSettings.vrrTimingOptions.historySeconds},
+            {"vrr_tolerance_us", m_PresentationSettings.vrrTimingOptions.toleranceUs},
             {"reduce_judder", m_PresentationSettings.smoothVrrFrameTiming}
         };
         QString error;
@@ -2211,8 +2242,12 @@ void Session::exec()
     // Start rich presence to indicate we're in game
     RichPresenceManager presence(*m_Preferences, m_App.name);
 
+    // Hold the display GPU at high-performance clocks if requested
+    GpuPerformanceHold gpuPerformance(m_Preferences->highPerformanceGpuPower);
+
     // Toggle the stats overlay if requested by the user
     m_OverlayManager.setOverlayState(Overlay::OverlayDebug, m_Preferences->showPerformanceOverlay);
+    m_OverlayManager.setTimingGraphState(m_Preferences->showFrametimeGraph);
 
     // Switch to async logging mode when we enter the SDL loop
     StreamUtils::enterAsyncLoggingMode();
@@ -2430,11 +2465,16 @@ void Session::exec()
 #endif
                 if (m_PresentationSettings.enableVrr && refreshMayHaveChanged) {
                     int currentRefreshRate = 0;
+                    bool adaptiveDisplayAvailable = true;
+#ifdef Q_OS_DARWIN
+                    adaptiveDisplayAvailable = queryMacDisplayTiming(m_Window).supportsVariableRefresh();
+#endif
                     if (!StreamUtils::tryGetDisplayRefreshRate(m_Window,
                                                                currentRefreshRate) ||
-                            currentRefreshRate != m_PresentationSettings.refreshRate) {
+                            currentRefreshRate != m_PresentationSettings.refreshRate ||
+                            !adaptiveDisplayAvailable) {
                         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR disabled for this session after display refresh changed or became unavailable; falling back to fixed pacing");
+                                    "VRR disabled for this session after display timing changed or became unavailable; falling back to fixed pacing");
                         m_PresentationSettings.enableVrr = false;
                         forceRecreation = true;
                     }
@@ -2534,7 +2574,8 @@ void Session::exec()
                                m_PresentationSettings.smoothVrrFrameTiming,
                                m_PresentationSettings.gamescopeMailbox,
                                m_PresentationSettings.vrrLatencyMode,
-                               m_PresentationSettings.gamescopeRepaint)) {
+                               m_PresentationSettings.gamescopeRepaint,
+                               m_PresentationSettings.vrrTimingOptions)) {
                 SDL_UnlockMutex(m_DecoderLock);
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "Failed to recreate decoder after reset");

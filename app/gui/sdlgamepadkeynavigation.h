@@ -2,6 +2,8 @@
 
 #include <QTimer>
 #include <QEvent>
+#include <QHash>
+#include <QPair>
 
 #include "SDL_compat.h"
 
@@ -43,4 +45,7 @@ private:
     bool m_FirstPoll;
     bool m_HasFocus;
     Uint32 m_LastAxisNavigationEventTime;
+    // Popups can change navigation mode during a button press. Its release
+    // must still match the key and modifiers sent for that same press.
+    QHash<quint64, QPair<Qt::Key, Qt::KeyboardModifiers>> m_PressedControllerKeys;
 };

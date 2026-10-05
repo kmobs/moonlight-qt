@@ -433,6 +433,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutAdaptiveOnly > 1) {
         return fail("playout_adaptive_only must be 0 or 1");
     }
+    if (value.nativeSynchronizedPresentation > 1) {
+        return fail("native_synchronized_presentation must be 0 or 1");
+    }
     if (value.latencyFixEnabled > 1 || value.latencyFixAllRates > 1 || value.latencyFixDelayPeriodPerMille > 1000) {
         return fail("latency_fix_enabled and latency_fix_all_rates must be 0 or 1 and latency_fix_delay_period_per_mille must be in 0..1000");
     }
@@ -481,9 +484,12 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutIntervalInitialMinimumSamples > 512) {
         return fail("initial interval calibration requires 250000..1000000 us and 2..512 samples");
     }
-    if (value.playoutResponsiveBuffer > 8 || (value.playoutResponsiveBuffer &&
+    if (value.playoutResponsiveBuffer > 9 || (value.playoutResponsiveBuffer &&
             (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
         return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
+    }
+    if (value.playoutHoldRenewBelowTarget > 3) {
+        return fail("playout_hold_renew_below_target revision must be 0..3");
     }
     if (value.playoutSourceMappingDecoderOutput > 1 ||
             value.playoutSerialServiceGate > 2 ||
@@ -523,6 +529,15 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutCatchupPerMille > 100) {
         return fail("playout_catchup_per_mille must be in 0..100");
     }
+    if (value.playoutIntervalToleranceUs != 0 &&
+            (value.playoutIntervalToleranceUs < 250 || value.playoutIntervalToleranceUs > 2000 ||
+             value.playoutIntervalToleranceUs % 250 != 0)) {
+        return fail("playout_interval_tolerance_us must be 0 (legacy) or 250..2000 in steps of 250");
+    }
+    if (value.playoutLateRecovery > 1 ||
+            (value.playoutLateRecovery && value.playoutCatchupPerMille == 0)) {
+        return fail("playout_late_recovery must be 0 or 1 and requires nonzero catchup");
+    }
     if (value.playoutSmoothingWindowedCadence > 2) {
         return fail("playout_smoothing_windowed_cadence must be in 0..2");
     }
@@ -542,6 +557,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutSmoothingResetSlewUs > 100000) {
         return fail("playout_smoothing_reset_slew_us must be in 0..100000");
+    }
+    if (value.playoutSmoothingReadinessBound > 1) {
+        return fail("playout_smoothing_readiness_bound must be 0 or 1");
     }
     if (value.playoutQueueFrames > VrrLargestQueuedFrames) {
         return fail("playout_queue_frames must be 0 (historical three) or at most the decoder-backed limit");

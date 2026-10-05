@@ -1,8 +1,142 @@
 #include "overlaymanager.h"
 #include "path.h"
 #include <exception>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <array>
 
 using namespace Overlay;
+
+namespace {
+// CPU rasterization runs on the overlay worker. All backends receive the same
+// composed surface through their current overlay upload path; no GPU API work
+// or text rendering happens on the frame path.
+// Draws the lanes above the optional stats text surface, which it consumes.
+SDL_Surface* composeTimingGraph(TTF_Font* font, SDL_Surface* text, const TimingGraphSnapshot& points, double scale)
+{
+    using Layout = TimingGraphLayout;
+    const size_t first = points.size() > size_t(Layout::Frames) ? points.size() - Layout::Frames : 0;
+    const size_t count = points.size() - first;
+    if (count < 2) return text;
+    const auto S = [scale](double value) { return int(std::lround(value * scale)); };
+
+    std::array<uint64_t, Layout::Frames> planned{};
+    size_t plannedCount = 0;
+    for (size_t i = first; i < points.size(); ++i) {
+        uint64_t interval;
+        if (timingGraphInterval(points, i, TimingGraphLane::Target, interval)) planned[plannedCount++] = interval;
+    }
+    uint64_t nominal = 8333;
+    if (plannedCount) {
+        auto middle = planned.begin() + plannedCount / 2;
+        std::nth_element(planned.begin(), middle, planned.begin() + plannedCount);
+        nominal = *middle; // Axis placement only; plotted intervals stay raw.
+    }
+    const double minimum = std::max(0.0, double(nominal) - Layout::RadiusUs);
+    const double maximum = double(nominal) + Layout::RadiusUs;
+
+    const int textWidth = text ? text->w : 0, textHeight = text ? text->h : 0;
+    const int width = std::max(textWidth, S(Layout::Width)), height = S(Layout::Height);
+    auto surface = SDL_CreateRGBSurfaceWithFormat(0, width, textHeight + height, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!surface) return text;
+    SDL_FillRect(surface, nullptr, 0);
+    if (text) {
+        SDL_Rect textPosition{0, height, text->w, text->h};
+        SDL_BlitSurface(text, nullptr, surface, &textPosition);
+        SDL_FreeSurface(text);
+    }
+    SDL_Rect background{0, 0, S(Layout::Width), height};
+    SDL_FillRect(surface, &background, SDL_MapRGBA(surface->format, 8, 12, 18, 235));
+
+    const SDL_Color planColor{190, 198, 210, 255}, submitColor{65, 215, 250, 255};
+    const SDL_Color displayColor{245, 110, 220, 255}, labelColor{225, 230, 235, 255};
+    const SDL_Color gridColor{45, 53, 65, 255}, referenceColor{105, 113, 125, 255}, clipColor{255, 95, 65, 255};
+    const auto label = [&](const char* value, int x, int y, SDL_Color c) {
+        auto words = TTF_RenderUTF8_Blended(font, value, c);
+        if (words) { SDL_Rect dest{x, y, words->w, words->h}; SDL_BlitSurface(words, nullptr, surface, &dest); SDL_FreeSurface(words); }
+    };
+    const auto line = [&](int x0, int y0, int x1, int y1, SDL_Color c, int thickness = 1) {
+        const Uint32 pixel = SDL_MapRGBA(surface->format, c.r, c.g, c.b, c.a);
+        const int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+        int error = dx + dy;
+        for (;;) {
+            for (int stroke = 0; stroke < thickness; ++stroke) {
+                const int y = y0 + stroke;
+                if (x0 >= 0 && x0 < surface->w && y >= 0 && y < height)
+                    reinterpret_cast<Uint32*>(static_cast<Uint8*>(surface->pixels) + y * surface->pitch)[x0] = pixel;
+            }
+            if (x0 == x1 && y0 == y1) break;
+            const int twice = 2 * error;
+            if (twice >= dy) { error += dy; x0 += sx; }
+            if (twice <= dx) { error += dx; y0 += sy; }
+        }
+    };
+
+    char caption[160];
+    std::snprintf(caption, sizeof(caption), "Frametimes: %zu frames, reference %.2f ms", count, nominal / 1000.0);
+    label(caption, S(10), S(4), labelColor);
+    label("ms", S(14), S(28), labelColor);
+
+    const int left = S(Layout::Left), right = S(Layout::Width - Layout::RightMargin);
+    const int stroke = std::max(1, S(1.5));
+    const auto xAt = [&](size_t i) {
+        return left + int((i - first + Layout::Frames - count) * size_t(right - left) / (Layout::Frames - 1));
+    };
+    const TimingGraphLane lanes[Layout::Lanes] = {TimingGraphLane::Target, TimingGraphLane::Submit, TimingGraphLane::Display};
+    const SDL_Color colors[Layout::Lanes] = {planColor, submitColor, displayColor};
+    const char* names[Layout::Lanes] = {"Planned cadence", "Client submissions", "Display events"};
+    for (int lane = 0; lane < Layout::Lanes; ++lane) {
+        const int top = S(Layout::plotTop(lane)), bottom = S(Layout::plotBottom(lane));
+        const auto yAt = [&](double v) {
+            return int(std::lround(bottom - (std::clamp(v, minimum, maximum) - minimum) / (maximum - minimum) * (bottom - top)));
+        };
+        size_t valid = 0;
+        double latest = 0, peak = 0;
+        for (size_t i = first; i < points.size(); ++i) {
+            uint64_t interval;
+            if (!timingGraphInterval(points, i, lanes[lane], interval)) continue;
+            latest = double(interval); peak = std::max(peak, latest); ++valid;
+        }
+        if (!valid) std::snprintf(caption, sizeof(caption), "%s: unavailable", names[lane]);
+        else if (lanes[lane] == TimingGraphLane::Display)
+            std::snprintf(caption, sizeof(caption), "%s: %.2f ms, %zu matched, peak %.2f", names[lane], latest / 1000.0, valid, peak / 1000.0);
+        else std::snprintf(caption, sizeof(caption), "%s: %.2f ms, peak %.2f", names[lane], latest / 1000.0, peak / 1000.0);
+        label(caption, left, S(Layout::titleTop(lane)), colors[lane]);
+        for (int tick = 0; tick <= 2; ++tick) {
+            const double v = minimum + (maximum - minimum) * tick / 2;
+            const int y = yAt(v);
+            line(left, y, right, y, gridColor);
+            char number[32]; std::snprintf(number, sizeof(number), "%.1f", v / 1000.0);
+            label(number, S(8), y - S(8), labelColor);
+        }
+        const int referenceY = yAt(double(nominal));
+        for (int x = left; x < right; x += S(8)) line(x, referenceY, std::min(x + S(3), right), referenceY, referenceColor);
+
+        bool havePrevious = false;
+        int previousX = 0, previousY = 0;
+        for (size_t i = first; i < points.size(); ++i) {
+            uint64_t interval;
+            if (!timingGraphInterval(points, i, lanes[lane], interval)) { havePrevious = false; continue; }
+            const double v = double(interval);
+            const bool flat = std::abs(v - double(nominal)) <= Layout::FlatUs;
+            const int x = xAt(i), y = yAt(flat ? double(nominal) : v);
+            if (havePrevious) line(previousX, previousY, x, y, colors[lane], stroke);
+            else line(x, y, x + 1, y, colors[lane], stroke);
+            if (v < minimum || v > maximum) {
+                const int inward = v > maximum ? S(4) : -S(4);
+                line(x - S(3), y, x, y + inward, clipColor);
+                line(x, y + inward, x + S(3), y, clipColor);
+            }
+            previousX = x; previousY = y; havePrevious = true;
+        }
+    }
+    label("Flat within 1 ms. Red: clipped. Gaps: no OS feedback.", left, height - S(26), labelColor);
+    return surface;
+}
+
+}
 
 OverlayManager::OverlayManager() :
     m_Renderer(nullptr),
@@ -64,6 +198,34 @@ bool OverlayManager::isOverlayEnabled(OverlayType type)
     return m_Overlays[type].enabled;
 }
 
+bool OverlayManager::isStatsEnabled()
+{
+    std::lock_guard<std::mutex> lock(m_StateLock);
+    return m_StatsEnabled;
+}
+
+bool OverlayManager::isTimingGraphEnabled()
+{
+    std::lock_guard<std::mutex> lock(m_StateLock);
+    return m_TimingGraphEnabled;
+}
+
+void OverlayManager::setTimingGraphState(bool enabled)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_StateLock);
+        if (m_TimingGraphEnabled == enabled) return;
+        m_TimingGraphEnabled = enabled;
+        if (!enabled) m_TimingGraph.reset();
+        auto& overlay = m_Overlays[OverlayDebug];
+        overlay.enabled = m_StatsEnabled || m_TimingGraphEnabled;
+        ++overlay.revision;
+        overlay.dirty = true;
+        overlay.queued = std::chrono::steady_clock::now();
+    }
+    m_WorkReady.notify_one();
+}
+
 void OverlayManager::setStatusMessage(StatusSource source, const std::string& text)
 {
     {
@@ -95,14 +257,32 @@ std::string OverlayManager::getOverlayText(OverlayType type)
     return m_Overlays[type].text;
 }
 
-void OverlayManager::updateOverlayText(OverlayType type, const char* text)
+void OverlayManager::updateOverlayText(OverlayType type, const char* text, TimingGraphSnapshot graph)
 {
+    const auto snapshot = graph.empty() ? nullptr : std::make_shared<const TimingGraphSnapshot>(std::move(graph));
     {
         std::lock_guard<std::mutex> lock(m_StateLock);
         auto& overlay = m_Overlays[type];
+        if (type == OverlayDebug && m_TimingGraphEnabled) m_TimingGraph = snapshot;
         SDL_utf8strlcpy(overlay.text, text, sizeof(overlay.text));
         ++overlay.revision;
         overlay.dirty = overlay.dirty || overlay.enabled;
+        overlay.queued = std::chrono::steady_clock::now();
+    }
+    m_WorkReady.notify_one();
+}
+
+void OverlayManager::updateTimingGraph(TimingGraphSnapshot graph)
+{
+    if (graph.empty()) return;
+    auto snapshot = std::make_shared<const TimingGraphSnapshot>(std::move(graph));
+    {
+        std::lock_guard<std::mutex> lock(m_StateLock);
+        auto& overlay = m_Overlays[OverlayDebug];
+        if (!m_TimingGraphEnabled) return;
+        m_TimingGraph = std::move(snapshot);
+        ++overlay.revision;
+        overlay.dirty = true;
         overlay.queued = std::chrono::steady_clock::now();
     }
     m_WorkReady.notify_one();
@@ -115,7 +295,24 @@ int OverlayManager::getOverlayMaxTextLength()
 
 int OverlayManager::getOverlayFontSize(OverlayType type)
 {
+    std::lock_guard<std::mutex> lock(m_StateLock);
     return m_Overlays[type].fontSize;
+}
+
+void OverlayManager::setOutputSize(int width, int height)
+{
+    if (width <= 0 || height <= 0) return;
+    const int fontSize = std::max(width, height) >= 3840 && std::min(width, height) >= 2160 ? 26 : 20;
+    {
+        std::lock_guard<std::mutex> lock(m_StateLock);
+        auto& stats = m_Overlays[OverlayDebug];
+        if (stats.fontSize == fontSize) return;
+        stats.fontSize = fontSize;
+        ++stats.revision;
+        stats.dirty = true;
+        stats.queued = std::chrono::steady_clock::now();
+    }
+    m_WorkReady.notify_one();
 }
 
 SDL_Surface* OverlayManager::getUpdatedOverlaySurface(OverlayType type)
@@ -128,8 +325,15 @@ void OverlayManager::setOverlayState(OverlayType type, bool enabled)
     {
         std::lock_guard<std::mutex> lock(m_StateLock);
         auto& overlay = m_Overlays[type];
-        if (overlay.enabled == enabled) return;
-        overlay.enabled = enabled;
+        if (type == OverlayDebug) {
+            if (m_StatsEnabled == enabled) return;
+            m_StatsEnabled = enabled;
+            overlay.enabled = m_StatsEnabled || m_TimingGraphEnabled;
+        }
+        else {
+            if (overlay.enabled == enabled) return;
+            overlay.enabled = enabled;
+        }
         if (!enabled) overlay.text[0] = 0;
         ++overlay.revision;
         overlay.dirty = true;
@@ -167,10 +371,13 @@ void OverlayManager::run()
     using Clock = std::chrono::steady_clock;
     auto ns = [](Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); };
     unsigned next = 0;
+    std::array<int, OverlayMax> rasterFontSizes{}; // Worker-owned font cache sizes.
     for (;;) {
         OverlayType type;
         char text[1024];
-        bool enabled;
+        bool enabled, drawText;
+        int fontSize;
+        std::shared_ptr<const TimingGraphSnapshot> graph;
         uint64_t revision;
         Clock::time_point queued;
         {
@@ -190,21 +397,32 @@ void OverlayManager::run()
             auto& overlay = m_Overlays[type];
             overlay.dirty = false;
             enabled = overlay.enabled;
+            drawText = enabled && overlay.text[0] && (type != OverlayDebug || m_StatsEnabled);
+            fontSize = overlay.fontSize;
             revision = overlay.revision;
             queued = overlay.queued;
             SDL_memcpy(text, overlay.text, sizeof(text));
+            if (type == OverlayDebug && m_TimingGraphEnabled) graph = m_TimingGraph;
         }
         const auto started = Clock::now();
         auto& overlay = m_Overlays[type];
         SDL_Surface* surface = nullptr;
-        if (enabled && text[0]) {
-            if (!overlay.font && !m_FontData.isEmpty()) {
-                overlay.font = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()),
-                                              1, overlay.fontSize);
+        const bool drawGraph = enabled && graph && graph->size() >= 2;
+        if (drawText || drawGraph) {
+            if ((!overlay.font || rasterFontSizes[type] != fontSize) && !m_FontData.isEmpty()) {
+                auto resized = TTF_OpenFontRW(SDL_RWFromConstMem(m_FontData.constData(), m_FontData.size()), 1, fontSize);
+                if (!resized) continue;
+                if (overlay.font) TTF_CloseFont(overlay.font);
+                overlay.font = resized;
+                rasterFontSizes[type] = fontSize;
             }
-            if (overlay.font) surface = RenderTextOutlinedWrapped(overlay.font, text, overlay.color,
-                                                                  {0, 0, 0, 255}, 4, 1024);
-            if (!surface) continue; // Keep the last successful overlay on failure.
+            const double scale = type == OverlayDebug ? fontSize / 20.0 : 1.0;
+            if (drawText) {
+                if (overlay.font) surface = RenderTextOutlinedWrapped(overlay.font, text, overlay.color,
+                                                                      {0, 0, 0, 255}, int(std::lround(4 * scale)), int(std::lround(1024 * scale)));
+                if (!surface) continue; // Keep the last successful overlay on failure.
+            }
+            if (drawGraph && overlay.font) surface = composeTimingGraph(overlay.font, surface, *graph, scale);
         }
         const auto rasterized = Clock::now();
         std::lock_guard<std::mutex> rendererLock(m_RendererLock);

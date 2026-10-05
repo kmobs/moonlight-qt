@@ -23,10 +23,11 @@ enum class VrrFallbackReason : uint8_t {
 };
 
 enum class VrrNativePresentationBackend : uint8_t {
-    Unknown,
-    Dxgi,
-    Vulkan,
-    Composition,
+    Unknown = 0,
+    Dxgi = 1,
+    Vulkan = 2,
+    Composition = 3,
+    Metal = 4,
 };
 
 // Observation-only D3DKMT raster sample bracketed on the Moonlight clock.
@@ -78,8 +79,10 @@ struct VrrPresentFeedback {
     uint64_t submissionTimeUs = 0;
     // Backend and signed native result for the actual presentation call.
     // Both validity flags are set whenever that call was attempted, including
-    // cancellation and failure paths. Vulkan's libplacebo wrapper exposes
-    // only a boolean result, represented as 0 for success and -1 for failure.
+    // cancellation and failure paths. Vulkan's libplacebo wrapper and Metal
+    // expose acceptance as 0 for success and -1 for failure. DXGI parameters,
+    // capability snapshots and native query results remain unavailable for
+    // Metal; its submission IDs are local serials rather than DXGI queries.
     bool nativeBackendValid = false;
     VrrNativePresentationBackend nativeBackend =
         VrrNativePresentationBackend::Unknown;
@@ -346,6 +349,14 @@ public:
     // the controller's software floor. A latch request must never recreate the
     // swapchain or replace an acquired image to change presentation mode.
     virtual bool canLatchAdaptivePresent() const
+    {
+        return false;
+    }
+
+    // The native path synchronizes every present, rather than selecting
+    // tearing or synchronization per frame. Resolve this once at worker
+    // construction so scheduling, feedback and exact replay agree.
+    virtual bool alwaysSynchronizesAdaptivePresent() const
     {
         return false;
     }

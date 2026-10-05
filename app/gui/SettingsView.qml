@@ -1,6 +1,6 @@
 import QtQuick 2.9
 import QtQuick.Controls 2.2
-import QtQuick.Layouts 1.2
+import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
 
 import StreamingPreferences 1.0
@@ -733,7 +733,7 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 8000
                     ToolTip.visible: hovered && slider.pyroWave
-                    ToolTip.text: qsTr("PyroWave is an intra-only GPU wavelet codec. It needs a wired connection with hundreds of Mbps to spare and a host with PyroWave support; other hosts fall back to H.264. On Linux, GPU readback and upload may limit frame rate.")
+                    ToolTip.text: qsTr("PyroWave is a GPU wavelet codec. It needs a wired connection with hundreds of Mbps to spare and a host with PyroWave support; other hosts fall back to H.264. On Linux, GPU readback and upload may limit frame rate.")
                 }
 
                 CheckBox {
@@ -893,51 +893,125 @@ Flickable {
                     }
                 }
 
-                Column {
-                    width: parent.width
-                    spacing: 5
+                Button {
+                    objectName: "pyrowaveCalibrationOpen"
+                    text: qsTr("Calibrate PyroWave…")
                     visible: SystemProperties.hasPyroWave && slider.pyroWave
-
-                    ComboBox {
-                        id: calibrationHost
-                        width: parent.width
-                        model: calibrationHosts
-                        textRole: "name"
-                        enabled: !PyroWaveCalibrator.running
-                    }
-
-                    Button {
-                        text: qsTr("Calibrate PyroWave")
-                        enabled: !PyroWaveCalibrator.running && calibrationHost.currentIndex >= 0
-                        onClicked: {
-                            calibrationDialog.testFps = StreamingPreferences.fps
-                            calibrationDialog.open()
-                            // Each test frame is drawn at this screen's size, as a stream would be
-                            PyroWaveCalibrator.start(ComputerManager,
-                                                     calibrationHosts.uuidAt(calibrationHost.currentIndex),
-                                                     calibrationDialog.testFps,
-                                                     Math.round(Screen.width * Screen.devicePixelRatio),
-                                                     Math.round(Screen.height * Screen.devicePixelRatio))
-                        }
-                    }
-
-                    Label {
-                        width: parent.width
-                        wrapMode: Text.Wrap
-                        text: qsTr("Tests bandwidth from the selected host to this PC, then finds a bitrate this device can decode and draw smoothly at your frame rate. Takes about two minutes. Click a result to use it.")
-                    }
+                    enabled: !PyroWaveCalibrator.running
+                    onClicked: calibrationDialog.open()
                 }
 
                 NavigableDialog {
                     id: calibrationDialog
+                    objectName: "pyrowaveCalibrationDialog"
+                    property int step: 0
+                    property int targetIndex: 1
+                    property bool decoderWasRunning: false
                     property int testFps: 60
-                    title: qsTr("PyroWave calibration — %1 FPS").arg(testFps)
-                    width: Math.min(settingsPage.width - 24, 860)
-                    height: Math.min(settingsPage.height - 24, 640)
-                    standardButtons: Dialog.Close
+                    property int testedTarget: -1
+                    property string testedHostUuid: ""
+                    property bool hasStarted: false
+                    property bool stopRequested: false
+                    readonly property int selectedTarget: targets[targetIndex].value
+                    readonly property string selectedHostUuid: calibrationHost.currentIndex >= 0 ? calibrationHosts.uuidAt(calibrationHost.currentIndex) : ""
+                    readonly property bool resultsMatch: hasStarted && testedTarget === selectedTarget && testedHostUuid === selectedHostUuid
+                    readonly property var targets: [
+                        { text: qsTr("Minimum"), summary: qsTr("Half recommendation"), value: PyroWaveCalibrator.Minimum,
+                          description: qsTr("Half the developer's recommended image bitrate. Uses less bandwidth.") },
+                        { text: qsTr("Recommended"), summary: qsTr("Developer choice"), value: PyroWaveCalibrator.Recommended,
+                          description: qsTr("The developer's recommended image bitrate for each format.") },
+                        { text: qsTr("Moderate"), summary: qsTr("60% of measured link"), value: PyroWaveCalibrator.Moderate,
+                          description: qsTr("Use up to 60% of the measured bandwidth, including overhead.") },
+                        { text: qsTr("Maximum"), summary: qsTr("Full measured budget"), value: PyroWaveCalibrator.Maximum,
+                          description: qsTr("Find the highest tested bitrate the connection and this device can sustain, with network headroom.") }
+                    ]
+                    readonly property bool canContinue: resultsMatch && PyroWaveCalibrator.bandwidthReady
+                    title: step === 0 ? qsTr("1 of 2 · Connection & quality") : qsTr("2 of 2 · Decoder stress test")
+                    width: Math.min(settingsPage.width - 24, step === 0 ? 850 : 1100)
+                    height: Math.min(settingsPage.height - 24, step === 0 ? 480 : 760)
+                    standardButtons: Dialog.NoButton
+                    focus: true
+                    background: Rectangle {
+                        color: "#303030"
+                        radius: 12
+                        border.color: "#606060"
+                    }
+                    onAboutToShow: {
+                        PyroWaveCalibrator.reset()
+                        step = 0
+                        if (calibrationHost.count > 0 && calibrationHost.currentIndex < 0) calibrationHost.currentIndex = 0
+                        decoderWasRunning = false
+                        testFps = StreamingPreferences.fps
+                        testedTarget = -1
+                        hasStarted = false
+                        stopRequested = false
+                    }
+                    onOpened: { SdlGamepadKeyNavigation.setUiNavMode(true); focusTarget() }
+                    onAboutToHide: PyroWaveCalibrator.reset()
 
-                    // Finished results stay; the format being tested is abandoned
-                    onAboutToHide: PyroWaveCalibrator.cancel()
+                    function focusTarget() {
+                        var card = calibrationTargets.itemAt(targetIndex)
+                        if (card) card.forceActiveFocus(Qt.TabFocusReason)
+                    }
+                    function changeTarget(index) {
+                        if (PyroWaveCalibrator.running) return
+                        targetIndex = Math.max(0, Math.min(targets.length - 1, index))
+                        focusTarget()
+                    }
+                    function nextStep() {
+                        if (!canContinue) return
+                        step = 1
+                        stopRequested = false
+                        PyroWaveCalibrator.startDecoderTest(testedHostUuid, testedTarget)
+                        calibrationRunButton.forceActiveFocus(Qt.TabFocusReason)
+                    }
+                    Connections {
+                        target: PyroWaveCalibrator
+                        function onChanged() {
+                            if (calibrationDialog.step !== 1 || !calibrationDialog.opened) return
+                            if (PyroWaveCalibrator.running) calibrationDialog.decoderWasRunning = true
+                            else if (calibrationDialog.decoderWasRunning) {
+                                calibrationDialog.decoderWasRunning = false
+                                Qt.callLater(function() {
+                                    if (calibrationDialog.opened && calibrationDialog.step === 1 && !PyroWaveCalibrator.running)
+                                        calibrationDialog.focusOption(0, 0, 1)
+                                })
+                            }
+                        }
+                    }
+
+                    function testTarget() {
+                        if (PyroWaveCalibrator.running || calibrationHost.currentIndex < 0) return
+                        testedTarget = selectedTarget
+                        testedHostUuid = selectedHostUuid
+                        hasStarted = true
+                        stopRequested = false
+                        PyroWaveCalibrator.start(ComputerManager,
+                                                 testedHostUuid,
+                                                 testFps,
+                                                 Math.round(Screen.width * Screen.devicePixelRatio),
+                                                 Math.round(Screen.height * Screen.devicePixelRatio),
+                                                 testedTarget)
+                        calibrationRunButton.forceActiveFocus(Qt.TabFocusReason)
+                    }
+
+                    function focusOption(row, mode, direction) {
+                        // Up/down follows one chroma column; left/right changes
+                        // chroma without changing HDR/SDR. Skip unavailable formats.
+                        var chroma = mode < 2 ? 0 : 2
+                        var position = row * 2 + mode % 2
+                        for (var attempt = 0; attempt < rows.length * 2; ++attempt) {
+                            if (position < 0) { calibrationRunButton.forceActiveFocus(Qt.TabFocusReason); return }
+                            if (position >= rows.length * 2) { calibrationCloseButton.forceActiveFocus(Qt.TabFocusReason); return }
+                            var rowItem = calibrationRows.itemAt(Math.floor(position / 2))
+                            var columnItem = rowItem ? rowItem.columns.itemAt(chroma / 2) : null
+                            var button = columnItem ? columnItem.formats.itemAt(position % 2) : null
+                            if (button && button.enabled) { button.forceActiveFocus(Qt.TabFocusReason); return }
+                            if (!direction) return
+                            position += direction
+                        }
+                        calibrationCloseButton.forceActiveFocus(Qt.TabFocusReason)
+                    }
 
                     readonly property var rows: (Qt.platform.os === "linux" ? [
                         { name: "4K", width: 3840, height: 2160 },
@@ -951,7 +1025,7 @@ Flickable {
                         { name: "1080p", width: 1920, height: 1080 },
                         { name: "720p", width: 1280, height: 720 }
                     ])
-                    readonly property var samples: PyroWaveCalibrator.results
+                    readonly property var samples: resultsMatch ? PyroWaveCalibrator.results : []
                     readonly property var tierColors: ({
                         "any": "#66bb6a",
                         "vrr": "#ffca28",
@@ -972,7 +1046,7 @@ Flickable {
                     }
 
                     function canApply(option) {
-                        return option && option.valid && !hdrUnavailable(option)
+                        return step === 1 && !PyroWaveCalibrator.running && resultsMatch && option && option.valid && !hdrUnavailable(option)
                     }
 
                     function headline(option, hdr) {
@@ -982,12 +1056,11 @@ Flickable {
                     }
 
                     function tierText(option) {
-                        if (!option) return PyroWaveCalibrator.running ? qsTr("Testing…") : "—"
+                        if (!option) return PyroWaveCalibrator.running ? qsTr("Testing…") : qsTr("Not tested")
                         if (option.tier === "error") return option.error
-                        if (option.tier === "slow") return qsTr("Can't keep up")
                         if (hdrUnavailable(option)) return qsTr("No HDR display")
-                        var text = option.tier === "any" ? qsTr("Any display") :
-                                   option.tier === "vrr" ? qsTr("Needs VRR") : qsTr("Needs VRR · Smooth mode")
+                        var text = option.tier === "slow" ? qsTr("Can't keep up") : option.tier === "any" ? qsTr("Any display") :
+                                   option.tier === "vrr" ? qsTr("Needs VRR") : qsTr("VRR · Smooth")
                         if (option.quality === "reduced") text += " · " + qsTr("Reduced quality")
                         else if (option.quality === "low") text += " · " + qsTr("Low quality")
                         return text
@@ -1005,22 +1078,21 @@ Flickable {
 
                     function optionDetail(option) {
                         if (!option || !option.valid) return ""
-                        if (!option.keepsUp) {
-                            return frameCost(option) + " " +
-                                    qsTr("A lower bitrate doesn't make this device fast enough, so the stream will stutter or fall behind. You can still use it.")
-                        }
                         var details = [frameCost(option)]
+                        if (!option.keepsUp) {
+                            details.push(qsTr("A lower bitrate doesn't make this device fast enough, so the stream will stutter or fall behind. You can still use it."))
+                        }
                         if (option.tier === "vrr") {
                             details.push(qsTr("With VRR the occasional slow frame is shown slightly late; on a fixed-refresh display it would stutter."))
                         }
                         else if (option.tier === "vrrLarge") {
                             details.push(qsTr("Slow frames use nearly the whole frame, so only the Smooth VRR latency mode's larger buffer hides them; other modes and fixed-refresh displays would stutter."))
                         }
-                        details.push(qsTr("%1 Mbps reaches %2 dB on the codec author's quality scale; he recommends %3 Mbps (35 dB) for this format.")
-                                     .arg(option.bitrateKbps / 1000).arg(option.qualityDb.toFixed(1))
+                        details.push(qsTr("%1 Mbps of image data reaches %2 dB on the codec author's quality scale; he recommends %3 Mbps of image data (35 dB) for this format. The applied rate includes FEC and packet overhead.")
+                                     .arg(option.imageKbps / 1000).arg(option.qualityDb.toFixed(1))
                                      .arg(option.guideKbps / 1000))
                         if (option.deviceLimited) details.push(qsTr("The bitrate was lowered so this device keeps up."))
-                        else if (option.linkLimited) details.push(qsTr("The bitrate is capped by this device's network link."))
+                        if (option.linkLimited) details.push(qsTr("The tested network budget limits the image bitrate for this target."))
                         return details.join(" ")
                     }
 
@@ -1066,140 +1138,494 @@ Flickable {
                         close()
                     }
 
-                    contentItem: Flickable {
-                        clip: true
-                        contentWidth: width
-                        contentHeight: calibrationTable.height
-
-                        Column {
-                            id: calibrationTable
-                            width: parent.width
-                            spacing: 4
-
-                            Label {
-                                width: parent.width
-                                wrapMode: Text.Wrap
-                                text: PyroWaveCalibrator.message
-                            }
-
-                            Label {
-                                width: parent.width
-                                wrapMode: Text.Wrap
-                                font.pointSize: 9
-                                text: PyroWaveCalibrator.linkSummary + " " +
-                                      qsTr("The bandwidth test is a bulk transfer; a live stream can still encounter packet loss or congestion. Clicking a format applies the bitrate shown.")
-                            }
-
-                            Repeater {
-                                model: [
-                                    { tier: "any", text: qsTr("Any display: 99% of frames use at most 60% of each frame, leaving room for a live stream's extra work with or without VRR.") },
-                                    { tier: "vrr", text: qsTr("Needs VRR: slow frames use up to 80% of each frame. VRR hides the occasional late one; a fixed-refresh display may stutter.") },
-                                    { tier: "vrrLarge", text: qsTr("Needs VRR · Smooth mode: slow frames use nearly the whole frame. Only the Smooth VRR latency mode's larger buffer hides them.") },
-                                    { tier: "slow", text: qsTr("Can't keep up: at %1 FPS, more than 1 frame in 100 takes longer than a frame to decode and draw. Expect stutter; it can still be selected.").arg(calibrationDialog.testFps) }
-                                ]
-                                delegate: Row {
-                                    spacing: 6
-                                    Rectangle {
-                                        width: 10
-                                        height: 10
-                                        radius: 5
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        color: calibrationDialog.tierColors[modelData.tier]
+                    footer: Pane {
+                        padding: 12
+                        contentItem: RowLayout {
+                            spacing: 8
+                            Button {
+                                id: calibrationRunButton
+                                objectName: "pyrowaveCalibrationRun"
+                                text: PyroWaveCalibrator.running ? (calibrationDialog.stopRequested ? qsTr("Stopping…") : qsTr("Stop test")) :
+                                      calibrationDialog.step === 0 ? qsTr("Test bandwidth") : qsTr("Test decoder again")
+                                enabled: PyroWaveCalibrator.running ? !calibrationDialog.stopRequested :
+                                         calibrationDialog.step === 0 ? calibrationHost.currentIndex >= 0 : calibrationDialog.canContinue
+                                implicitHeight: 44
+                                highlighted: calibrationDialog.step === 0 && !calibrationDialog.canContinue
+                                onClicked: {
+                                    if (PyroWaveCalibrator.running) {
+                                        calibrationDialog.stopRequested = true
+                                        PyroWaveCalibrator.cancel()
                                     }
-                                    Label {
-                                        width: calibrationTable.width - 16
-                                        wrapMode: Text.Wrap
-                                        font.pointSize: 9
+                                    else if (calibrationDialog.step === 0) calibrationDialog.testTarget()
+                                    else {
+                                        calibrationDialog.stopRequested = false
+                                        PyroWaveCalibrator.startDecoderTest(calibrationDialog.testedHostUuid, calibrationDialog.testedTarget)
+                                    }
+                                }
+                                Keys.onPressed: function(event) {
+                                    if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up ||
+                                            (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+                                        if (calibrationDialog.step === 0 && !PyroWaveCalibrator.running) calibrationDialog.focusTarget()
+                                        else calibrationCloseButton.forceActiveFocus(Qt.TabFocusReason)
+                                    }
+                                    else if (event.key === Qt.Key_Right && calibrationDialog.step === 1) {
+                                        calibrationDetails.forceActiveFocus(Qt.TabFocusReason)
+                                    }
+                                    else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Down || event.key === Qt.Key_Right) {
+                                        if (calibrationDialog.step === 1) calibrationDialog.focusOption(0, 0, 1)
+                                        else if (calibrationNextButton.enabled) calibrationNextButton.forceActiveFocus(Qt.TabFocusReason)
+                                        else calibrationCloseButton.forceActiveFocus(Qt.TabFocusReason)
+                                    }
+                                    else return
+                                    event.accepted = true
+                                }
+                            }
+                            Button {
+                                id: calibrationDetails
+                                objectName: "pyrowaveCalibrationDetails"
+                                visible: calibrationDialog.step === 1
+                                text: qsTr("About results")
+                                checkable: true
+                                implicitHeight: 44
+                                KeyNavigation.left: calibrationRunButton
+                                KeyNavigation.right: calibrationCloseButton.enabled ? calibrationCloseButton : calibrationRunButton
+                                KeyNavigation.backtab: calibrationRunButton
+                                Keys.onTabPressed: calibrationDialog.focusOption(0, 0, 1)
+                                Keys.onDownPressed: calibrationDialog.focusOption(0, 0, 1)
+                            }
+                            Item { Layout.fillWidth: true }
+                            Button {
+                                id: calibrationCloseButton
+                                objectName: "pyrowaveCalibrationBack"
+                                text: calibrationDialog.step === 0 ? qsTr("Cancel") : qsTr("Back")
+                                enabled: calibrationDialog.step === 0 || !PyroWaveCalibrator.running
+                                implicitHeight: 44
+                                onClicked: {
+                                    if (calibrationDialog.step === 0) calibrationDialog.close()
+                                    else { calibrationDialog.step = 0; calibrationDialog.focusTarget() }
+                                }
+                                Keys.onTabPressed: {
+                                    if (calibrationDialog.step === 0 && !PyroWaveCalibrator.running) calibrationHost.forceActiveFocus(Qt.TabFocusReason)
+                                    else calibrationRunButton.forceActiveFocus(Qt.TabFocusReason)
+                                }
+                            }
+                            Button {
+                                id: calibrationNextButton
+                                objectName: "pyrowaveCalibrationNext"
+                                text: qsTr("Next →")
+                                visible: calibrationDialog.step === 0
+                                enabled: calibrationDialog.canContinue
+                                implicitHeight: 44
+                                highlighted: true
+                                onClicked: calibrationDialog.nextStep()
+                                KeyNavigation.backtab: calibrationRunButton
+                                KeyNavigation.tab: calibrationCloseButton
+                                KeyNavigation.left: calibrationRunButton
+                            }
+                        }
+                    }
+
+                    contentItem: StackLayout {
+                        currentIndex: calibrationDialog.step
+                        ColumnLayout {
+                            spacing: 12
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Label { text: qsTr("Host") }
+                                AutoResizingComboBox {
+                                    id: calibrationHost
+                                    objectName: "pyrowaveCalibrationHost"
+                                    Layout.fillWidth: true
+                                    model: calibrationHosts
+                                    textRole: "name"
+                                    onCountChanged: { if (count > 0 && currentIndex < 0) currentIndex = 0 }
+                                    displayText: count > 0 ? currentText : qsTr("No hosts available")
+                                    enabled: !PyroWaveCalibrator.running
+                                    // Closed selectors use Tab for controller focus traversal.
+                                    // An open popup owns arrow keys for selecting a host.
+                                    KeyNavigation.backtab: calibrationCloseButton
+                                    Keys.onTabPressed: function(event) {
+                                        if (popup.visible) {
+                                            event.accepted = false
+                                            return
+                                        }
+                                        if (event.modifiers & Qt.ShiftModifier)
+                                            calibrationCloseButton.forceActiveFocus(Qt.TabFocusReason)
+                                        else calibrationDialog.focusTarget()
+                                    }
+                                }
+                                Label { text: qsTr("%1 FPS").arg(calibrationDialog.testFps) }
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                font.pointSize: 16
+                                font.bold: true
+                                text: qsTr("Choose your quality target")
+                                wrapMode: Text.Wrap
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+                                Repeater {
+                                    id: calibrationTargets
+                                    model: calibrationDialog.targets
+                                    delegate: Button {
+                                        id: targetCard
+                                        objectName: "pyrowaveCalibrationTarget" + index
+                                        Layout.fillWidth: true
+                                        Layout.preferredWidth: 1
+                                        Layout.preferredHeight: 82
                                         text: modelData.text
+                                        checked: calibrationDialog.targetIndex === index
+                                        enabled: !PyroWaveCalibrator.running
+                                        activeFocusOnTab: true
+                                        Accessible.name: modelData.text
+                                        Accessible.description: modelData.description
+                                        contentItem: Column {
+                                            spacing: 6
+                                            Label {
+                                                width: parent.width
+                                                text: targetCard.text
+                                                font.bold: targetCard.checked
+                                                font.pointSize: 11
+                                                horizontalAlignment: Text.AlignHCenter
+                                                elide: Text.ElideRight
+                                                color: targetCard.checked ? "#e1bee7" : "#ffffff"
+                                            }
+                                            Label {
+                                                width: parent.width
+                                                text: modelData.summary
+                                                font.pointSize: 9
+                                                horizontalAlignment: Text.AlignHCenter
+                                                wrapMode: Text.Wrap
+                                                color: "#c7c7c7"
+                                            }
+                                        }
+                                        background: Rectangle {
+                                            radius: 8
+                                            color: targetCard.checked ? "#51405c" : "#383838"
+                                            border.width: targetCard.activeFocus ? 3 : 1
+                                            border.color: targetCard.activeFocus ? "#e1bee7" : targetCard.checked ? "#ab75c3" : "#606060"
+                                            opacity: targetCard.enabled ? 1 : 0.6
+                                        }
+                                        onClicked: calibrationDialog.changeTarget(index)
+                                        Keys.priority: Keys.BeforeItem
+                                        Keys.onPressed: function(event) {
+                                            if (event.key === Qt.Key_Left) calibrationDialog.changeTarget(index - 1)
+                                            else if (event.key === Qt.Key_Right) calibrationDialog.changeTarget(index + 1)
+                                            else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up ||
+                                                     (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier)))
+                                                calibrationHost.forceActiveFocus(Qt.TabFocusReason)
+                                            else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Down)
+                                                (calibrationRunButton.enabled ? calibrationRunButton : calibrationCloseButton).forceActiveFocus(Qt.TabFocusReason)
+                                            else return
+                                            event.accepted = true
+                                        }
                                     }
                                 }
                             }
-
                             Label {
-                                width: parent.width
+                                Layout.fillWidth: true
+                                Layout.minimumHeight: 32
                                 wrapMode: Text.Wrap
-                                font.pointSize: 9
-                                text: qsTr("Every format is tested at the codec author's recommended bitrate. \"Reduced quality\" or \"Low quality\" means the bitrate had to be lowered for this device to keep up.")
+                                text: calibrationDialog.targets[calibrationDialog.targetIndex].description
                             }
-
+                            Label {
+                                Layout.fillWidth: true
+                                text: qsTr("Test your connection first, then continue to test this device's decoder.")
+                                wrapMode: Text.Wrap
+                                opacity: 0.7
+                            }
+                            Item { Layout.fillHeight: true }
+                            Pane {
+                                Layout.fillWidth: true
+                                padding: 12
+                                background: Rectangle {
+                                    color: calibrationDialog.canContinue ? (PyroWaveCalibrator.networkTimingWarning ? "#413824" : "#283b2e") : "#252525"
+                                    radius: 8
+                                    border.color: calibrationDialog.canContinue ? (PyroWaveCalibrator.networkTimingWarning ? "#aa8542" : "#568260") : "#505050"
+                                }
+                                contentItem: RowLayout {
+                                    spacing: 12
+                                    BusyIndicator {
+                                        Layout.preferredWidth: 28
+                                        Layout.preferredHeight: 28
+                                        running: PyroWaveCalibrator.running
+                                        visible: running
+                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 4
+                                        Label {
+                                            objectName: "pyrowaveCalibrationStatus"
+                                            Layout.fillWidth: true
+                                            wrapMode: Text.Wrap
+                                            text: !calibrationDialog.hasStarted ? qsTr("Ready to test your connection.") :
+                                                  !calibrationDialog.resultsMatch ? qsTr("Selection changed. Test bandwidth again to continue.") : PyroWaveCalibrator.message
+                                        }
+                                        Label {
+                                            Layout.fillWidth: true
+                                            visible: calibrationDialog.canContinue
+                                            wrapMode: Text.Wrap
+                                            color: PyroWaveCalibrator.networkTimingWarning ? "#ffd180" : "#a5d6a7"
+                                            text: qsTr("Measured budget: %1 Mbps · Continue to the decoder test").arg(PyroWaveCalibrator.bandwidthKbps / 1000)
+                                        }
+                                    }
+                                }
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                font.pointSize: 9
+                                color: "#bdbdbd"
+                                wrapMode: Text.Wrap
+                                text: qsTr("↑↓ Navigate  ·  ←→ Choose target  ·  %1 Select  ·  %2 Back")
+                                    .arg(StreamingPreferences.swapFaceButtons ? "B" : "A")
+                                    .arg(StreamingPreferences.swapFaceButtons ? "A" : "B")
+                            }
+                        }
+                        ColumnLayout {
+                            spacing: 8
+                            Label {
+                                Layout.fillWidth: true
+                                font.pointSize: 14
+                                font.bold: true
+                                text: calibrationDialog.targets[calibrationDialog.targetIndex].text + " · " + qsTr("%1 FPS").arg(calibrationDialog.testFps)
+                            }
+                            Label {
+                                objectName: "pyrowaveDecoderStatus"
+                                Layout.fillWidth: true
+                                wrapMode: Text.Wrap
+                                text: PyroWaveCalibrator.message
+                            }
+                            Label {
+                                objectName: "pyrowaveNetworkTimingWarning"
+                                Layout.fillWidth: true
+                                visible: PyroWaveCalibrator.networkTimingWarning
+                                wrapMode: Text.Wrap
+                                color: "#ffd180"
+                                text: qsTr("Network timing warning: packet-arrival variation exceeds 4 ms and may cause stutter. Format grades measure this device's decode and draw capacity.")
+                            }
+                            ProgressBar {
+                                Layout.fillWidth: true
+                                from: 0
+                                to: calibrationDialog.rows.length * 4
+                                value: calibrationDialog.samples.length
+                                visible: PyroWaveCalibrator.running
+                            }
                             Row {
+                                id: calibrationHeaders
+                                Layout.fillWidth: true
                                 spacing: 6
                                 Label { width: 72; text: qsTr("Resolution") }
-                                Label { width: (calibrationTable.width - 84) / 2; text: "4:4:4"; horizontalAlignment: Text.AlignHCenter }
-                                Label { width: (calibrationTable.width - 84) / 2; text: "4:2:0"; horizontalAlignment: Text.AlignHCenter }
+                                Label { width: (calibrationHeaders.width - 84) / 2; text: "4:4:4"; horizontalAlignment: Text.AlignHCenter }
+                                Label { width: (calibrationHeaders.width - 84) / 2; text: "4:2:0"; horizontalAlignment: Text.AlignHCenter }
                             }
-
-                            Repeater {
-                                model: calibrationDialog.rows
-                                delegate: Row {
-                                    id: calibrationRow
-                                    width: calibrationTable.width
+                            Flickable {
+                                id: calibrationResults
+                                objectName: "pyrowaveCalibrationResults"
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                clip: true
+                                contentWidth: width
+                                contentHeight: calibrationTable.height
+                                boundsBehavior: Flickable.StopAtBounds
+                                ScrollBar.vertical: ScrollBar {}
+                                function ensureFocusedVisible() {
+                                    var item = Window.activeFocusItem
+                                    if (!item) return
+                                    var ancestor = item
+                                    while (ancestor && ancestor !== contentItem) ancestor = ancestor.parent
+                                    if (!ancestor) return
+                                    var position = item.mapToItem(contentItem, 0, 0)
+                                    if (position.y < contentY) contentY = position.y
+                                    else if (position.y + item.height > contentY + height)
+                                        contentY = Math.min(Math.max(0, contentHeight - height), position.y + item.height - height)
+                                }
+                                Window.onActiveFocusItemChanged: ensureFocusedVisible()
+                                onHeightChanged: ensureFocusedVisible()
+                                Column {
+                                    id: calibrationTable
+                                    width: parent.width
                                     spacing: 6
-                                    readonly property int rowIndex: index
-                                    readonly property var rowData: modelData
-
                                     Label {
-                                        width: 72
-                                        text: calibrationRow.rowData.name
-                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: parent.width
+                                        visible: calibrationDetails.checked
+                                        wrapMode: Text.Wrap
+                                        font.pointSize: 9
+                                        text: PyroWaveCalibrator.linkSummary + " " +
+                                              qsTr("Rates include FEC and packet overhead. Quality is relative to the developer's recommended image bitrate. Every selected target is tested afresh.")
+                                    }
+                                    Flow {
+                                        width: parent.width
+                                        spacing: 12
+                                        Repeater {
+                                            model: [
+                                                { tier: "any", text: qsTr("Any display") },
+                                                { tier: "vrr", text: qsTr("Needs VRR") },
+                                                { tier: "vrrLarge", text: qsTr("VRR · Smooth") },
+                                                { tier: "slow", text: qsTr("Can't keep up") }
+                                            ]
+                                            delegate: Row {
+                                                spacing: 5
+                                                Rectangle {
+                                                    width: 8; height: 8; radius: 4
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    color: calibrationDialog.tierColors[modelData.tier]
+                                                }
+                                                Label { text: modelData.text; font.pointSize: 9 }
+                                            }
+                                        }
+                                    }
+                                    Repeater {
+                                        model: calibrationDetails.checked ? [
+                                            { tier: "any", text: qsTr("Any display: 99% of frames use at most 60% of each frame, leaving room for a live stream's extra work with or without VRR.") },
+                                            { tier: "vrr", text: qsTr("Needs VRR: slow frames use up to 80% of each frame. VRR hides the occasional late one; a fixed-refresh display may stutter.") },
+                                            { tier: "vrrLarge", text: qsTr("Needs VRR · Smooth mode: slow frames use nearly the whole frame. Only the Smooth VRR latency mode's larger buffer hides them.") },
+                                            { tier: "slow", text: qsTr("Can't keep up: at %1 FPS, more than 1 frame in 100 takes longer than a frame to decode and draw. Expect stutter; it can still be selected.").arg(calibrationDialog.testFps) }
+                                        ] : []
+                                        delegate: Row {
+                                            spacing: 6
+                                            Rectangle {
+                                                width: 10
+                                                height: 10
+                                                radius: 5
+                                                anchors.verticalCenter: parent.verticalCenter
+                                                color: calibrationDialog.tierColors[modelData.tier]
+                                            }
+                                            Label {
+                                                width: calibrationTable.width - 16
+                                                wrapMode: Text.Wrap
+                                                font.pointSize: 9
+                                                text: modelData.text
+                                            }
+                                        }
                                     }
 
+                                    Label {
+                                        width: parent.width
+                                        wrapMode: Text.Wrap
+                                        font.pointSize: 9
+                                        visible: calibrationDetails.checked
+                                        text: qsTr("Reduced or low quality means the image bitrate is below the developer's recommendation. This can follow your chosen target, network limits, or device limits.")
+                                    }
+
+
+
                                     Repeater {
-                                        // 4:4:4 then 4:2:0, each HDR then SDR
-                                        model: [[0, 1], [2, 3]]
-                                        delegate: Column {
-                                            id: chromaColumn
-                                            readonly property var modes: modelData
-                                            width: (calibrationTable.width - 84) / 2
-                                            spacing: 2
+                                        id: calibrationRows
+                                        model: calibrationDialog.rows
+                                        delegate: Row {
+                                            id: calibrationRow
+                                            width: calibrationTable.width
+                                            spacing: 6
+                                            readonly property int rowIndex: index
+                                            readonly property var rowData: modelData
+                                            property alias columns: calibrationChroma
+
+                                            Label {
+                                                width: 72
+                                                text: calibrationRow.rowData.name
+                                                anchors.verticalCenter: parent.verticalCenter
+                                            }
 
                                             Repeater {
-                                                model: chromaColumn.modes
-                                                delegate: Button {
-                                                    id: optionButton
-                                                    width: parent.width
-                                                    height: 54
-                                                    readonly property var option: calibrationDialog.sample(calibrationRow.rowIndex, modelData)
-                                                    readonly property bool hdr: modelData % 2 === 0
-                                                    enabled: calibrationDialog.canApply(option)
-                                                    ToolTip.delay: 400
-                                                    ToolTip.visible: hovered && ToolTip.text !== ""
-                                                    ToolTip.text: calibrationDialog.optionDetail(option)
-                                                    onClicked: calibrationDialog.applyChoice(option)
+                                                id: calibrationChroma
+                                                // 4:4:4 then 4:2:0, each HDR then SDR
+                                                model: [[0, 1], [2, 3]]
+                                                delegate: Column {
+                                                    id: chromaColumn
+                                                    readonly property var modes: modelData
+                                                    property alias formats: calibrationFormats
+                                                    width: (calibrationTable.width - 84) / 2
+                                                    spacing: 2
 
-                                                    contentItem: Column {
-                                                        spacing: 2
-                                                        opacity: optionButton.enabled ? 1.0 : 0.6
-
-                                                        Label {
+                                                    Repeater {
+                                                        id: calibrationFormats
+                                                        model: chromaColumn.modes
+                                                        delegate: Button {
+                                                            id: optionButton
+                                                            objectName: "pyrowaveCalibrationOption" + (calibrationRow.rowIndex * 4 + modelData)
                                                             width: parent.width
-                                                            horizontalAlignment: Text.AlignHCenter
-                                                            elide: Text.ElideRight
-                                                            font.pointSize: 10
-                                                            text: calibrationDialog.headline(optionButton.option, optionButton.hdr)
-                                                        }
-
-                                                        Row {
-                                                            anchors.horizontalCenter: parent.horizontalCenter
-                                                            spacing: 6
-
-                                                            Rectangle {
-                                                                width: 10
-                                                                height: 10
-                                                                radius: 5
-                                                                anchors.verticalCenter: parent.verticalCenter
-                                                                visible: !!optionButton.option
-                                                                color: calibrationDialog.tierColor(optionButton.option)
+                                                            height: 44
+                                                            padding: 6
+                                                            topPadding: 4
+                                                            bottomPadding: 4
+                                                            topInset: 0
+                                                            bottomInset: 0
+                                                            leftInset: 0
+                                                            rightInset: 0
+                                                            background: Rectangle {
+                                                                radius: 6
+                                                                color: optionButton.activeFocus ? "#484454" : "#383838"
+                                                                border.width: optionButton.activeFocus ? 2 : 1
+                                                                border.color: optionButton.activeFocus ? "#ce93d8" : "#505050"
+                                                                opacity: optionButton.enabled ? 1 : 0.55
+                                                            }
+                                                            readonly property var option: calibrationDialog.sample(calibrationRow.rowIndex, modelData)
+                                                            readonly property bool hdr: modelData % 2 === 0
+                                                            enabled: calibrationDialog.canApply(option)
+                                                            Accessible.name: calibrationDialog.headline(option, hdr)
+                                                            Accessible.description: option && option.valid ? calibrationDialog.frameCost(option) : ""
+                                                            ToolTip.delay: 400
+                                                            ToolTip.visible: hovered && ToolTip.text !== ""
+                                                            ToolTip.text: calibrationDialog.optionDetail(option)
+                                                            onClicked: calibrationDialog.applyChoice(option)
+                                                            Keys.onPressed: function(event) {
+                                                                var mode = modelData
+                                                                var row = calibrationRow.rowIndex
+                                                                if (event.key === Qt.Key_Left || event.key === Qt.Key_Right) {
+                                                                    calibrationDialog.focusOption(row, event.key === Qt.Key_Left ? mode % 2 : 2 + mode % 2, 0)
+                                                                }
+                                                                else if (event.key === Qt.Key_Up || event.key === Qt.Key_Backtab ||
+                                                                         (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+                                                                    calibrationDialog.focusOption(mode % 2 ? row : row - 1,
+                                                                        mode % 2 ? mode - 1 : mode + 1, -1)
+                                                                }
+                                                                else if (event.key === Qt.Key_Down || event.key === Qt.Key_Tab) {
+                                                                    calibrationDialog.focusOption(mode % 2 ? row + 1 : row,
+                                                                        mode % 2 ? mode - 1 : mode + 1, 1)
+                                                                }
+                                                                else return
+                                                                event.accepted = true
                                                             }
 
-                                                            Label {
-                                                                font.pointSize: 9
-                                                                text: calibrationDialog.tierText(optionButton.option)
+                                                            contentItem: Column {
+                                                                spacing: 2
+                                                                opacity: !optionButton.enabled ? 0.6 : optionButton.option && !optionButton.option.keepsUp ? 0.7 : 1.0
 
-                                                                // Untested cells keep the style's text color
-                                                                Binding on color {
-                                                                    when: !!optionButton.option
-                                                                    value: calibrationDialog.tierColor(optionButton.option)
+                                                                Label {
+                                                                    width: parent.width
+                                                                    horizontalAlignment: Text.AlignHCenter
+                                                                    elide: Text.ElideRight
+                                                                    font.pointSize: 10
+                                                                    text: calibrationDialog.headline(optionButton.option, optionButton.hdr)
+                                                                }
+
+                                                                Row {
+                                                                    anchors.horizontalCenter: parent.horizontalCenter
+                                                                    spacing: 6
+
+                                                                    Rectangle {
+                                                                        width: 10
+                                                                        height: 10
+                                                                        radius: 5
+                                                                        anchors.verticalCenter: parent.verticalCenter
+                                                                        visible: !!optionButton.option
+                                                                        color: calibrationDialog.tierColor(optionButton.option)
+                                                                    }
+
+                                                                    Label {
+                                                                        font.pointSize: 9
+                                                                        width: Math.min(implicitWidth, optionButton.width - 30)
+                                                                        elide: Text.ElideRight
+                                                                        text: calibrationDialog.tierText(optionButton.option)
+
+                                                                        // Untested cells keep the style's text color
+                                                                        Binding on color {
+                                                                            when: !!optionButton.option
+                                                                            value: calibrationDialog.tierColor(optionButton.option)
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -1370,79 +1796,19 @@ Flickable {
                     }
                 }
 
-                Column {
+                VrrTimingSettings {
                     width: parent.width
-                    spacing: 5
                     visible: StreamingPreferences.enableVrr
                     enabled: StreamingPreferences.enableVsync && StreamingPreferences.enableVrr
-
-                    Label {
-                        width: parent.width
-                        text: qsTr("VRR timing")
-                        font.pointSize: 12
-                        wrapMode: Text.Wrap
-                    }
-
-                    AutoResizingComboBox {
-                        id: vrrLatencyModeComboBox
-                        textRole: "text"
-                        model: ListModel {
-                            id: vrrLatencyModeListModel
-                            ListElement {
-                                text: qsTr("Low Latency")
-                                val: StreamingPreferences.VLM_LOW_LATENCY
-                            }
-                            ListElement {
-                                text: qsTr("Balanced Target")
-                                val: StreamingPreferences.VLM_BALANCED_TARGET
-                            }
-                            ListElement {
-                                text: qsTr("Smooth")
-                                val: StreamingPreferences.VLM_SMOOTH
-                            }
-                        }
-                        currentIndex: {
-                            for (var i = 0; i < vrrLatencyModeListModel.count; i++) {
-                                if (vrrLatencyModeListModel.get(i).val === StreamingPreferences.vrrLatencyMode) {
-                                    return i
-                                }
-                            }
-                            return 1
-                        }
-                        onActivated: {
-                            StreamingPreferences.vrrLatencyMode = vrrLatencyModeListModel.get(currentIndex).val
-                        }
-                        Component.onCompleted: {
-                            recalculateWidth()
-                            languageChanged.connect(recalculateWidth)
-                        }
-                    }
-
-                    Label {
-                        width: parent.width
-                        wrapMode: Text.Wrap
-                        text: StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_LOW_LATENCY ?
-                                  qsTr("Minimizes added delay. Uneven delivery can cause more stutter or skipped frames.") :
-                              StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTH ?
-                                  qsTr("Uses more padding and holds it longer for steadier motion, with more input delay.") :
-                                  qsTr("Targets steadier motion with a moderate timing reserve and balanced input delay.")
-                    }
-
-                    Label {
-                        width: parent.width
-                        wrapMode: Text.Wrap
-                        text: StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_SMOOTH ?
-                                  qsTr("Buffer allowance: up to 4 source frames, limited by queue capacity. Actual learned delay may be lower.") :
-                              StreamingPreferences.vrrLatencyMode === StreamingPreferences.VLM_LOW_LATENCY ?
-                                  qsTr("Buffer allowance: up to 1 source frame, limited by queue capacity. Actual learned delay may be lower.") :
-                                  qsTr("Buffer allowance: up to 2 source frames, limited by queue capacity. Actual learned delay may be lower.")
-                    }
-
-                    Label {
-                        width: parent.width
-                        wrapMode: Text.Wrap
-                        text: qsTr("Applies at all VRR frame rates. Reconnect the stream after changing this setting.")
-                    }
+                    bufferPerMille: StreamingPreferences.vrrBufferPerMille
+                    targetHundredths: StreamingPreferences.vrrTargetHundredths
+                    historySeconds: StreamingPreferences.vrrHistorySeconds
+                    toleranceUs: StreamingPreferences.vrrToleranceUs
+                    onPresetPicked: function(mode) { StreamingPreferences.applyVrrPreset(mode) }
+                    onBufferEdited: function(value) { StreamingPreferences.vrrBufferPerMille = value }
+                    onTargetEdited: function(value) { StreamingPreferences.vrrTargetHundredths = value }
+                    onHistoryEdited: function(value) { StreamingPreferences.vrrHistorySeconds = value }
+                    onToleranceEdited: function(value) { StreamingPreferences.vrrToleranceUs = value }
                 }
 
                 CheckBox {
@@ -1459,6 +1825,21 @@ Flickable {
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Evens out when frames are displayed, including games whose frame rate does not divide the host display's refresh rate. Adds up to a few milliseconds of delay only while uneven frames need it. Does not blend images or eliminate game stalls.") + "\n\n" +
                                   qsTr("Reconnect the stream after changing this setting.")
+                }
+
+                CheckBox {
+                    hoverEnabled: true
+                    text: qsTr("High-performance GPU power while streaming")
+                    font.pointSize: 12
+                    visible: Qt.platform.os === "linux"
+                    checked: StreamingPreferences.highPerformanceGpuPower
+                    onCheckedChanged: StreamingPreferences.highPerformanceGpuPower = checked
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Holds an AMD GPU at its high-performance clocks for the whole stream so it cannot drop its clocks between frames, which can delay when the display shows a frame that was ready on time. Uses more power and reduces battery life. Has no effect if GPU clocks are already set manually.") + "\n\n" +
+                                  qsTr("Takes effect at the start of the next stream.")
                 }
 
                 CheckBox {
@@ -2398,6 +2779,23 @@ Flickable {
                     ToolTip.text: qsTr("Display real-time stream performance information while streaming.") + "\n\n" +
                                   qsTr("You can toggle it at any time while streaming using Ctrl+Alt+Shift+S or Select+L1+R1+X.") + "\n\n" +
                                   qsTr("The performance overlay is not supported on Steam Link or Raspberry Pi.")
+                }
+
+                CheckBox {
+                    id: showFrametimeGraph
+                    width: parent.width
+                    text: qsTr("Show frametime graph while streaming")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.showFrametimeGraph
+                    onCheckedChanged: {
+                        StreamingPreferences.showFrametimeGraph = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 10000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Shows planned, submitted and displayed frame intervals in separate lanes during VRR streaming, so you can see where a stutter starts. Variation under 1 ms is drawn flat.") + "\n\n" +
+                                  qsTr("You can toggle it at any time while streaming using Ctrl+Alt+Shift+F or Select+L1+R1+Y (Triangle).")
                 }
             }
         }

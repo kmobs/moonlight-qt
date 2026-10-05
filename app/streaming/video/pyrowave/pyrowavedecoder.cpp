@@ -5,6 +5,7 @@
 
 #include <Limelight.h>
 #include <SDL.h>
+#include <algorithm>
 #include <chrono>
 
 #ifdef _WIN32
@@ -323,6 +324,7 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
     impl->config = config;
     impl->geometry = { config.width, config.height, config.chroma444 };
 
+
     uint32_t major = 0, minor = 0, patch = 0;
     pyrowave_get_api_version(&major, &minor, &patch);
 
@@ -369,12 +371,18 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
         }
         else {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "PyroWave: cannot share the renderer's Vulkan device (%s); reading frames back instead",
-                        resultString(result));
+                        "PyroWave: cannot share the renderer's Vulkan device (%s)%s",
+                        resultString(result), config.requireSharedOutput ? "" :
+                        "; reading frames back instead");
             impl->device = nullptr;
         }
     }
     if (impl->device == nullptr) {
+        if (config.requireSharedOutput) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: the renderer's shared Vulkan device is required");
+            return false;
+        }
         result = pyrowave_create_default_device(&impl->device);
         if (result != PYROWAVE_SUCCESS) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -469,7 +477,8 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
     impl.reportDiagnostics |= diagnostics != nullptr;
 
     m_LastFramePartial = false;
-    if (!PyroWaveFraming::parse(data, size, packets, criticalPackets, impl.geometry, impl.parsed, m_LastError)) {
+    if (!PyroWaveFraming::parse(data, size, packets, criticalPackets, impl.geometry,
+                                impl.parsed, m_LastError, impl.config.compression)) {
         return false;
     }
     m_LastFraming = impl.parsed.framing;
@@ -482,11 +491,11 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
     }
     phase.next(1);
 
-    // Every frame is independent. Clearing first keeps the 3-bit sequence
-    // counter from treating a frame after a long drop as stale.
+    // Independent reconstruction also prevents stale three-bit sequence state
+    // after a long run of dropped frames.
     pyrowave_decoder_clear(impl.decoder);
     for (const auto& span : impl.parsed.spans) {
-        const pyrowave_result result = pyrowave_decoder_push_packet(impl.decoder, data + span.offset, span.size);
+        const pyrowave_result result = pyrowave_decoder_push_packet(impl.decoder, (span.expanded ? impl.parsed.expanded.data() : data) + span.offset, span.size);
         if (result != PYROWAVE_SUCCESS) {
             m_LastError = std::string("decoder rejected a packet: ") + resultString(result);
             return false;

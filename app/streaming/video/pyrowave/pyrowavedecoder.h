@@ -12,8 +12,9 @@ extern "C" {
 }
 
 // Decodes PyroWave frames on Vulkan. Windows shares GPU surfaces with the
-// renderer. Linux decodes on the renderer's own VkDevice into planes it lends
-// (IPyroWaveVulkanPool), or without one reads planar frames back to the CPU.
+// renderer. Linux and macOS decode on the VkDevice supplied by the renderer's
+// IPyroWaveVulkanPool into planes it lends. macOS exports those MoltenVK images
+// to the native Metal presenter. Diagnostics can instead read planes to the CPU.
 // Not thread safe: decode() must be called from one thread. Frames it produces
 // may be freed from any thread.
 class PyroWaveDecoder
@@ -24,9 +25,14 @@ public:
         int height = 0;
         bool chroma444 = false;
         bool tenBit = false;
+        // Negotiated with a host that supports independent LZ4 detail groups.
+        bool compression = false;
 #ifndef _WIN32
         // Optional; without it frames are read back into system memory
         IPyroWaveVulkanPool* vulkanPool = nullptr;
+        // Production Metal playback requires GPU sharing. Readback remains
+        // available to standalone diagnostics which do not own a presenter.
+        bool requireSharedOutput = false;
 #endif
     };
 
@@ -59,7 +65,8 @@ public:
     // packets maps the frame's RTP packets and which of them were lost (empty
     // for a frame that arrived whole); what survived is decoded when the
     // coarsest wavelet level did, which the host announces as the first
-    // criticalPackets packets (0 if it did not).
+    // criticalPackets packets (0 if it did not). Compressed detail groups
+    // are independent; unrepaired detail loss remains a partial frame.
     bool decode(const uint8_t* data, size_t size,
                 const std::vector<PyroWaveFraming::Segment>& packets, size_t criticalPackets,
                 AVFrame* frame, DecodeDiagnostics* diagnostics = nullptr);

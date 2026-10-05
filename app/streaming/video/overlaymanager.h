@@ -4,11 +4,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 
 #include "SDL_compat.h"
 #include <SDL_ttf.h>
+#include "timinggraph.h"
 
 namespace Overlay {
 
@@ -56,14 +58,22 @@ public:
     OverlayManager();
     ~OverlayManager();
 
+    // For OverlayDebug, true while the stats text or the timing graph shows.
     bool isOverlayEnabled(OverlayType type);
+    bool isStatsEnabled();
+    bool isTimingGraphEnabled();
+    void setTimingGraphState(bool enabled);
     std::string getOverlayText(OverlayType type);
-    void updateOverlayText(OverlayType type, const char* text);
+    void updateOverlayText(OverlayType type, const char* text, TimingGraphSnapshot graph = {});
+    // Refreshes the stats graph between text updates.
+    void updateTimingGraph(TimingGraphSnapshot graph);
     int getOverlayMaxTextLength();
+    // For OverlayDebug, controls the stats text independently of the graph.
     void setOverlayState(OverlayType type, bool enabled);
     void setStatusMessage(StatusSource source, const std::string& text);
     SDL_Color getOverlayColor(OverlayType type);
     int getOverlayFontSize(OverlayType type);
+    void setOutputSize(int width, int height);
     SDL_Surface* getUpdatedOverlaySurface(OverlayType type);
 
     void setOverlayRenderer(IOverlayRenderer* renderer);
@@ -86,6 +96,8 @@ private:
     } m_Overlays[OverlayMax];
     IOverlayRenderer* m_Renderer;
     QByteArray m_FontData;
+    std::shared_ptr<const TimingGraphSnapshot> m_TimingGraph;
+    bool m_StatsEnabled = false, m_TimingGraphEnabled = false;
     std::mutex m_StateLock;
     std::string m_StatusMessages[static_cast<int>(StatusSource::Count)];
     std::condition_variable m_WorkReady;

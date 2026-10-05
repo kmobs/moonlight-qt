@@ -5,11 +5,13 @@
 #include <cstdint>
 #include <vector>
 
+#include "presenttiming.h"
+
 namespace Vrr13 {
-// One definition for buffering and reporting: mean absolute client-added
-// interval error, including zero-error intervals, over the last second. The
-// caller selects the profile tolerance; the quality score retains the
-// preset's longer history independently of that one-second detection average.
+// Client-added interval error, including zero-error intervals. Production
+// scores excess above tolerance per interval before averaging over history;
+// the one-second mean remains diagnostic. Recorded policies retain their
+// historical mean-before-tolerance behavior.
 class IntervalBuffer {
 public:
     static constexpr uint64_t ToleranceUs = 500;
@@ -66,6 +68,9 @@ public:
         Update update;
         uint64_t lastGrowthAtUs = 0, lastGrowthUs = 0;
         uint64_t lastClippedAtUs = 0, lastClippedUs = 0;
+        // Filled by the controller; post-submission timing never changes
+        // this buffer's score or requests.
+        PresentTiming::Stats present;
         double lossFraction() const {
             return evaluatedUs ? std::clamp(
                 (severityWeighted ? weightedLossUs : double(failedUs)) / evaluatedUs,
@@ -82,7 +87,8 @@ public:
                  size_t initialMinimumSamples = 2,
                  uint64_t recentPressureRelease = 0,
                  uint64_t serialServiceGate = 0,
-                 bool holdRenewsBelowTargetOnly = false) {
+                 uint64_t holdRenewBelowTarget = 0,
+                 bool perIntervalExcess = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.severityWeighted = severityWeighted;
         minimum = std::min(minimum, maximum);
@@ -171,16 +177,18 @@ public:
         m_Stats.initialCalibrationComplete = true;
         m_Stats.serviceOverloaded = service > intendedTime || decoderQueue > intendedTime;
         const bool pressure = total > samples * toleranceUs;
-        // Weight the score by evaluated time, not frame rate. Attribute the
-        // preceding interval to its evaluated one-second mean; gaps are unknown.
+        // Weight the score by evaluated time, not frame rate; gaps are unknown.
+        // Revision 9 applies tolerance before averaging so clean intervals
+        // cannot erase excess from isolated late/catch-up intervals.
         auto& score = m_Score[(s.submitted / 100000) % m_Score.size()];
         if (score.tick != s.submitted / 100000) score = ScoreBucket{s.submitted / 100000};
         score.evaluated += actual;
-        if (pressure) score.failed += actual;
+        if (perIntervalExcess ? error > toleranceUs : pressure) score.failed += actual;
         // Revision 7 measures severity rather than treating a tiny crossing as
         // a completely failed interval. Keep sub-microsecond loss in double so
         // Smooth's 99.99% target is not biased by per-frame rounding.
-        const double excessUs = std::max(0.0, m_Stats.averageErrorUs - toleranceUs);
+        const double excessUs = std::max(0.0,
+            (perIntervalExcess ? double(error) : m_Stats.averageErrorUs) - toleranceUs);
         const double loss = std::min(1.0, excessUs / intended);
         if (severityWeighted) score.weightedLoss += actual * loss;
         updateScore(s.submitted, scoreWindowUs);
@@ -205,14 +213,18 @@ public:
         // service overload, cannot be repaired by retaining standing delay.
         // Keep the normal hold between attributable misses; do not change the
         // long quality score, attack qualification, or gradual release rate.
-        const bool pressureHolds = currentPressure &&
+        // Revision 2 permits continued recovery while the long score meets
+        // the preset target, even when recent pressure moves that score.
+        // Revision 1 only suppressed hold renewal and still paused release.
+        const bool targetAllowsHold = holdRenewBelowTarget < 2 ||
+            !severityWeighted || belowTarget;
+        const bool pressureHolds = targetAllowsHold && currentPressure &&
             (recentPressureRelease < 2 || (freshError && delayedAbsorbable && lateness));
         const bool holdProtection = pressureHolds ||
-            historyHolds;
-        // While the score still meets the target, a small dip pauses release
-        // for that frame without restarting the clean-time hold.
+            (targetAllowsHold && historyHolds);
+        // Preserve revision 1's above-target pause for historical captures.
         const bool renewsHold = holdProtection &&
-            (!holdRenewsBelowTargetOnly || !severityWeighted || belowTarget);
+            (!holdRenewBelowTarget || !severityWeighted || belowTarget);
         if (renewsHold) {
             m_LastPressure = s.submitted;
             if (severityWeighted) m_ReleaseFraction = 0;
@@ -223,11 +235,14 @@ public:
         // keeping a raised delay forever when a frame is missed every few
         // seconds, without counting the unknown gap as clean playback.
         if (recentPressureRelease >= 3) {
-            if (renewsHold || !s.absorbable || !windowAbsorbable) {
+            // A capacity dip pauses qualified recovery, but revision 3
+            // must not erase it while the long score meets the target.
+            if (renewsHold || ((holdRenewBelowTarget < 3 || targetAllowsHold) &&
+                               (!s.absorbable || !windowAbsorbable))) {
                 m_CleanEvidenceUs = 0;
                 m_LastCleanEvidenceUs = 0;
             }
-            else if (!holdProtection) {
+            else if (!holdProtection && s.absorbable && windowAbsorbable) {
                 m_CleanEvidenceUs = std::min<uint64_t>(
                     hold, m_CleanEvidenceUs + std::min<uint64_t>(actual, 100000));
                 m_LastCleanEvidenceUs = s.submitted;
@@ -245,7 +260,7 @@ public:
         update.cooldownRemainingUs = m_LastAttack ?
             remaining(s.submitted - m_LastAttack, 250000) : 0;
         update.action = pressureHolds ? Action::CurrentPressure :
-            historyHolds ? Action::HistoryHold : Action::RecoveryHold;
+            (targetAllowsHold && historyHolds) ? Action::HistoryHold : Action::RecoveryHold;
         const bool grow = currentPressure && (!severityWeighted || belowTarget);
         // Revision 1 mistook every slow frame for sustained overload. A
         // jitter buffer can cover a transient dependency stall when subsequent
