@@ -489,11 +489,10 @@ void DevUISettings::Render()
                 ImGui::ShowDemoWindow(&show_demo_window);
             }
 
-        /*
         // This HDR stuff is pretty half-baked and not very useful at the moment
         #ifdef __APPLE__
             if (ImGui::CollapsingHeader("HDR")) {
-                ImGui::Text("EDR headroom: %.1fx SDR", metrics.currentEDR);
+                ImGui::Text("EDR headroom: %.1fx SDR (%.1f nits)", metrics.currentEDR, metrics.currentEDR * 100.0);
 
                 ImGui::SetNextItemWidth(-ImGui::GetContentRegionAvail().x * 0.5f);
                 if (cfg.isReferenceModeDisplay) ImGui::BeginDisabled(); // reference mode uses 100 nits
@@ -508,14 +507,13 @@ void DevUISettings::Render()
                 ImGui::SetNextItemWidth(-ImGui::GetContentRegionAvail().x * 0.5f);
                 configChanged |= ImGui::SliderFloat("Max Luminance", &cfg.maxNits, 1.0f, 10000.0f, "%.2f nits");
 
-                configChanged |= ImGui::Checkbox("Enable EDR tone-mapping (experimental)", &cfg.useEDR);
+                configChanged |= ImGui::Checkbox("Enable EDR tone-mapping", &cfg.useEDR);
                 ImGui::SameLine();
                 HelpMarker(
                     "macOS will render HDR content according to your current display brightness and display preset. HDR will be tone-mapped to SDR when viewed on a non-HDR display.\n\n"
-                    "If disabled, HDR is rendered at its native brightness.");
+                    "If disabled, HDR is rendered at its native brightness. Values above EDR headroom will be clipped.");
             }
         #endif
-        */
 
             if (ImGui::CollapsingHeader("Audio")) {
                 if (Session::get()->getAudioRenderer() != nullptr) {

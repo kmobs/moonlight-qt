@@ -122,7 +122,7 @@ public:
           m_IsFullScreen(false),
           m_ProMotionAllowsVRR(false),
           m_UsePTSForVRR(false),
-          m_UseEDR(false),
+          m_UseEDR(true),
           m_NeedNewDrawable(false),
           m_ShowMetalHUD(false),
           m_MaxPotentialEDR(1.0),
@@ -404,51 +404,6 @@ public:
         paramBuffer.chromaOffset = simd_make_half2(chromaOffset[0],
                                                    chromaOffset[1]);
 
-        if (m_UseEDR && frame->color_trc == AVCOL_TRC_SMPTE2084) {
-            // EDR requires a linear floating-point pixel format
-            newPixelFormat = MTLPixelFormatRGBA16Float;
-
-            // change to linear colorspace
-            CFStringRef name;
-            switch (colorspace) {
-                case COLORSPACE_REC_2020:
-                    name = kCGColorSpaceExtendedLinearITUR_2020;
-                    break;
-                case COLORSPACE_REC_601:
-                    name = kCGColorSpaceExtendedLinearSRGB;
-                    break;
-                case COLORSPACE_REC_709:
-                default:
-                    name = kCGColorSpaceExtendedLinearSRGB;
-                    break;
-            }
-
-            CGColorSpaceRelease(newColorSpace);
-            newColorSpace = CGColorSpaceCreateWithName(name);
-
-            // MDCV contains min/max values from the host
-            // The user can override this if they want to
-            if (m_OverrideNits) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "EDR using user-selected min/max nits %.4f/%.2f, referenceWhite %.2f",
-                            m_MinNits, m_MaxNits, m_ReferenceWhite);
-                m_MetalLayer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:m_MinNits
-                                                                           maxLuminance:m_MaxNits
-                                                                     opticalOutputScale:m_ReferenceWhite];
-            }
-            else if (m_MasteringDisplayColorVolume != nullptr) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "EDR using MasteringDisplayColorVolume from host: min/max nits %.4f/%.2f, referenceWhite %.2f",
-                            m_MinNits, m_MaxNits, m_ReferenceWhite);
-                m_MetalLayer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithDisplayInfo:(__bridge NSData*)m_MasteringDisplayColorVolume
-                                                                           contentInfo:(__bridge NSData*)m_ContentLightLevelInfo
-                                                                    opticalOutputScale:m_ReferenceWhite];
-            }
-        }
-        else {
-            m_MetalLayer.EDRMetadata = nullptr;
-        }
-
         // Set the new colorspace and pixelFormat, must be done on main thread
         // or we risk a "Deleted thread with uncommitted CATransaction" error when the render thread exits
         bool pixelFormatChanged = m_MetalLayer.pixelFormat != newPixelFormat;
@@ -456,6 +411,36 @@ public:
             m_MetalLayer.pixelFormat = newPixelFormat;
             m_MetalLayer.colorspace = newColorSpace;
         });
+
+        // Upstream always sets EDRMetadata, we allow user to disable it in devUI
+        if (m_UseEDR && frame->color_trc == AVCOL_TRC_SMPTE2084) {
+            // MDCV contains min/max values from the host
+            // The user can override this if they want to
+            if (m_OverrideNits) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "EDR tone-mapping is enabled using user-selected min/max nits %.4f/%.2f, referenceWhite %.2f",
+                            m_MinNits, m_MaxNits, m_ReferenceWhite);
+                m_MetalLayer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:m_MinNits
+                                                                           maxLuminance:m_MaxNits
+                                                                     opticalOutputScale:m_ReferenceWhite];
+            }
+            else if (m_MasteringDisplayColorVolume != nullptr) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "EDR tone-mapping is enabled using MasteringDisplayColorVolume from host: min/max nits %.4f/%.2f, referenceWhite %.2f",
+                            m_MinNits, m_MaxNits, m_ReferenceWhite);
+                m_MetalLayer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithDisplayInfo:(__bridge NSData*)m_MasteringDisplayColorVolume
+                                                                           contentInfo:(__bridge NSData*)m_ContentLightLevelInfo
+                                                                    opticalOutputScale:m_ReferenceWhite];
+            }
+
+            // This shouldn't work but it does. Apple says that your pixel format must be in linear
+            // MTLPixelFormatRGBA16Float, but it also seems to work if you are using MTLPixelFormatBGR10A2Unorm
+            // with PQ.
+        }
+        else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "EDR tone-mapping is disabled");
+            m_MetalLayer.EDRMetadata = nullptr;
+        }
 
         // Get a new drawable if the pixel format was changed
         if (pixelFormatChanged || m_NeedNewDrawable) {
@@ -939,6 +924,9 @@ public:
                     metrics.referenceWhite = pfi.referenceWhite;
                     metrics.maxNits = pfi.maxNits;
                 }
+                else {
+                    metrics.currentEDR = 1.0;
+                }
             });
         #endif
         };
@@ -955,13 +943,11 @@ public:
             .vsyncDeadline  = vsyncDeadline
         };
 
-        if (m_UseEDR) {
-            pfi.currentEDR = m_CurrentEDR.load();
-            pfi.maxPotentialEDR = m_MaxPotentialEDR;
-            pfi.maxReferenceEDR = m_MaxReferenceEDR;
-            pfi.referenceWhite = m_ReferenceWhite;
-            pfi.maxNits = m_MaxNits;
-        }
+        pfi.currentEDR = m_CurrentEDR.load();
+        pfi.maxPotentialEDR = m_MaxPotentialEDR;
+        pfi.maxReferenceEDR = m_MaxReferenceEDR;
+        pfi.referenceWhite = m_ReferenceWhite;
+        pfi.maxNits = m_MaxNits;
 
         // prefer the user's choice from DevUI, or use auto-detection
         pfi.presentMode = m_RequestedPresentMode;
@@ -1645,6 +1631,13 @@ public:
         if (currentEDR != m_CurrentEDR.load()) {
             m_CurrentEDR.store(currentEDR);
         }
+
+        static CFTimeInterval lastCurrentEDR = 0.0;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - lastCurrentEDR > 1.0) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "EDR (maximumExtendedDynamicRangeColorComponentValue) is now %.1f", currentEDR);
+        }
+        lastCurrentEDR = now;
 
         DevUISettings::instance().SetConfig([=](DevUIConfig& config) {
             config.isReferenceModeDisplay = m_MaxReferenceEDR > 1.0;

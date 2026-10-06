@@ -81,7 +81,7 @@ struct DevUIConfig {
     bool showMetalHud = false;
     bool proMotionAllowsVRR = false;
     bool captureGPUTrace = false;
-    bool useEDR = false;
+    bool useEDR = true;
     bool isReferenceModeDisplay = false;
     float referenceWhite = 203.0f;
     float minNits = 0.0f;
