@@ -1,6 +1,7 @@
 #include "assertions.h"
 #include "overlaymanager.h"
 #include "../../app/streaming/video/clientpacingwarning.h"
+#include "../../app/streaming/video/pyrowave/pyrowavepacketlosswarning.h"
 #include <QCoreApplication>
 #include <QDir>
 #include <cassert>
@@ -175,6 +176,36 @@ int main(int argc, char** argv)
 {
     testLaneIntervals();
     {
+        PyroWavePacketLossWarning warning;
+        uint64_t now = 1000000;
+        // 100 FPS: each completed window has exactly 300 delivered frames.
+        const auto window = [&](unsigned partialPercent) {
+            bool visible = false;
+            for (unsigned frame = 0; frame < 300; ++frame) {
+                visible = warning.observe(now, true, frame % 100 < partialPercent);
+                now += 10000;
+            }
+            return visible;
+        };
+        assert(!window(1));  // Isolated holes do not warn.
+        assert(!window(15));
+        assert(!window(15)); // Two complete moderate-loss windows required.
+        assert(window(10));
+        assert(window(5));  // Retain through the hysteresis band.
+        assert(!window(0)); // A complete recovery window clears.
+        assert(!window(30));
+        assert(window(0));  // One complete high-loss window is sufficient.
+        assert(!window(0));
+        assert(!window(100));
+        assert(window(100));
+        assert(!warning.observe(now, false, true)); // Preference/codec disables.
+        assert(!window(100));
+        assert(window(100));
+        now += 3000000;
+        assert(!warning.observe(now, true, true)); // Restart after a reporting gap.
+        assert(!warning.observe(now - 1, true, true)); // Restart after clock reversal.
+    }
+    {
         using Reason = ClientPacingWarning::Reason;
         ClientPacingWarning warning;
         for (uint64_t t = 1; t <= 6; ++t)
@@ -241,6 +272,21 @@ int main(int argc, char** argv)
         manager.setStatusMessage(StatusSource::ClientPacing, "");
         assert(manager.getOverlayText(OverlayStatusUpdate) == "network loss");
         manager.setStatusMessage(StatusSource::Network, "");
+        assert(!manager.isOverlayEnabled(OverlayStatusUpdate));
+        manager.setStatusMessage(StatusSource::Network, PyroWavePacketLossWarning::Message);
+        manager.setStatusMessage(StatusSource::PacketLoss, PyroWavePacketLossWarning::Message);
+        assert(manager.getOverlayText(OverlayStatusUpdate) == PyroWavePacketLossWarning::Message);
+        manager.setStatusMessage(StatusSource::Network, "");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == PyroWavePacketLossWarning::Message);
+        manager.setStatusMessage(StatusSource::ClientPacing, "client pacing");
+        manager.setStatusMessage(StatusSource::Mouse, "mouse");
+        manager.setStatusMessage(StatusSource::PacketLoss, "");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "mouse");
+        manager.setStatusMessage(StatusSource::Mouse, "");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "client pacing");
+        manager.setStatusMessage(StatusSource::ClientPacing, "");
+        const auto statusColor = manager.getOverlayColor(OverlayStatusUpdate);
+        assert(statusColor.r > 0 && statusColor.g == 0 && statusColor.b == 0);
         assert(!manager.isOverlayEnabled(OverlayStatusUpdate));
         Presenter old(manager), replacement(manager);
         manager.setOverlayRenderer(&old);

@@ -454,7 +454,24 @@ The paired client requests `/pyrowave-udp-probe?kbps=...&port=...&packetsize=...
 over pinned HTTPS. Parameters are 5000–3000000 kbps, a nonprivileged UDP port,
 a 256–1392 byte packet size, and a fresh 32-character lowercase hex token.
 The destination IP is always the authenticated HTTPS peer's IP; this is a
-LAN probe, and a NAT/firewall blocking its UDP port produces no recommendation.
+LAN probe. Windows clients additionally require `PyroWaveUdpHandshakeVersion=1`;
+Linux and macOS use this capability when available and retain the legacy probe
+with older hosts. Handshake clients request `handshake=1`. The host binds its UDP sender, sends an ungraded
+32-byte token warmup, and flushes an `X-PyroWave-Udp-Port` header over paired
+HTTPS before completing the response body. The client sends the same token
+from its receiving socket to that announced port, retrying every 100 ms until
+measured data arrives. The host allows at most 1500 ms for a matching token
+from the authenticated HTTPS peer's IP, using the observed UDP source port as
+the return destination. Its token warmups retry every 100 ms during that wait.
+The measured two-second transfer starts only after this exchange; warmups are
+excluded from all delivery scores. This opens outbound UDP state on both peers
+without requiring unsolicited inbound allowances. The client accepts measured
+packets only from the announced host IP and port. Missing support is reported
+as a host update requirement, and failed handshakes produce no recommendation.
+The successful HTTPS response uses connection-close framing so its final XML
+can follow the completed measurement. Handshake failures after the initial
+headers return XML with `status_code=500` and the failure message. Hosts retain
+the legacy transfer when `handshake` is absent or zero for older clients.
 The host refuses probes during stream activity and serializes them with stream
 operations on the existing blocking worker. Each probe lasts two seconds and
 paces whole packets in 1 ms groups. Its UDP payload is `packetsize + 48` bytes:
@@ -484,13 +501,16 @@ The UDP search starts at the ceiling bounded by known routed endpoint link
 speeds and the 3 Gbps UI limit. For Minimum and Recommended, the ceiling also
 stops at the largest quality target in the matrix, allowing applied rounding
 and the 5% confirmation margin. Failed ceilings are bisected to 5 Mbps. A pass requires all planned packets sent,
-no more than 0.1% aggregate loss or 1% loss in any 100 ms window, p99 transit
-variation at most 4 ms, delay growth at most 2 ms, and sender duration within
+no more than 0.1% aggregate loss or 1% loss in any 100 ms window, finite timing
+measurements, delay growth at most 2 ms, and sender duration within
 2% of the requested duration. These are calibration policy thresholds, not FEC
 recovery guarantees. The highest passing rate is reduced by 5% where possible
 and measured twice afresh. Failed confirmation reduces the rate by 20% and
 retests; persistent loss, blocked UDP, malformed responses, or an unsupported
 host do not produce a rate. Cancellation abandons the current result.
+The separate strict diagnostic grade retains the 4 ms p99 transit-variation
+threshold. It does not gate the usable budget or produce a calibration warning;
+result colors reflect whether the selected image-quality target is met.
 
 Each GPU format tests its chosen image target directly within that confirmed
 wire budget. A passing ceiling stops the search; no lower successful probes are

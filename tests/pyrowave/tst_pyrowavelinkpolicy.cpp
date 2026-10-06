@@ -138,6 +138,20 @@ int main() {
     CHECK(C::imageTarget(C::Minimum, 5000, 2000000) == 5000);
     CHECK(C::wireTarget(C::Moderate, 950000) == 570000);
     CHECK(C::wireTarget(C::Maximum, 950000) == 950000);
+    CHECK(C::imageQuality(C::Recommended, 500000, 765000) == C::ReducedQuality);
+    CHECK(C::imageQuality(C::Recommended, 765000, 765000) == C::MeetsTarget);
+    CHECK(C::imageQuality(C::Recommended, 900000, 765000) == C::MeetsTarget);
+    CHECK(C::imageQuality(C::Recommended, 380000, 765000) == C::ReducedQuality);
+    CHECK(C::imageQuality(C::Recommended, 375000, 765000) == C::BelowMinimum);
+    CHECK(C::imageQuality(C::Minimum, 380000, 765000) == C::MeetsTarget);
+    CHECK(C::imageQuality(C::Minimum, 375000, 765000) == C::BelowMinimum);
+    CHECK(C::imageQuality(C::Minimum, 0, 5000) == C::BelowMinimum);
+    // The measured wire rate is not image quality: reserve FEC and headers,
+    // then apply Moderate's allowance before grading against the guide.
+    CHECK(C::imageQuality(C::Recommended, C::imageCapacity(500000, 120, t), 765000) == C::ReducedQuality);
+    CHECK(C::imageQuality(C::Minimum, C::imageCapacity(500000, 120, t), 765000) == C::MeetsTarget);
+    CHECK(C::imageQuality(C::Recommended, C::imageCapacity(765000, 120, t), 765000) != C::MeetsTarget);
+    CHECK(C::imageQuality(C::Moderate, C::imageCapacity(C::wireTarget(C::Moderate, 950000), 120, t), 765000) == C::ReducedQuality);
     for (int fps : {30, 60, 120, 240}) for (int guide : {5000, 100000, 765000, 2000000}) {
         const int ceiling = C::qualityProbeCeiling(guide, fps, t);
         const int confirmed = C::roundDown(ceiling * 0.95);

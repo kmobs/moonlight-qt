@@ -2,6 +2,8 @@
 
 #include <QObject>
 #include <QNetworkAccessManager>
+#include <QJsonArray>
+#include <QJsonObject>
 
 class AutoUpdateChecker : public QObject
 {
@@ -18,9 +20,14 @@ private slots:
     void handleUpdateCheckRequestFinished(QNetworkReply* reply);
 
 private:
-    void parseStringToVersionQuad(QString& string, QVector<int>& version);
+    friend class AutoUpdateCheckerTest;
 
-    int compareVersion(QVector<int>& version1, QVector<int>& version2);
+    static bool parseVersion(const QString& string, QVector<int>& version);
+
+    static int compareVersion(const QVector<int>& version1, const QVector<int>& version2);
+
+    static QJsonObject findUpdate(const QJsonArray& releases, const QVector<int>& currentVersion,
+                                 const QString& platform, const QString& architecture);
 
     QString getPlatform();
 

@@ -23,7 +23,8 @@ class PyroWaveCalibrator : public QObject
     Q_PROPERTY(bool running READ running NOTIFY changed)
     Q_PROPERTY(bool bandwidthReady READ bandwidthReady NOTIFY changed)
     Q_PROPERTY(int bandwidthKbps READ bandwidthKbps NOTIFY changed)
-    Q_PROPERTY(bool networkTimingWarning READ networkTimingWarning NOTIFY changed)
+    Q_PROPERTY(int bandwidthTargetKbps READ bandwidthTargetKbps NOTIFY changed)
+    Q_PROPERTY(QString bandwidthQuality READ bandwidthQuality NOTIFY changed)
     Q_PROPERTY(QString message READ message NOTIFY changed)
     Q_PROPERTY(QString linkSummary READ linkSummary NOTIFY changed)
     Q_PROPERTY(QVariantList results READ results NOTIFY changed)
@@ -43,7 +44,8 @@ public:
     bool running() const { return m_Running; }
     bool bandwidthReady() const { return m_BandwidthReady && !m_Running; }
     int bandwidthKbps() const { return m_LinkCapKbps; }
-    bool networkTimingWarning() const { return m_NetworkTimingWarning; }
+    int bandwidthTargetKbps() const;
+    QString bandwidthQuality() const;
     QString message() const { return m_Message; }
     QString linkSummary() const { return m_LinkSummary; }
     QVariantList results() const { return m_Results; }
@@ -69,12 +71,13 @@ private:
     void watchWorker();
     bool m_Running = false;
     bool m_BandwidthReady = false;
-    bool m_NetworkTimingWarning = false;
     int m_LinkCapKbps = 0;
     int m_Fps = 60;
     int m_DisplayWidth = 0;
     int m_DisplayHeight = 0;
     int m_Target = Recommended;
+    int m_RecommendedImageKbps = 0;
+    QString m_VideoDescription;
     QString m_HostUuid;
     pyrowave::bandwidth::transport_t m_Transport;
     QString m_Message;

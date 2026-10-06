@@ -5,9 +5,10 @@ of a session working on streaming, decoding, rendering, VRR, latency, or replay.
 It explains the implementation and the reasoning needed to investigate it;
 it does not establish that a particular deployed executable matches the source.
 
-Current source review baseline: `8101fd29` plus automatic Windows composition
+Current source review baseline: `54cdfaef` plus the paired-HTTPS UDP calibration
+handshake in this worktree (2026-10-04). Automatic Windows composition
 presentation, explicit native synchronization and continuous D3D11 overlay
-publication in this worktree (2026-10-04).
+publication are included.
 The upstream two-step PyroWave calibration targets, planned-present timing
 judgements and below-VRR-floor pause are included. The shared customizable VRR
 settings, Reduce judder readiness bound, above-target shrinkage correction,
@@ -434,6 +435,17 @@ The 2026-10-04 UI follow-up gives the four target cards equal widths and short
 budget descriptions, highlights the next useful action, and groups connection
 progress and the confirmed budget in a status panel. The first screen is 480
 logical pixels tall where space permits, with controller hints below the panel.
+The 2026-10-05 correction reserves the spinner width and status text space so
+starting a transfer does not reflow the panel. Step one scrolls when its content
+exceeds the available height. Its result grades the resolution, FPS, chroma and
+HDR settings selected when the test starts, using the confirmed image capacity
+after FEC, packet overhead and the chosen target's wire allowance. Green means
+the selected Minimum or Recommended guide is met (Moderate and Maximum compare
+against Recommended); yellow means below Recommended but at least Minimum;
+red means below Minimum. The target's
+required wire rate is shown beside the measured budget. A usable lower-quality
+connection can still continue to the per-format decoder tests, where an Any
+display result is yellow/red when its image rate misses these quality bounds.
 Four target cards default to Recommended: Minimum requests half the author's
 recommended image bitrate (rounded down to the 5 Mbps step, with a 5 Mbps
 minimum), Recommended requests the author's full image guide, Moderate uses at
@@ -477,9 +489,11 @@ confirmations; failed confirmation backs off another 20%. Sequence accounting
 includes lost tails without counting duplicates. The <=4 ms p99 relative transit
 variation gate remains the separate strict stability grade, but no longer
 prevents local GPU/format calibration on a loss-qualified, non-growing link.
-Such results display a network timing/stutter warning and call the rate a
-measured throughput budget, rather than claiming stable delivery. Missing
-support, blocked UDP, persistent loss or growing queues give no recommendation. The legacy bulk
+The 2026-10-05 follow-up removes the 4 ms warning and its effect on result
+colors from both calibration steps. Transit variation remains in diagnostic
+logs and the measured-throughput summary. Result colors grade image quality.
+Missing support, blocked UDP, persistent loss or growing queues give no
+recommendation. The legacy bulk
 HTTPS probe remains available but is not used to grade stability.
 
 The UDP receiver resolves DNS/mDNS hostnames such as `ambidexl.local` before
@@ -489,6 +503,21 @@ names retain IPv6. The pinned-certificate HTTPS probe uses the same resolved
 address as the UDP source filter, avoiding address-family mismatches. Resolution
 and socket-open errors identify the actual failure. The original numeric-only
 parser rejected hostname connections before sending any probe packets.
+Windows calibration now requires `PyroWaveUdpHandshakeVersion=1` in addition to
+the existing probe and wire-budget capabilities. Linux and macOS use it when
+advertised and retain their legacy probe against older hosts. The client requests `handshake=1`
+and handles the paired HTTPS response's `X-PyroWave-Udp-Port` header while its
+XML body remains pending. It sends the 32-byte token from the actual receiving
+socket to that announced host port, retrying every 100 ms until an authenticated
+measured packet arrives or cancellation occurs. Measured packets must match the
+announced IP and port as well as the token and sequence. The matching host opens
+outbound state with ungraded token warmups, allows at most 1500 ms for the token
+from the HTTPS peer's IP, and starts its two-second measurement afterward. This
+establishes the UDP return path on both peers without changing firewall rules;
+HTTPS alone cannot establish that UDP exchange. Warmups do not enter the packet
+counts or timing scores. On Windows, legacy hosts produce an explicit update requirement.
+The host implementation must be deployed separately before live calibration
+can be verified; a passing client loopback test does not establish live success.
 Authenticated UDP-test HTTP errors preserve the host's plain-text rejection
 reason in the UI and log. In particular, a host with an active stream refuses
 calibration with HTTP 400 and asks the user to stop streaming first; this is
@@ -1373,6 +1402,22 @@ has display priority while retaining both warnings; clearing any source cannot
 clear the others. Client pacing counters do not feed the network frame-gap
 counter or the transport connection callback. Those existing delivery-loss
 signals do not diagnose a specific network component or internal GPU cause.
+
+PyroWave packet-loss warning (2026-10-05, `ed757879` plus this worktree):
+the decoder observes `BUFFER_TYPE_LOST` payload holes before decoding or
+stale-frame shedding, independently of the stats overlay and VRR selection.
+Partial frames count as affected even when they display successfully. Following
+the transport warning's thresholds, a three-second window with at least 30%
+affected frames, or two consecutive windows with at least 15%, shows red text:
+"Severe packet loss detected / Reduce bitrate to prevent shimmering".
+A window at or below 5% clears this source; a reporting gap over 2.5 seconds,
+decoder reset, or disabled connection warnings restarts qualification. This is
+the percentage of delivered frames with unrecovered holes, not a raw network
+packet-loss percentage or a diagnosis of where packets disappeared. Fully
+recovered FEC packets do not qualify. The transport's whole-frame-loss callback
+uses the same text for the negotiated PyroWave codec. Both sources retain their
+own state and identical text is displayed once, alongside client pacing warnings;
+mouse-mode priority is unchanged. No bitrate changes automatically.
 
 ### Cross-platform ownership and buffer-attribution correction (2026-09-19)
 

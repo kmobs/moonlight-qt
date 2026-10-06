@@ -2,8 +2,7 @@
 
 #include <QNetworkReply>
 #include <QJsonDocument>
-#include <QJsonArray>
-#include <QJsonObject>
+#include <QRegularExpression>
 
 AutoUpdateChecker::AutoUpdateChecker(QObject *parent) :
     QObject(parent)
@@ -12,25 +11,22 @@ AutoUpdateChecker::AutoUpdateChecker(QObject *parent) :
 
     // Never communicate over HTTP
     m_Nam->setStrictTransportSecurityEnabled(true);
-
-    // Allow HTTP redirects
     m_Nam->setRedirectPolicy(QNetworkRequest::NoLessSafeRedirectPolicy);
 
     connect(m_Nam, &QNetworkAccessManager::finished,
             this, &AutoUpdateChecker::handleUpdateCheckRequestFinished);
 
-    QString currentVersion(VERSION_STR);
+    const QString currentVersion(VERSION_STR);
     qDebug() << "Current Moonlight version:" << currentVersion;
-    parseStringToVersionQuad(currentVersion, m_CurrentVersionQuad);
-
-    // Should at least have a 1.0-style version number
-    Q_ASSERT(m_CurrentVersionQuad.count() > 1);
+    if (!parseVersion(currentVersion, m_CurrentVersionQuad)) {
+        // Development hashes and vrr-lite builds have no ordered release version.
+        qDebug() << "Skipping update checks for an unversioned development build";
+    }
 }
 
 void AutoUpdateChecker::start()
 {
-    if (!m_Nam) {
-        Q_ASSERT(m_Nam);
+    if (!m_Nam || m_CurrentVersionQuad.isEmpty()) {
         return;
     }
 
@@ -43,9 +39,11 @@ void AutoUpdateChecker::start()
     QT_WARNING_POP
 #endif
 
-    // We'll get a callback when this is finished
-    QUrl url("https://moonlight-stream.org/updates/qt.json");
-    QNetworkRequest request(url);
+    // The list includes published prereleases, which are used for VRR releases.
+    // Never consult the upstream manifest or fall back to upstream releases.
+    QNetworkRequest request(QUrl(QStringLiteral("https://api.github.com/repos/Nonary/moonlight-qt/releases?per_page=100")));
+    request.setRawHeader("Accept", "application/vnd.github+json");
+    request.setRawHeader("User-Agent", "Moonlight-Nonary-UpdateChecker");
 #if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
     request.setAttribute(QNetworkRequest::Http2AllowedAttribute, true);
 #else
@@ -55,12 +53,26 @@ void AutoUpdateChecker::start()
 #endif
 }
 
-void AutoUpdateChecker::parseStringToVersionQuad(QString& string, QVector<int>& version)
+bool AutoUpdateChecker::parseVersion(const QString& string, QVector<int>& version)
 {
-    QStringList list = string.split('.');
-    for (const QString& component : std::as_const(list)) {
-        version.append(component.toInt());
+    // Compare base version, VRR revision, then VRR patch numerically. A plain
+    // base version sorts before its VRR releases; vrr18 sorts after vrr17.1.
+    static const QRegularExpression pattern(QStringLiteral("\\Av?([0-9]+)\\.([0-9]+)\\.([0-9]+)(?:-vrr([0-9]+)(?:\\.([0-9]+))?)?\\z"));
+    const auto match = pattern.match(string);
+    version.clear();
+    if (!match.hasMatch()) {
+        return false;
     }
+    for (int i = 1; i <= 5; ++i) {
+        bool ok = true;
+        const int component = match.captured(i).isEmpty() ? 0 : match.captured(i).toInt(&ok);
+        if (!ok) {
+            version.clear();
+            return false;
+        }
+        version.append(component);
+    }
+    return true;
 }
 
 QString AutoUpdateChecker::getPlatform()
@@ -69,150 +81,110 @@ QString AutoUpdateChecker::getPlatform()
     return QStringLiteral("steamlink");
 #elif defined(APP_IMAGE)
     return QStringLiteral("appimage");
-#elif defined(Q_OS_DARWIN) && QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    // Qt 6 changed this from 'osx' to 'macos'. Use the old one
-    // to be consistent (and not require another entry in the manifest).
+#elif defined(Q_OS_DARWIN)
     return QStringLiteral("osx");
 #else
     return QSysInfo::productType();
 #endif
 }
 
-int AutoUpdateChecker::compareVersion(QVector<int>& version1, QVector<int>& version2) {
-    for (int i = 0;; i++) {
-        int v1Val = 0;
-        int v2Val = 0;
-
-        // Treat missing decimal places as 0
-        if (i < version1.count()) {
-            v1Val = version1[i];
-        }
-        if (i < version2.count()) {
-            v2Val = version2[i];
-        }
-        if (i >= version1.count() && i >= version2.count()) {
-            // Equal versions
-            return 0;
-        }
-
-        if (v1Val < v2Val) {
-            return -1;
-        }
-        else if (v1Val > v2Val) {
-            return 1;
+int AutoUpdateChecker::compareVersion(const QVector<int>& version1, const QVector<int>& version2)
+{
+    for (int i = 0; i < qMax(version1.size(), version2.size()); ++i) {
+        const int v1 = version1.value(i);
+        const int v2 = version2.value(i);
+        if (v1 != v2) {
+            return v1 < v2 ? -1 : 1;
         }
     }
+    return 0;
+}
+
+QJsonObject AutoUpdateChecker::findUpdate(const QJsonArray& releases, const QVector<int>& currentVersion,
+                                        const QString& platform, const QString& architecture)
+{
+    if (currentVersion.isEmpty()) {
+        return {};
+    }
+
+    QJsonObject latest;
+    QVector<int> latestVersion = currentVersion;
+    for (const auto& entry : releases) {
+        const auto release = entry.toObject();
+        if (!release.value("draft").isBool() || release.value("draft").toBool() ||
+                !release.value("tag_name").isString() || !release.value("assets").isArray()) {
+            continue;
+        }
+
+        const QString tag = release.value("tag_name").toString();
+        QVector<int> version;
+        if (!parseVersion(tag, version) || compareVersion(version, latestVersion) <= 0) {
+            continue;
+        }
+
+        const QString versionString = tag.startsWith('v') ? tag.mid(1) : tag;
+        QString assetName;
+        if (platform == "windows") {
+            const QString arch = architecture == "x86_64" ? QStringLiteral("x64") :
+                                 architecture == "i386" ? QStringLiteral("x86") : architecture;
+            assetName = QStringLiteral("MoonlightPortable-%1-%2.zip").arg(arch, versionString);
+        }
+        else if (platform == "appimage") {
+            assetName = QStringLiteral("Moonlight-%1-%2.AppImage").arg(versionString, architecture);
+        }
+        else if (platform == "osx") {
+            assetName = QStringLiteral("Moonlight-%1.dmg").arg(versionString);
+        }
+        else if (platform == "steamlink") {
+            assetName = QStringLiteral("Moonlight-SteamLink-%1.zip").arg(versionString);
+        }
+        else {
+            continue;
+        }
+
+        for (const auto& assetEntry : release.value("assets").toArray()) {
+            const auto asset = assetEntry.toObject();
+            if (asset.value("name").toString() == assetName &&
+                    asset.value("state").toString() == "uploaded" && asset.value("size").toDouble() > 0) {
+                latest = release;
+                latestVersion = version;
+                break;
+            }
+        }
+    }
+    return latest;
 }
 
 void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
 {
     Q_ASSERT(reply->isFinished());
 
-    // Delete the QNetworkAccessManager to free resources and
-    // prevent the bearer plugin from polling in the background.
+    // Free resources and prevent the bearer plugin from polling in the background.
     m_Nam->deleteLater();
     m_Nam = nullptr;
+    reply->deleteLater();
 
-    if (reply->error() == QNetworkReply::NoError) {
-        QTextStream stream(reply);
-
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        stream.setEncoding(QStringConverter::Utf8);
-#else
-        stream.setCodec("UTF-8");
-#endif
-
-        // Read all data and queue the reply for deletion
-        QString jsonString = stream.readAll();
-        reply->deleteLater();
-
-        QJsonParseError error;
-        QJsonDocument jsonDoc = QJsonDocument::fromJson(jsonString.toUtf8(), &error);
-        if (jsonDoc.isNull()) {
-            qWarning() << "Update manifest malformed:" << error.errorString();
-            return;
-        }
-
-        QJsonArray array = jsonDoc.array();
-        if (array.isEmpty()) {
-            qWarning() << "Update manifest doesn't contain an array";
-            return;
-        }
-
-        for (const auto& updateEntry : std::as_const(array)) {
-            if (updateEntry.isObject()) {
-                QJsonObject updateObj = updateEntry.toObject();
-                if (!updateObj.contains("platform") ||
-                        !updateObj.contains("arch") ||
-                        !updateObj.contains("version") ||
-                        !updateObj.contains("browser_url")) {
-                    qWarning() << "Update manifest entry missing vital field";
-                    continue;
-                }
-
-                if (!updateObj["platform"].isString() ||
-                        !updateObj["arch"].isString() ||
-                        !updateObj["version"].isString() ||
-                        !updateObj["browser_url"].isString()) {
-                    qWarning() << "Update manifest entry has unexpected vital field type";
-                    continue;
-                }
-
-                if (updateObj["arch"] == QSysInfo::buildCpuArchitecture() &&
-                        updateObj["platform"] == getPlatform()) {
-
-                    // Check the kernel version minimum if one exists
-                    if (updateObj.contains("kernel_version_at_least") && updateObj["kernel_version_at_least"].isString()) {
-                        QVector<int> requiredVersionQuad;
-                        QVector<int> actualVersionQuad;
-
-                        QString requiredVersion = updateObj["kernel_version_at_least"].toString();
-                        QString actualVersion = QSysInfo::kernelVersion();
-                        parseStringToVersionQuad(requiredVersion, requiredVersionQuad);
-                        parseStringToVersionQuad(actualVersion, actualVersionQuad);
-
-                        if (compareVersion(actualVersionQuad, requiredVersionQuad) < 0) {
-                            qDebug() << "Skipping manifest entry due to kernel version (" << actualVersion << "<" << requiredVersion << ")";
-                            continue;
-                        }
-                    }
-
-                    qDebug() << "Found update manifest match for current platform";
-
-                    QString latestVersion = updateObj["version"].toString();
-                    qDebug() << "Latest version of Moonlight for this platform is:" << latestVersion;
-
-                    QVector<int> latestVersionQuad;
-                    parseStringToVersionQuad(latestVersion, latestVersionQuad);
-
-                    int res = compareVersion(m_CurrentVersionQuad, latestVersionQuad);
-                    if (res < 0) {
-                        // m_CurrentVersionQuad < latestVersionQuad
-                        qDebug() << "Update available";
-                        emit onUpdateAvailable(updateObj["version"].toString(),
-                                               updateObj["browser_url"].toString());
-                        return;
-                    }
-                    else if (res > 0) {
-                        qDebug() << "Update manifest version lower than current version";
-                        return;
-                    }
-                    else {
-                        qDebug() << "Update manifest version equal to current version";
-                        return;
-                    }
-                }
-            }
-            else {
-                qWarning() << "Update manifest contained unrecognized entry:" << updateEntry.toString();
-            }
-        }
-
-        qWarning() << "No entry in update manifest found for current platform:"
-                   << QSysInfo::buildCpuArchitecture() << getPlatform() << QSysInfo::kernelVersion();
-    }
-    else {
+    if (reply->error() != QNetworkReply::NoError) {
         qWarning() << "Update checking failed with error:" << reply->error();
-        reply->deleteLater();
+        return;
     }
+
+    QJsonParseError error;
+    const auto document = QJsonDocument::fromJson(reply->readAll(), &error);
+    if (!document.isArray()) {
+        qWarning() << "GitHub release list malformed:" << error.errorString();
+        return;
+    }
+
+    const auto update = findUpdate(document.array(), m_CurrentVersionQuad,
+                                   getPlatform(), QSysInfo::buildCpuArchitecture());
+    if (update.isEmpty()) {
+        qDebug() << "No newer compatible Nonary Moonlight release found";
+        return;
+    }
+
+    const QString tag = update.value("tag_name").toString();
+    const QString version = tag.startsWith('v') ? tag.mid(1) : tag;
+    qDebug() << "Nonary Moonlight update available:" << version;
+    emit onUpdateAvailable(version, QStringLiteral("https://github.com/Nonary/moonlight-qt/releases/tag/") + tag);
 }

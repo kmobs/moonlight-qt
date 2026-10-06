@@ -368,8 +368,10 @@ void FFmpegVideoDecoder::reset()
     }
 
     m_ClientPacingWarning = {};
+    m_PyroWavePacketLossWarning = {};
     if (Session::get() && !m_TestOnly) {
         Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::ClientPacing, "");
+        Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::PacketLoss, "");
     }
 
     // Windows normally roll over from submitDecodeUnit(). Session shutdown
@@ -2962,6 +2964,24 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     }
 
     m_BwTracker.AddBytes(du->fullLength);
+
+    // Observe every delivered PyroWave frame before stale-frame shedding or
+    // decoding. Missing detail can shimmer without dropping a whole frame.
+    if (!m_TestOnly) {
+        bool partial = false;
+        if (m_PyroWaveActive) {
+            for (PLENTRY packet = du->bufferList; packet != nullptr; packet = packet->next) {
+                if (packet->bufferType == BUFFER_TYPE_LOST) {
+                    partial = true;
+                    break;
+                }
+            }
+        }
+        const bool visible = m_PyroWavePacketLossWarning.observe(LiGetMicroseconds(),
+            m_PyroWaveActive && Session::get()->clientPacingWarningsEnabled(), partial);
+        Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::PacketLoss,
+            visible ? PyroWavePacketLossWarning::Message : "");
+    }
 
     // The stats text changes once per second; the timing graph scrolls at 10 Hz.
     const uint64_t graphNowUs = LiGetMicroseconds();

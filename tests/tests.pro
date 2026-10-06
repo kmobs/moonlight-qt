@@ -4,6 +4,7 @@ TEMPLATE = subdirs
 CONFIG += ordered
 
 contains(CONFIG, tests) {
+    SUBDIRS += updates
     SUBDIRS += vrr
     SUBDIRS += haptics
     SUBDIRS += pyrowave

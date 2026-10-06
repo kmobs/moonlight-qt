@@ -220,7 +220,8 @@ int NvHTTP::probePyroWaveDownloadMbps()
     return qRound(bytes * 8.0 / clock.elapsed() / 1000.0);
 }
 
-PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const std::atomic<bool>& cancelled)
+PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const std::atomic<bool>& cancelled,
+                                           bool useHandshake)
 {
     if (m_ServerCert.isNull() || httpsPort() == 0 || kbps < 5000 || kbps > 3000000 ||
         packetSize < 256 || packetSize > 1392) {
@@ -232,6 +233,7 @@ PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const st
     probeUrl.setHost(host.toString());
     socket.setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, 8 * 1024 * 1024);
     const QByteArray token = QUuid::createUuid().toRfc4122().toHex();
+    PyroWaveUdp::ProbeHandshake handshake(socket, host, token, cancelled);
     PyroWaveLink::Result result;
     result.requestedKbps = kbps;
     result.expected = uint64_t(kbps) * PyroWaveLink::durationMs / (8 * (packetSize + 134));
@@ -247,11 +249,14 @@ PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const st
         // traffic arrives continuously. Cancellation still drains without grading.
         for (int count = 0; count < 4096 && socket.hasPendingDatagrams(); ++count) {
             QHostAddress source;
+            quint16 sourcePort;
             qint64 arrivalUs;
-            const auto bytes = timing.readDatagram(packet, sizeof(packet), &source, arrivalUs);
+            const auto bytes = timing.readDatagram(packet, sizeof(packet), &source, arrivalUs, &sourcePort);
             if (bytes < 0) break;
-            if (bytes != packetSize + 48 || source != host ||
+            if (bytes != packetSize + 48 ||
+                (useHandshake ? !handshake.acceptsSource(source, sourcePort) : source != host) ||
                 memcmp(packet, token.constData(), 32) != 0 || cancelled.load()) continue;
+            handshake.receivedPacket();
             const auto seq = qFromBigEndian<quint32>(reinterpret_cast<const uchar*>(packet + 32));
             if (seq < arrivals.size() && arrivals[seq] < 0) {
                 if (arrivalUs < 0) { missingTimestamp = true; continue; }
@@ -266,10 +271,21 @@ PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const st
     poll.start(1);
     // ReadyRead continues draining UDP inside openConnection's event loop while
     // the host sends; the reliable response gives the count including lost tails.
-    const QString reply = openConnectionToString(probeUrl, "pyrowave-udp-probe",
-        QString("kbps=%1&port=%2&packetsize=%3&token=%4")
+    const std::function<QString(QNetworkReply*)> receiveHeaders = useHandshake ?
+        std::function<QString(QNetworkReply*)>([&](QNetworkReply* response) {
+            handshake.start(response->rawHeader("X-PyroWave-Udp-Port"));
+            return handshake.errorString();
+        }) : std::function<QString(QNetworkReply*)>();
+    QNetworkReply* networkReply = openConnection(probeUrl, "pyrowave-udp-probe",
+        (QString("kbps=%1&port=%2&packetsize=%3&token=%4") + (useHandshake ? "&handshake=1" : ""))
             .arg(kbps).arg(socket.localPort()).arg(packetSize).arg(QString::fromLatin1(token)),
-        6000, NVLL_ERROR);
+        6000, NVLL_ERROR, receiveHeaders);
+    const QString reply = QString::fromUtf8(networkReply->readAll());
+    delete networkReply;
+    if (useHandshake && !handshake.started()) {
+        throw std::runtime_error("Update Vibeshine to support the PyroWave UDP handshake");
+    }
+    if (!handshake.errorString().isEmpty()) throw std::runtime_error(handshake.errorString().toStdString());
     verifyResponseStatus(reply);
     bool validExpected = false, validSent = false, validElapsed = false;
     const auto expected = getXmlString(reply, "expected").toUInt(&validExpected);
@@ -591,7 +607,8 @@ NvHTTP::openConnection(QUrl baseUrl,
                        QString command,
                        QString arguments,
                        int timeoutMs,
-                       NvLogLevel logLevel)
+                       NvLogLevel logLevel,
+                       const std::function<QString(QNetworkReply*)>& receiveHeaders)
 {
     // Port must be set
     Q_ASSERT(baseUrl.port(0) != 0);
@@ -627,6 +644,16 @@ NvHTTP::openConnection(QUrl baseUrl,
 
     // Run the request with a timeout if requested
     QEventLoop loop;
+    QString headerError;
+    if (receiveHeaders) {
+        connect(reply, &QNetworkReply::metaDataChanged, &loop, [&] {
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (status >= 200 && status < 300) {
+                headerError = receiveHeaders(reply);
+                if (!headerError.isEmpty()) reply->abort();
+            }
+        });
+    }
     connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, &loop, &QEventLoop::quit);
     if (timeoutMs) {
@@ -651,6 +678,11 @@ NvHTTP::openConnection(QUrl baseUrl,
     m_Nam->clearAccessCache();
 #endif
     disconnect(sslErrorsConnection);
+
+    if (!headerError.isEmpty()) {
+        delete reply;
+        throw std::runtime_error(headerError.toStdString());
+    }
 
     // Handle error
     if (reply->error() != QNetworkReply::NoError)

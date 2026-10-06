@@ -92,8 +92,60 @@ PyroWaveUdp::ReceiverTiming::ReceiverTiming(QUdpSocket& socket) : m_Socket(socke
 #endif
 }
 
+PyroWaveUdp::ProbeHandshake::ProbeHandshake(QUdpSocket& socket, const QHostAddress& host,
+                                           const QByteArray& token, const std::atomic<bool>& cancelled) :
+    m_Socket(socket), m_Host(host), m_Token(token), m_Cancelled(cancelled)
+{
+    m_Retry.setInterval(100);
+    QObject::connect(&m_Retry, &QTimer::timeout, &m_Retry, [this] { sendToken(); });
+}
+
+bool PyroWaveUdp::ProbeHandshake::start(const QByteArray& portHeader)
+{
+    if (!m_Error.isEmpty()) return false;
+    bool valid = false;
+    const auto port = portHeader.toUShort(&valid);
+    if (portHeader.isEmpty() || portHeader.size() > 5 || !valid || port < 1024) {
+        m_Retry.stop();
+        m_Error = QStringLiteral("The host did not announce a valid PyroWave UDP port; update Vibeshine to support the UDP handshake");
+        return false;
+    }
+    for (char digit : portHeader) {
+        if (digit < '0' || digit > '9') {
+            m_Retry.stop();
+            m_Error = QStringLiteral("Invalid PyroWave UDP handshake port");
+            return false;
+        }
+    }
+    if (m_Port != 0 && m_Port != port) {
+        m_Error = QStringLiteral("The host changed its PyroWave UDP handshake port");
+        m_Retry.stop();
+        return false;
+    }
+    if (m_Port == port) return true;
+    m_Port = port;
+    if (m_Cancelled.load()) return true;
+    m_Retry.start();
+    sendToken();
+    return m_Error.isEmpty();
+}
+
+void PyroWaveUdp::ProbeHandshake::sendToken()
+{
+    if (m_Cancelled.load()) { m_Retry.stop(); return; }
+    if (m_Socket.writeDatagram(m_Token, m_Host, m_Port) != m_Token.size()) {
+        m_Error = QStringLiteral("Could not send the PyroWave UDP handshake: %1").arg(m_Socket.errorString());
+        m_Retry.stop();
+    }
+}
+
+bool PyroWaveUdp::ProbeHandshake::acceptsSource(const QHostAddress& source, quint16 port) const
+{
+    return m_Port != 0 && source == m_Host && port == m_Port;
+}
+
 qint64 PyroWaveUdp::ReceiverTiming::readDatagram(char* data, qint64 capacity,
-                                               QHostAddress* source, qint64& arrivalUs)
+                                               QHostAddress* source, qint64& arrivalUs, quint16* sourcePort)
 {
     arrivalUs = -1;
     m_LastReadDelayUs = -1;
@@ -120,7 +172,7 @@ qint64 PyroWaveUdp::ReceiverTiming::readDatagram(char* data, qint64 capacity,
             }
         }
     }
-    const auto bytes = m_Socket.readDatagram(data, capacity, source);
+    const auto bytes = m_Socket.readDatagram(data, capacity, source, sourcePort);
     if (bytes < 0) return bytes;
     const uint64_t readTicks = mach_absolute_time();
     if (ticks >= m_StartTicks && ticks <= readTicks) {
@@ -134,7 +186,7 @@ qint64 PyroWaveUdp::ReceiverTiming::readDatagram(char* data, qint64 capacity,
     // The caller can reject an authenticated packet instead of misgrading it.
     return bytes;
 #else
-    const auto bytes = m_Socket.readDatagram(data, capacity, source);
+    const auto bytes = m_Socket.readDatagram(data, capacity, source, sourcePort);
     if (bytes >= 0) {
         arrivalUs = m_Clock.nsecsElapsed() / 1000;
         m_LastReadDelayUs = 0;

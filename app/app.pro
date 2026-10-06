@@ -280,6 +280,7 @@ HEADERS += \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
     streaming/video/clientpacingwarning.h \
+    streaming/video/pyrowave/pyrowavepacketlosswarning.h \
     backend/systemproperties.h \
     backend/networkbuffers.h \
     windowsvblankvirtualization.h

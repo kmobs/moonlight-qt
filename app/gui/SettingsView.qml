@@ -893,7 +893,7 @@ Flickable {
                     }
                 }
 
-                Button {
+                CalibrationButton {
                     objectName: "pyrowaveCalibrationOpen"
                     text: qsTr("Calibrate PyroWave…")
                     visible: SystemProperties.hasPyroWave && slider.pyroWave
@@ -1068,6 +1068,12 @@ Flickable {
 
                     function tierColor(option) {
                         if (!option || hdrUnavailable(option)) return "#9e9e9e"
+                        if (option.tier !== "slow" && option.tier !== "error") {
+                            var minimum = Math.max(5000, Math.floor(option.guideKbps / 10000) * 5000)
+                            var required = selectedTarget === PyroWaveCalibrator.Minimum ? minimum : option.guideKbps
+                            if (option.imageKbps < minimum) return tierColors.slow
+                            if (option.imageKbps < required && option.tier === "any") return tierColors.vrr
+                        }
                         return tierColors[option.tier]
                     }
 
@@ -1142,7 +1148,7 @@ Flickable {
                         padding: 12
                         contentItem: RowLayout {
                             spacing: 8
-                            Button {
+                            CalibrationButton {
                                 id: calibrationRunButton
                                 objectName: "pyrowaveCalibrationRun"
                                 text: PyroWaveCalibrator.running ? (calibrationDialog.stopRequested ? qsTr("Stopping…") : qsTr("Stop test")) :
@@ -1180,7 +1186,7 @@ Flickable {
                                     event.accepted = true
                                 }
                             }
-                            Button {
+                            CalibrationButton {
                                 id: calibrationDetails
                                 objectName: "pyrowaveCalibrationDetails"
                                 visible: calibrationDialog.step === 1
@@ -1194,7 +1200,7 @@ Flickable {
                                 Keys.onDownPressed: calibrationDialog.focusOption(0, 0, 1)
                             }
                             Item { Layout.fillWidth: true }
-                            Button {
+                            CalibrationButton {
                                 id: calibrationCloseButton
                                 objectName: "pyrowaveCalibrationBack"
                                 text: calibrationDialog.step === 0 ? qsTr("Cancel") : qsTr("Back")
@@ -1209,7 +1215,7 @@ Flickable {
                                     else calibrationRunButton.forceActiveFocus(Qt.TabFocusReason)
                                 }
                             }
-                            Button {
+                            CalibrationButton {
                                 id: calibrationNextButton
                                 objectName: "pyrowaveCalibrationNext"
                                 text: qsTr("Next →")
@@ -1227,160 +1233,176 @@ Flickable {
 
                     contentItem: StackLayout {
                         currentIndex: calibrationDialog.step
-                        ColumnLayout {
-                            spacing: 12
-                            RowLayout {
-                                Layout.fillWidth: true
-                                Label { text: qsTr("Host") }
-                                AutoResizingComboBox {
-                                    id: calibrationHost
-                                    objectName: "pyrowaveCalibrationHost"
+                        ScrollView {
+                            id: calibrationConnectionScroll
+                            objectName: "pyrowaveCalibrationConnectionScroll"
+                            clip: true
+                            contentWidth: availableWidth
+                            ColumnLayout {
+                                width: calibrationConnectionScroll.availableWidth
+                                height: Math.max(implicitHeight, calibrationConnectionScroll.availableHeight)
+                                spacing: 12
+                                RowLayout {
                                     Layout.fillWidth: true
-                                    model: calibrationHosts
-                                    textRole: "name"
-                                    onCountChanged: { if (count > 0 && currentIndex < 0) currentIndex = 0 }
-                                    displayText: count > 0 ? currentText : qsTr("No hosts available")
-                                    enabled: !PyroWaveCalibrator.running
-                                    // Closed selectors use Tab for controller focus traversal.
-                                    // An open popup owns arrow keys for selecting a host.
-                                    KeyNavigation.backtab: calibrationCloseButton
-                                    Keys.onTabPressed: function(event) {
-                                        if (popup.visible) {
-                                            event.accepted = false
-                                            return
-                                        }
-                                        if (event.modifiers & Qt.ShiftModifier)
-                                            calibrationCloseButton.forceActiveFocus(Qt.TabFocusReason)
-                                        else calibrationDialog.focusTarget()
-                                    }
-                                }
-                                Label { text: qsTr("%1 FPS").arg(calibrationDialog.testFps) }
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                font.pointSize: 16
-                                font.bold: true
-                                text: qsTr("Choose your quality target")
-                                wrapMode: Text.Wrap
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 8
-                                Repeater {
-                                    id: calibrationTargets
-                                    model: calibrationDialog.targets
-                                    delegate: Button {
-                                        id: targetCard
-                                        objectName: "pyrowaveCalibrationTarget" + index
+                                    Label { text: qsTr("Host") }
+                                    AutoResizingComboBox {
+                                        id: calibrationHost
+                                        objectName: "pyrowaveCalibrationHost"
                                         Layout.fillWidth: true
-                                        Layout.preferredWidth: 1
-                                        Layout.preferredHeight: 82
-                                        text: modelData.text
-                                        checked: calibrationDialog.targetIndex === index
+                                        model: calibrationHosts
+                                        textRole: "name"
+                                        onCountChanged: { if (count > 0 && currentIndex < 0) currentIndex = 0 }
+                                        displayText: count > 0 ? currentText : qsTr("No hosts available")
                                         enabled: !PyroWaveCalibrator.running
-                                        activeFocusOnTab: true
-                                        Accessible.name: modelData.text
-                                        Accessible.description: modelData.description
-                                        contentItem: Column {
-                                            spacing: 6
-                                            Label {
-                                                width: parent.width
-                                                text: targetCard.text
-                                                font.bold: targetCard.checked
-                                                font.pointSize: 11
-                                                horizontalAlignment: Text.AlignHCenter
-                                                elide: Text.ElideRight
-                                                color: targetCard.checked ? "#e1bee7" : "#ffffff"
+                                        // Closed selectors use Tab for controller focus traversal.
+                                        // An open popup owns arrow keys for selecting a host.
+                                        KeyNavigation.backtab: calibrationCloseButton
+                                        Keys.onTabPressed: function(event) {
+                                            if (popup.visible) {
+                                                event.accepted = false
+                                                return
                                             }
-                                            Label {
-                                                width: parent.width
-                                                text: modelData.summary
-                                                font.pointSize: 9
-                                                horizontalAlignment: Text.AlignHCenter
-                                                wrapMode: Text.Wrap
-                                                color: "#c7c7c7"
-                                            }
+                                            if (event.modifiers & Qt.ShiftModifier)
+                                                calibrationCloseButton.forceActiveFocus(Qt.TabFocusReason)
+                                            else calibrationDialog.focusTarget()
                                         }
-                                        background: Rectangle {
-                                            radius: 8
-                                            color: targetCard.checked ? "#51405c" : "#383838"
-                                            border.width: targetCard.activeFocus ? 3 : 1
-                                            border.color: targetCard.activeFocus ? "#e1bee7" : targetCard.checked ? "#ab75c3" : "#606060"
+                                    }
+                                    Label { text: qsTr("%1 FPS").arg(calibrationDialog.testFps) }
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    font.pointSize: 16
+                                    font.bold: true
+                                    text: qsTr("Choose your quality target")
+                                    wrapMode: Text.Wrap
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    Repeater {
+                                        id: calibrationTargets
+                                        model: calibrationDialog.targets
+                                        delegate: CalibrationButton {
+                                            id: targetCard
+                                            objectName: "pyrowaveCalibrationTarget" + index
+                                            Layout.fillWidth: true
+                                            Layout.preferredWidth: 1
+                                            Layout.preferredHeight: 82
+                                            text: modelData.text
+                                            checked: calibrationDialog.targetIndex === index
+                                            enabled: !PyroWaveCalibrator.running
+                                            activeFocusOnTab: true
+                                            Accessible.name: modelData.text
+                                            Accessible.description: modelData.description
+                                            contentItem: Column {
+                                                spacing: 6
+                                                Label {
+                                                    width: parent.width
+                                                    text: (targetCard.checked ? "\u2713 " : "") + targetCard.text
+                                                    font.bold: targetCard.checked
+                                                    font.pointSize: 11
+                                                    horizontalAlignment: Text.AlignHCenter
+                                                    elide: Text.ElideRight
+                                                    color: "#ffffff"
+                                                }
+                                                Label {
+                                                    width: parent.width
+                                                    text: modelData.summary
+                                                    font.pointSize: 9
+                                                    horizontalAlignment: Text.AlignHCenter
+                                                    wrapMode: Text.Wrap
+                                                    color: "#c7c7c7"
+                                                }
+                                            }
                                             opacity: targetCard.enabled ? 1 : 0.6
-                                        }
-                                        onClicked: calibrationDialog.changeTarget(index)
-                                        Keys.priority: Keys.BeforeItem
-                                        Keys.onPressed: function(event) {
-                                            if (event.key === Qt.Key_Left) calibrationDialog.changeTarget(index - 1)
-                                            else if (event.key === Qt.Key_Right) calibrationDialog.changeTarget(index + 1)
-                                            else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up ||
-                                                     (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier)))
-                                                calibrationHost.forceActiveFocus(Qt.TabFocusReason)
-                                            else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Down)
-                                                (calibrationRunButton.enabled ? calibrationRunButton : calibrationCloseButton).forceActiveFocus(Qt.TabFocusReason)
-                                            else return
-                                            event.accepted = true
+                                            onClicked: calibrationDialog.changeTarget(index)
+                                            Keys.priority: Keys.BeforeItem
+                                            Keys.onPressed: function(event) {
+                                                if (event.key === Qt.Key_Left) calibrationDialog.changeTarget(index - 1)
+                                                else if (event.key === Qt.Key_Right) calibrationDialog.changeTarget(index + 1)
+                                                else if (event.key === Qt.Key_Backtab || event.key === Qt.Key_Up ||
+                                                         (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier)))
+                                                    calibrationHost.forceActiveFocus(Qt.TabFocusReason)
+                                                else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Down)
+                                                    (calibrationRunButton.enabled ? calibrationRunButton : calibrationCloseButton).forceActiveFocus(Qt.TabFocusReason)
+                                                else return
+                                                event.accepted = true
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                Layout.minimumHeight: 32
-                                wrapMode: Text.Wrap
-                                text: calibrationDialog.targets[calibrationDialog.targetIndex].description
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: qsTr("Test your connection first, then continue to test this device's decoder.")
-                                wrapMode: Text.Wrap
-                                opacity: 0.7
-                            }
-                            Item { Layout.fillHeight: true }
-                            Pane {
-                                Layout.fillWidth: true
-                                padding: 12
-                                background: Rectangle {
-                                    color: calibrationDialog.canContinue ? (PyroWaveCalibrator.networkTimingWarning ? "#413824" : "#283b2e") : "#252525"
-                                    radius: 8
-                                    border.color: calibrationDialog.canContinue ? (PyroWaveCalibrator.networkTimingWarning ? "#aa8542" : "#568260") : "#505050"
+                                Label {
+                                    Layout.fillWidth: true
+                                    Layout.minimumHeight: 32
+                                    wrapMode: Text.Wrap
+                                    text: calibrationDialog.targets[calibrationDialog.targetIndex].description
                                 }
-                                contentItem: RowLayout {
-                                    spacing: 12
-                                    BusyIndicator {
-                                        Layout.preferredWidth: 28
-                                        Layout.preferredHeight: 28
-                                        running: PyroWaveCalibrator.running
-                                        visible: running
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: qsTr("Test your connection first, then continue to test this device's decoder.")
+                                    wrapMode: Text.Wrap
+                                    opacity: 0.7
+                                }
+                                Item { Layout.fillHeight: true }
+                                Pane {
+                                    Layout.fillWidth: true
+                                    padding: 12
+                                    readonly property string grade: calibrationDialog.canContinue ? PyroWaveCalibrator.bandwidthQuality : ""
+                                    readonly property bool warning: grade === "reduced"
+                                    background: Rectangle {
+                                        color: parent.grade === "low" ? "#452b2b" : calibrationDialog.canContinue ? (parent.warning ? "#413824" : "#283b2e") : "#252525"
+                                        radius: 8
+                                        border.color: parent.grade === "low" ? "#b45c5c" : calibrationDialog.canContinue ? (parent.warning ? "#aa8542" : "#568260") : "#505050"
                                     }
-                                    ColumnLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 4
-                                        Label {
-                                            objectName: "pyrowaveCalibrationStatus"
+                                    contentItem: RowLayout {
+                                        spacing: 12
+                                        // Keep the text width stable when the spinner appears.
+                                        Item {
+                                            Layout.preferredWidth: 28
+                                            Layout.preferredHeight: 28
+                                            BusyIndicator {
+                                                anchors.fill: parent
+                                                running: PyroWaveCalibrator.running
+                                                visible: running
+                                            }
+                                        }
+                                        ColumnLayout {
                                             Layout.fillWidth: true
-                                            wrapMode: Text.Wrap
-                                            text: !calibrationDialog.hasStarted ? qsTr("Ready to test your connection.") :
-                                                  !calibrationDialog.resultsMatch ? qsTr("Selection changed. Test bandwidth again to continue.") : PyroWaveCalibrator.message
-                                        }
-                                        Label {
-                                            Layout.fillWidth: true
-                                            visible: calibrationDialog.canContinue
-                                            wrapMode: Text.Wrap
-                                            color: PyroWaveCalibrator.networkTimingWarning ? "#ffd180" : "#a5d6a7"
-                                            text: qsTr("Measured budget: %1 Mbps · Continue to the decoder test").arg(PyroWaveCalibrator.bandwidthKbps / 1000)
+                                            spacing: 4
+                                            Label {
+                                                id: calibrationStatusText
+                                                objectName: "pyrowaveCalibrationStatus"
+                                                Layout.fillWidth: true
+                                                Layout.minimumHeight: fontMetrics.height * 3
+                                                verticalAlignment: Text.AlignTop
+                                                wrapMode: Text.Wrap
+                                                text: !calibrationDialog.hasStarted ? qsTr("Ready to test your connection.") :
+                                                      !calibrationDialog.resultsMatch ? qsTr("Selection changed. Test bandwidth again to continue.") : PyroWaveCalibrator.message
+                                            }
+                                            Label {
+                                                Layout.fillWidth: true
+                                                Layout.minimumHeight: fontMetrics.height * 2
+                                                opacity: calibrationDialog.canContinue ? 1 : 0
+                                                verticalAlignment: Text.AlignTop
+                                                wrapMode: Text.Wrap
+                                                color: PyroWaveCalibrator.bandwidthQuality === "low" ? "#ef9a9a" :
+                                                       PyroWaveCalibrator.bandwidthQuality === "reduced" ? "#ffd180" : "#a5d6a7"
+                                                text: qsTr("Measured budget: %1 Mbps · Target needs: %2 Mbps including overhead")
+                                                    .arg(PyroWaveCalibrator.bandwidthKbps / 1000).arg(PyroWaveCalibrator.bandwidthTargetKbps / 1000)
+                                            }
+                                            FontMetrics { id: fontMetrics; font: calibrationStatusText.font }
                                         }
                                     }
                                 }
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                font.pointSize: 9
-                                color: "#bdbdbd"
-                                wrapMode: Text.Wrap
-                                text: qsTr("↑↓ Navigate  ·  ←→ Choose target  ·  %1 Select  ·  %2 Back")
-                                    .arg(StreamingPreferences.swapFaceButtons ? "B" : "A")
-                                    .arg(StreamingPreferences.swapFaceButtons ? "A" : "B")
+                                Label {
+                                    Layout.fillWidth: true
+                                    font.pointSize: 9
+                                    color: "#bdbdbd"
+                                    wrapMode: Text.Wrap
+                                    text: qsTr("↑↓ Navigate  ·  ←→ Choose target  ·  %1 Select  ·  %2 Back")
+                                        .arg(StreamingPreferences.swapFaceButtons ? "B" : "A")
+                                        .arg(StreamingPreferences.swapFaceButtons ? "A" : "B")
+                                }
                             }
                         }
                         ColumnLayout {
@@ -1396,14 +1418,6 @@ Flickable {
                                 Layout.fillWidth: true
                                 wrapMode: Text.Wrap
                                 text: PyroWaveCalibrator.message
-                            }
-                            Label {
-                                objectName: "pyrowaveNetworkTimingWarning"
-                                Layout.fillWidth: true
-                                visible: PyroWaveCalibrator.networkTimingWarning
-                                wrapMode: Text.Wrap
-                                color: "#ffd180"
-                                text: qsTr("Network timing warning: packet-arrival variation exceeds 4 ms and may cause stutter. Format grades measure this device's decode and draw capacity.")
                             }
                             ProgressBar {
                                 Layout.fillWidth: true
@@ -1542,7 +1556,7 @@ Flickable {
                                                     Repeater {
                                                         id: calibrationFormats
                                                         model: chromaColumn.modes
-                                                        delegate: Button {
+                                                        delegate: CalibrationButton {
                                                             id: optionButton
                                                             objectName: "pyrowaveCalibrationOption" + (calibrationRow.rowIndex * 4 + modelData)
                                                             width: parent.width
@@ -1554,13 +1568,6 @@ Flickable {
                                                             bottomInset: 0
                                                             leftInset: 0
                                                             rightInset: 0
-                                                            background: Rectangle {
-                                                                radius: 6
-                                                                color: optionButton.activeFocus ? "#484454" : "#383838"
-                                                                border.width: optionButton.activeFocus ? 2 : 1
-                                                                border.color: optionButton.activeFocus ? "#ce93d8" : "#505050"
-                                                                opacity: optionButton.enabled ? 1 : 0.55
-                                                            }
                                                             readonly property var option: calibrationDialog.sample(calibrationRow.rowIndex, modelData)
                                                             readonly property bool hdr: modelData % 2 === 0
                                                             enabled: calibrationDialog.canApply(option)
@@ -1591,7 +1598,7 @@ Flickable {
 
                                                             contentItem: Column {
                                                                 spacing: 2
-                                                                opacity: !optionButton.enabled ? 0.6 : optionButton.option && !optionButton.option.keepsUp ? 0.7 : 1.0
+                                                                opacity: !optionButton.enabled ? 0.6 : optionButton.activeFocus || optionButton.hovered ? 1.0 : optionButton.option && !optionButton.option.keepsUp ? 0.7 : 1.0
 
                                                                 Label {
                                                                     width: parent.width

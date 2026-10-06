@@ -236,6 +236,11 @@ void OverlayManager::setStatusMessage(StatusSource source, const std::string& te
         std::string combined = m_StatusMessages[static_cast<int>(StatusSource::Mouse)];
         if (combined.empty()) {
             combined = m_StatusMessages[static_cast<int>(StatusSource::Network)];
+            const auto& packetLoss = m_StatusMessages[static_cast<int>(StatusSource::PacketLoss)];
+            if (!packetLoss.empty() && packetLoss != combined) {
+                if (!combined.empty()) combined += "\n\n";
+                combined += packetLoss;
+            }
             const auto& client = m_StatusMessages[static_cast<int>(StatusSource::ClientPacing)];
             if (!combined.empty() && !client.empty()) combined += "\n\n";
             combined += client;

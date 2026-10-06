@@ -165,7 +165,10 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             while (recorded.pop(report)) {
                 ++reports;
-                if (packet > 110 && std::all_of(report + 13, report + 77,
+                // Observe silence from the end of the right-channel effect.
+                // Idle now follows the last nonzero sample, so Windows timer
+                // granularity can put the final report before packet 110.
+                if (packet >= 100 && std::all_of(report + 13, report + 77,
                                               [](uint8_t sample) { return sample == 0; }))
                     gotSilence = true;
                 for (unsigned i = 0; i < 32; ++i) {

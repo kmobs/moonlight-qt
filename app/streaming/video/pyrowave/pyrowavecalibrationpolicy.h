@@ -5,6 +5,7 @@
 
 namespace PyroWaveCalibration {
 enum Target { Minimum, Recommended, Moderate, Maximum };
+enum Quality { MeetsTarget, ReducedQuality, BelowMinimum };
 constexpr int stepKbps = 5000;
 
 inline int roundDown(double kbps) { return int(kbps / stepKbps) * stepKbps; }
@@ -22,6 +23,16 @@ inline int imageTarget(Target target, int recommendedKbps, int imageCapKbps)
 inline int wireTarget(Target target, int confirmedKbps)
 {
     return target == Moderate ? roundDown(confirmedKbps * 0.6) : confirmedKbps;
+}
+
+// Judge the uncapped quality guide. Capping it to the measured connection
+// before comparison would turn every usable link into a green result.
+inline Quality imageQuality(Target target, int imageKbps, int recommendedKbps)
+{
+    const int minimum = imageTarget(Minimum, recommendedKbps, recommendedKbps);
+    const int required = target == Minimum ? minimum : recommendedKbps;
+    if (imageKbps >= required) return MeetsTarget;
+    return imageKbps >= minimum ? ReducedQuality : BelowMinimum;
 }
 
 inline int qualityProbeCeiling(int imageKbps, int fps, const pyrowave::bandwidth::transport_t& transport)
