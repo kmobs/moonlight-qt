@@ -1,31 +1,36 @@
 // Adapted from Nonary moonlight-qt vrr18 (record framing and partial recovery).
 #include "pyrowaveframing.h"
 
+#ifdef HAVE_PYROWAVE
+
+#include <pyrowave_bitstream.hpp>
 #include <algorithm>
 #include <cstring>
 #include <limits>
 #include <utility>
 
+#include "SDL_compat.h"
+
 namespace PyroWaveFraming {
 
 namespace {
 
-// Bitstream constants (pyrowave bitstream/bitstream.md)
-constexpr int k_DecompositionLevels = 5;
-constexpr int k_BlockSize = 32;
-constexpr int k_MinimumImageSize = 128;
-constexpr size_t k_HeaderBytes = 8;
-constexpr uint32_t k_HeaderWords = 2;
+constexpr size_t k_HeaderBytes = sizeof(PyroWave::BitstreamHeader);
+constexpr uint32_t k_HeaderWords = k_HeaderBytes / sizeof(uint32_t);
 
 uint32_t readU32(const uint8_t* p)
 {
     return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
 }
 
-int alignedExtent(int extent)
+template <typename T>
+T readHeader(const uint8_t* data)
 {
-    int aligned = (extent + k_BlockSize - 1) / k_BlockSize * k_BlockSize;
-    return std::max(aligned, k_MinimumImageSize);
+    // The upstream wire structs target little-endian macOS. Copy instead of
+    // casting so the transport adapter can also inspect unaligned input.
+    T header;
+    std::memcpy(&header, data, sizeof(header));
+    return header;
 }
 
 // The frame's packets, looked up by byte offset. Without segments, the frame
@@ -126,37 +131,45 @@ private:
     mutable size_t m_Index = 0;
 };
 
-bool checkSequenceHeader(uint32_t word0, uint32_t word1, const StreamGeometry& geometry,
-                         uint32_t maxBlocks, Frame& frame, std::string& error)
+// Called with at least a full header. Inspect only what the transport walker
+// needs; the decoder's BitstreamParser owns codec validation and accumulation.
+bool inspectRecord(const uint8_t* data, size_t size, uint32_t maxBlocks,
+                   Frame& frame, PyroWave::BitstreamHeader& header,
+                   size_t& recordBytes, std::string& error)
 {
-    const int width = int(word0 & 0x3FFF) + 1;
-    const int height = int((word0 >> 14) & 0x3FFF) + 1;
-    const uint32_t totalBlocks = word1 & 0xFFFFFF;
-    const uint32_t code = (word1 >> 24) & 0x3;
-    const bool chroma444 = ((word1 >> 26) & 0x1) != 0;
-
-    if (code != 0) {
-        // Code 1 is the Solarflare "keep previous coefficients" frame,
-        // which upstream PyroWave cannot decode.
-        error = "unsupported sequence header code " + std::to_string(code);
-        return false;
-    }
-    if (width != geometry.width || height != geometry.height) {
-        error = "sequence header size " + std::to_string(width) + "x" + std::to_string(height) +
-                " differs from the stream";
-        return false;
-    }
-    if (chroma444 != geometry.chroma444) {
-        error = "sequence header chroma subsampling differs from the stream";
-        return false;
-    }
-    if (totalBlocks > maxBlocks) {
-        error = "sequence header announces more blocks than the frame can hold";
-        return false;
+    header = readHeader<PyroWave::BitstreamHeader>(data);
+    if (header.extended) {
+        if (frame.sequenceHeaderSeen) {
+            error = "second sequence header";
+            return false;
+        }
+        const auto sequence = readHeader<PyroWave::BitstreamSequenceHeader>(data);
+        if (sequence.total_blocks > maxBlocks) {
+            error = "sequence header announces more blocks than the frame can hold";
+            return false;
+        }
+        frame.sequenceHeaderSeen = true;
+        frame.sequence = sequence.sequence;
+        frame.announcedBlocks = sequence.total_blocks;
+        recordBytes = sizeof(sequence);
+        return true;
     }
 
-    frame.sequenceHeaderSeen = true;
-    frame.announcedBlocks = totalBlocks;
+    if (!frame.sequenceHeaderSeen || header.sequence != frame.sequence) {
+        error = "block record before sequence header or from another frame";
+        return false;
+    }
+    // Keep this guard even for duplicate blocks: upstream currently bypasses
+    // its minimum-length check for duplicates, and zero length cannot advance.
+    if (header.payload_words < k_HeaderWords) {
+        error = "block record shorter than its header";
+        return false;
+    }
+    recordBytes = size_t(header.payload_words) * sizeof(uint32_t);
+    if (recordBytes > size) {
+        error = "block record runs past the end of the packet or frame";
+        return false;
+    }
     return true;
 }
 
@@ -169,15 +182,14 @@ bool checkSequenceHeader(uint32_t word0, uint32_t word1, const StreamGeometry& g
 // Before that, and for hosts that let ordinary records straddle packets, the
 // rest of the frame is lost.
 bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segments,
-                     bool coarseLevelKnown, const StreamGeometry& geometry, uint32_t maxBlocks,
+                     bool coarseLevelKnown, const PyroWave::BlockLayout& layout,
                      Frame& frame, std::string& error)
 {
-    const uint32_t coarseBlocks = coarseBlockCount(geometry);
+    const uint32_t coarseBlocks = uint32_t(PyroWave::get_num_active_blocks(layout, 2));
     const size_t payloadSize = segments.payloadSize();
     const bool flagged = segments.recordStartsFlagged();
     size_t pos = 0;
     size_t spanStart = 0;
-    uint32_t sequence = 0;
     // Every later packet starts with a record
     bool aligned = false;
     // Every coarsest-level block has been passed
@@ -224,50 +236,24 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
             continue;
         }
 
-        if (word0 & 0x80000000u) {
-            if (frame.sequenceHeaderSeen) {
-                error = "second sequence header";
-                return false;
-            }
-            if (!checkSequenceHeader(word0, word1, geometry, maxBlocks, frame, error)) {
-                return false;
-            }
-            sequence = (word0 >> 28) & 0x7;
-            pos += k_HeaderBytes;
+        PyroWave::BitstreamHeader header;
+        size_t recordBytes;
+        if (!inspectRecord(data + pos, size - pos, uint32_t(layout.block_count_32x32),
+                           frame, header, recordBytes, error)) {
+            return false;
+        }
+        if (header.extended) {
+            pos += recordBytes;
             continue;
         }
-
-        // BitstreamHeader
-        const uint32_t payloadWords = (word0 >> 16) & 0xFFF;
-        const uint32_t blockIndex = word1 >> 8;
-
-        if (!frame.sequenceHeaderSeen) {
-            error = "block record before the sequence header";
-            return false;
-        }
-        if (((word0 >> 28) & 0x7) != sequence) {
-            error = "block record from another frame";
-            return false;
-        }
-        if (payloadWords < k_HeaderWords) {
-            error = "block record shorter than its header";
-            return false;
-        }
-        if (uint64_t(payloadWords) * 4 > size - pos) {
-            error = "block record runs past the end of the frame";
-            return false;
-        }
-        if (blockIndex >= maxBlocks) {
-            error = "block index " + std::to_string(blockIndex) + " is out of range";
-            return false;
-        }
+        const uint32_t blockIndex = header.block_index;
 
         // The whole coarsest level precedes the first finer block
         if (blockIndex >= coarseBlocks) {
             pastCoarseLevel = true;
         }
 
-        const size_t end = pos + size_t(payloadWords) * 4;
+        const size_t end = pos + recordBytes;
         if (segments.lost(pos, end)) {
             // Only a record that spans packets can lose its payload but not its header
             noteLoss();
@@ -291,14 +277,10 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
 
 // Walks one length-prefixed packet, which never contains padding.
 bool walkPacket(const uint8_t* data, size_t base, size_t size,
-                const StreamGeometry& geometry, uint32_t maxBlocks,
+                const PyroWave::BlockLayout& layout,
                 Frame& frame, std::string& error)
 {
     size_t pos = 0;
-    uint32_t sequence = 0;
-    if (frame.sequenceHeaderSeen) {
-        sequence = (readU32(data + frame.spans.front().offset) >> 28) & 7u;
-    }
 
     while (pos < size) {
         if (size - pos < k_HeaderBytes) {
@@ -307,49 +289,22 @@ bool walkPacket(const uint8_t* data, size_t base, size_t size,
         }
 
         const uint32_t word0 = readU32(data + base + pos);
-        const uint32_t word1 = readU32(data + base + pos + 4);
 
         if (word0 == k_PaddingMagic) {
             error = "padding record inside a length-prefixed packet";
             return false;
         }
 
-        if (word0 & 0x80000000u) {
-            if (frame.sequenceHeaderSeen) {
-                error = "second sequence header";
-                return false;
-            }
-            sequence = (word0 >> 28) & 7u;
-            if (!checkSequenceHeader(word0, word1, geometry, maxBlocks, frame, error)) {
-                return false;
-            }
-            pos += k_HeaderBytes;
-            continue;
-        }
-
-        // BitstreamHeader
-        const uint32_t payloadWords = (word0 >> 16) & 0xFFF;
-        const uint32_t blockIndex = word1 >> 8;
-
-        if (!frame.sequenceHeaderSeen || ((word0 >> 28) & 7u) != sequence) {
-            error = "block record before sequence header or from another frame";
+        PyroWave::BitstreamHeader header;
+        size_t recordBytes;
+        if (!inspectRecord(data + base + pos, size - pos, uint32_t(layout.block_count_32x32),
+                           frame, header, recordBytes, error)) {
             return false;
         }
-        if (payloadWords < k_HeaderWords) {
-            error = "block record shorter than its header";
-            return false;
+        if (!header.extended) {
+            frame.blockRecords++;
         }
-        if (uint64_t(payloadWords) * 4 > size - pos) {
-            error = "block record runs past the end of the frame";
-            return false;
-        }
-        if (blockIndex >= maxBlocks) {
-            error = "block index " + std::to_string(blockIndex) + " is out of range";
-            return false;
-        }
-
-        frame.blockRecords++;
-        pos += size_t(payloadWords) * 4;
+        pos += recordBytes;
     }
 
     if (size != 0) {
@@ -359,49 +314,20 @@ bool walkPacket(const uint8_t* data, size_t base, size_t size,
 }
 }
 
-uint32_t coarseBlockCount(const StreamGeometry& geometry)
-{
-    const int bandWidth = alignedExtent(geometry.width) >> k_DecompositionLevels;
-    const int bandHeight = alignedExtent(geometry.height) >> k_DecompositionLevels;
-    const uint32_t perBand = uint32_t((bandWidth + k_BlockSize - 1) / k_BlockSize) *
-                             uint32_t((bandHeight + k_BlockSize - 1) / k_BlockSize);
-    // Four bands of three components (only level 0 drops 4:2:0 chroma)
-    return perBand * 4 * 3;
-}
-
-uint32_t maxBlockCount(const StreamGeometry& geometry)
-{
-    const int alignedWidth = alignedExtent(geometry.width);
-    const int alignedHeight = alignedExtent(geometry.height);
-    uint32_t blocks = 0;
-
-    for (int level = 0; level < k_DecompositionLevels; level++) {
-        const int bandWidth = alignedWidth >> (level + 1);
-        const int bandHeight = alignedHeight >> (level + 1);
-        const uint32_t perBand = uint32_t((bandWidth + k_BlockSize - 1) / k_BlockSize) *
-                                 uint32_t((bandHeight + k_BlockSize - 1) / k_BlockSize);
-        const uint32_t bands = level == k_DecompositionLevels - 1 ? 4 : 3;
-        const uint32_t components = (level == 0 && !geometry.chroma444) ? 1 : 3;
-        blocks += perBand * bands * components;
-    }
-
-    return blocks;
-}
-
-bool parse(const uint8_t* data, size_t size, const StreamGeometry& geometry,
+bool parse(const uint8_t* data, size_t size, const PyroWave::BlockLayout& layout,
            Frame& frame, std::string& error)
 {
-    return parse(data, size, {}, 0, geometry, frame, error);
+    return parse(data, size, {}, 0, layout, frame, error);
 }
 
 bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
-           const StreamGeometry& geometry, Frame& frame, std::string& error)
+           const PyroWave::BlockLayout& layout, Frame& frame, std::string& error)
 {
-    return parse(data, size, segments, 0, geometry, frame, error);
+    return parse(data, size, segments, 0, layout, frame, error);
 }
 
 bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
-           size_t criticalPackets, const StreamGeometry& geometry, Frame& frame, std::string& error)
+           size_t criticalPackets, const PyroWave::BlockLayout& layout, Frame& frame, std::string& error)
 {
     // Keep the per-decoder span allocation across frames. All semantic state
     // is still reset, including after a failed or partial frame.
@@ -412,6 +338,10 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
 
     if (data == nullptr || size < k_HeaderBytes || (size % 4) != 0) {
         error = "frame is empty or not word aligned";
+        return false;
+    }
+    if (layout.block_count_32x32 <= 0) {
+        error = "stream layout was not initialized";
         return false;
     }
 
@@ -429,7 +359,6 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
     }
 
     const SegmentMap packets(segments);
-    const uint32_t maxBlocks = maxBlockCount(geometry);
 
     // The first packet carries the sequence header; without it nothing decodes
     if (packets.lost(0, k_HeaderBytes)) {
@@ -441,7 +370,7 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
 
     // A record-framed frame starts with a sequence header (extended bit set,
     // which a padding record also has); a packet count never sets bit 31.
-    if (firstWord & 0x80000000u) {
+    if (readHeader<PyroWave::BitstreamHeader>(data).extended) {
         frame.framing = Framing::Records;
         // Vibeshine only aligns records to shards for word-aligned payloads of
         // at least 24 bytes. Otherwise a surviving packet start is not a safe
@@ -464,7 +393,7 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
                                                    [](const Segment& segment) { return segment.lost; });
         }
 
-        if (!walkRecordFrame(data, size, packets, coarseLevelKnown, geometry, maxBlocks, frame, error)) {
+        if (!walkRecordFrame(data, size, packets, coarseLevelKnown, layout, frame, error)) {
             return false;
         }
     }
@@ -493,7 +422,7 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
                 error = "invalid packet length " + std::to_string(packetSize);
                 return false;
             }
-            if (!walkPacket(data, pos, packetSize, geometry, maxBlocks, frame, error)) {
+            if (!walkPacket(data, pos, packetSize, layout, frame, error)) {
                 return false;
             }
             pos += packetSize;
@@ -520,3 +449,5 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
 }
 
 }
+
+#endif // HAVE_PYROWAVE

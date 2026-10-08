@@ -2,10 +2,12 @@
 #include "plotdesc.h"
 #include "IconsFontAwesome7.h"
 #include "fa-solid-900.h"
+#ifndef IMGUI_DISABLE
 #include "devui.h"
 
 #include "imgui.h"
 #include "implot.h"
+#endif
 
 #include <cassert>
 #include <numeric>
@@ -32,6 +34,9 @@ ImGuiPlots::ImGuiPlots():
         Plot(kPlotDescs[PLOT_QUEUED_FRAMES]),
         Plot(kPlotDescs[PLOT_BANDWIDTH]),
         Plot(kPlotDescs[PLOT_PRESENT_DELAY]),
+
+        Plot(kPlotDescs[PLOT_PACKETS]),
+        Plot(kPlotDescs[PLOT_PACKETS_LOST]),
     }},
     m_isEnabled(true)
 {}

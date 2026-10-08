@@ -12,6 +12,9 @@ enum PlotType {
     PLOT_QUEUED_FRAMES,
     PLOT_BANDWIDTH,
     PLOT_PRESENT_DELAY,
+
+    PLOT_PACKETS,
+    PLOT_PACKETS_LOST,
     PlotCount
 };
 
@@ -42,6 +45,9 @@ inline constexpr std::array<PlotDesc, PlotCount> kPlotDescs = {{
 	{"Frames queued",             PLOT_LABEL_MIN_MAX_AVG_INT, "",  0.0f, 4.0f,   kNoValue, kNoValue},
     {"Video stream",              PLOT_LABEL_MIN_MAX_AVG, "Mbps", -0.1f, kNoValue, kNoValue, kNoValue},
     {"Present delay",             PLOT_LABEL_MIN_MAX_AVG,   "ms", -0.1f, 65.0f,  kNoValue, 64.0f},
+
+    {"Packets/sec",               PLOT_LABEL_MIN_MAX_AVG,     "", -0.1f, kNoValue, kNoValue, 64.0f},
+    {"Packet Loss",               PLOT_LABEL_MIN_MAX_AVG,    "%", -0.1f, 75.0f,  kNoValue, 74.0f},
 }};
 
 static_assert(kPlotDescs.size() == PlotCount, "Plot descriptors out of sync with PlotType enum");

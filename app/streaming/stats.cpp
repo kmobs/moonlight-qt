@@ -1,10 +1,12 @@
 #include "stats.h"
 
 #include "streaming/video/ffmpeg-renderers/framepacing/framepacer.h"
+#ifndef IMGUI_DISABLE
 #include "imgui.h"
 #include "imgui/devui.h"
-#include "imgui/imgui_plots.h"
 #include "implot.h"
+#endif
+#include "imgui/imgui_plots.h"
 #include "SDL_compat.h"
 
 // Log something only once, safe to use in hot areas of the code
@@ -49,6 +51,59 @@ void Stats::SetMetadata(int videoFormat, int width, int height)
 
     StreamingPreferences *prefs = StreamingPreferences::get();
     m_BitrateKbps = prefs->bitrateKbps;
+
+    // Let's also pass this along to DevUI
+#ifndef IMGUI_DISABLE
+    DevUISettings::instance().UpdateMetrics([&](DevUIMetrics& metrics) {
+        metrics.videoFormat = videoFormat;
+        metrics.width = width;
+        metrics.height = height;
+        metrics.bitrateKbps = m_BitrateKbps;
+    });
+#endif
+}
+
+void Stats::Reset()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    SDL_zero(m_ActiveWndVideoStats);
+    SDL_zero(m_LastWndVideoStats);
+    SDL_zero(m_GlobalVideoStats);
+    SDL_zero(m_LastRtpVideoStats);
+    m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
+    m_avgQueueSize = 0.0f;
+    m_avgMbpsSmoothed = 0.0;
+}
+
+void Stats::sampleRtpStats()
+{
+    // must be called with m_mutex held
+    RTP_VIDEO_STATS current = {};
+    if (!LiGetRTPVideoStatsSnapshot(&current)) {
+        return;
+    }
+
+    // XXX: this is not the right way to have a 1-second interval
+    m_ActiveWndVideoStats.expectedVideoPackets += uint32_t(current.packetCountVideoExpected - m_LastRtpVideoStats.packetCountVideoExpected);
+    m_ActiveWndVideoStats.recoveredVideoPackets += uint32_t(current.packetCountFecRecovered - m_LastRtpVideoStats.packetCountFecRecovered);
+    m_ActiveWndVideoStats.unrecoveredVideoPackets += uint32_t(current.packetCountFecFailed - m_LastRtpVideoStats.packetCountFecFailed);
+    m_ActiveWndVideoStats.receivedVideoPackets += current.packetCountVideoReceived - m_LastRtpVideoStats.packetCountVideoReceived;
+    m_ActiveWndVideoStats.lostVideoPackets += current.packetCountLostVideo - m_LastRtpVideoStats.packetCountLostVideo;
+
+    float pps = 0.0f;
+    float lps = 0.0f;
+    if (current.packetCountVideoReceived > m_LastRtpVideoStats.packetCountVideoReceived) {
+        pps = (float)current.packetCountVideoReceived - m_LastRtpVideoStats.packetCountVideoReceived;
+    }
+    if (current.packetCountLostVideo > m_LastRtpVideoStats.packetCountLostVideo) {
+        lps = (float)current.packetCountLostVideo - m_LastRtpVideoStats.packetCountLostVideo;
+    }
+    ImGuiPlots::instance().observeFloat(PLOT_PACKETS, pps);
+    if (pps > 0.0) {
+        ImGuiPlots::instance().observeFloat(PLOT_PACKETS_LOST, (lps / (pps + lps)) * 100.0);
+    }
+
+    m_LastRtpVideoStats = current;
 }
 
 bool Stats::GetShowGraphs()
@@ -72,6 +127,9 @@ bool Stats::ShouldUpdateDisplay(bool isVisible, char* output, size_t length)
         const double alpha = 0.1f;
         m_avgMbpsSmoothed = (1 - alpha) * m_avgMbpsSmoothed + alpha * m_bwTracker.GetAverageMbps();
         ImGuiPlots::instance().observeFloat(PLOT_BANDWIDTH, (float) m_avgMbpsSmoothed);
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        sampleRtpStats();
     }
 
     // Process stats once per second
@@ -103,9 +161,12 @@ bool Stats::ShouldUpdateDisplay(bool isVisible, char* output, size_t length)
 void Stats::LogGlobalVideoStats()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_GlobalVideoStats.renderedFps > 0 || m_GlobalVideoStats.renderedFrames != 0) {
-        char videoStatsStr[1024];
-        formatVideoStats(m_GlobalVideoStats, videoStatsStr, sizeof(videoStatsStr));
+    sampleRtpStats();
+    if (m_GlobalVideoStats.renderedFrames != 0 || m_ActiveWndVideoStats.renderedFrames != 0) {
+        VIDEO_STATS completeStats = m_GlobalVideoStats;
+        addVideoStats(m_ActiveWndVideoStats, completeStats);
+        char videoStatsStr[2048];
+        formatVideoStats(completeStats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "\n%s\n------------------\n%s", "Global video stats", videoStatsStr);
     }
@@ -123,6 +184,23 @@ void Stats::SubmitVideoBytesAndReassemblyTime(PDECODE_UNIT decodeUnit, uint32_t 
     std::lock_guard<std::mutex> lock(m_mutex);
     m_ActiveWndVideoStats.receivedFrames++;
     m_ActiveWndVideoStats.totalFrames++;
+
+    if (m_VideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+        uint32_t packets = 0;
+        uint32_t lost = 0;
+        for (auto entry = decodeUnit->bufferList; entry; entry = entry->next) {
+            packets++;
+            lost += entry->bufferType == BUFFER_TYPE_LOST;
+        }
+        if (packets != 0) {
+            // Each PyroWave entry preserves one RTP data-packet boundary after
+            // FEC. Average each delivered frame equally, including intact ones.
+            const double percent = 100.0 * lost / packets;
+            m_ActiveWndVideoStats.framesWithPacketLossStats++;
+            m_ActiveWndVideoStats.totalFramePacketLossPercent += percent;
+            m_ActiveWndVideoStats.maxFramePacketLossPercent = std::max(m_ActiveWndVideoStats.maxFramePacketLossPercent, percent);
+        }
+    }
 
     // bandwidth
     m_bwTracker.AddBytes(decodeUnit->fullLength);
@@ -196,6 +274,28 @@ void Stats::SubmitDroppedFrame(int count)
 #endif
 }
 
+void Stats::SubmitPyroWavePartialFrame(bool accepted)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (accepted) {
+        m_ActiveWndVideoStats.partialFramesAccepted++;
+    }
+    else {
+        m_ActiveWndVideoStats.partialFramesRejected++;
+    }
+}
+
+void Stats::SubmitDecoderDroppedFrame()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_ActiveWndVideoStats.decoderDroppedFrames++;
+#ifndef IMGUI_DISABLE
+    DevUISettings::instance().UpdateMetrics([](DevUIMetrics& metrics) {
+        metrics.decoderDroppedFrames++;
+    });
+#endif
+}
+
 void Stats::SubmitAvgQueueSize(float avgQueueSize)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -246,6 +346,7 @@ void Stats::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalFrames += src.totalFrames;
     dst.networkDroppedFrames += src.networkDroppedFrames;
     dst.pacerDroppedFrames += src.pacerDroppedFrames;
+    dst.decoderDroppedFrames += src.decoderDroppedFrames;
     dst.hitDeadlines += src.hitDeadlines;
     dst.missedDeadlines += src.missedDeadlines;
     dst.totalReassemblyTimeUs += src.totalReassemblyTimeUs;
@@ -255,6 +356,19 @@ void Stats::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.totalPreWaitTimeUs += src.totalPreWaitTimeUs;
     dst.totalPresentTimeUs += src.totalPresentTimeUs;
     dst.presentMode = src.presentMode;
+
+    dst.expectedVideoPackets += src.expectedVideoPackets;
+    dst.expectedFecPackets += src.expectedFecPackets;
+    dst.recoveredVideoPackets += src.recoveredVideoPackets;
+    dst.unrecoveredVideoPackets += src.unrecoveredVideoPackets;
+    dst.receivedVideoPackets += src.receivedVideoPackets;
+    dst.receivedFecPackets += src.receivedFecPackets;
+    dst.lostVideoPackets += src.lostVideoPackets;
+    dst.framesWithPacketLossStats += src.framesWithPacketLossStats;
+    dst.totalFramePacketLossPercent += src.totalFramePacketLossPercent;
+    dst.maxFramePacketLossPercent = std::max(dst.maxFramePacketLossPercent, src.maxFramePacketLossPercent);
+    dst.partialFramesAccepted += src.partialFramesAccepted;
+    dst.partialFramesRejected += src.partialFramesRejected;
 
     if (dst.minHostProcessingLatency == 0) {
         dst.minHostProcessingLatency = src.minHostProcessingLatency;
@@ -289,6 +403,12 @@ void Stats::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.receivedFps = (double) dst.receivedFrames / timeDiffSecs;
     dst.decodedFps = (double) dst.decodedFrames / timeDiffSecs;
     dst.renderedFps = (double) dst.renderedFrames / timeDiffSecs;
+
+    dst.videoPps = (double) dst.receivedVideoPackets / timeDiffSecs;
+    dst.lostPps = (double) dst.lostVideoPackets / timeDiffSecs;
+    dst.recoveredPps = (double) dst.recoveredVideoPackets / timeDiffSecs;
+    dst.partialAcceptedPps = (double) dst.partialFramesAccepted / timeDiffSecs;
+    dst.partialRejectedPps = (double) dst.partialFramesRejected / timeDiffSecs;
 }
 
 void Stats::formatVideoStats(VIDEO_STATS& stats, char* output, size_t length)
@@ -399,9 +519,8 @@ void Stats::formatVideoStats(VIDEO_STATS& stats, char* output, size_t length)
 
         double avgVideoMbps = m_bwTracker.GetAverageMbps();
         double peakVideoMbps = m_bwTracker.GetPeakMbps();
-        const RTP_VIDEO_STATS* rtpVideoStats = LiGetRTPVideoStats();
-        float fecOverhead = (float) rtpVideoStats->packetCountFec * 1.0 /
-                            (rtpVideoStats->packetCountVideo + rtpVideoStats->packetCountFec);
+        const double fecOverhead = stats.expectedVideoPackets ?
+                    double(stats.expectedFecPackets) / stats.expectedVideoPackets : 0.0;
 
         ret = snprintf(&output[offset],
                        length - offset,
@@ -429,31 +548,54 @@ void Stats::formatVideoStats(VIDEO_STATS& stats, char* output, size_t length)
         }
 
         offset += ret;
-    }
 
-    if (stats.framesWithHostProcessingLatency > 0) {
-        ret = snprintf(&output[offset],
-                       length - offset,
-                       "Host processing latency min/max/average: %.1f/%.1f/%.1f ms\n",
-                       (double) stats.minHostProcessingLatency / 10,
-                       (double) stats.maxHostProcessingLatency / 10,
-                       (double) stats.totalHostProcessingLatency / 10 / stats.framesWithHostProcessingLatency);
-        if (ret < 0 || (size_t) ret >= (length - offset)) {
+        if (stats.framesWithHostProcessingLatency > 0) {
+            ret = snprintf(&output[offset],
+                        length - offset,
+                        "Host processing latency min/max/average: %.1f/%.1f/%.1f ms\n",
+                        (double) stats.minHostProcessingLatency / 10,
+                        (double) stats.maxHostProcessingLatency / 10,
+                        (double) stats.totalHostProcessingLatency / 10 / stats.framesWithHostProcessingLatency);
+            if (ret < 0 || (size_t) ret >= (length - offset)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Error: Stats::formatVideoStats length overflow");
+                return;
+            }
+
+            offset += ret;
+        }
+        else {
+            // If all frames are duplicates this can happen, but let's avoid having the whole stats area change height
+            ret = snprintf(&output[offset], length - offset, "Host processing latency min/max/avg: -/-/- ms\n");
+            if (ret < 0 || (size_t) ret >= (length - offset)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Error: Stats::formatVideoStats length overflow");
+                return;
+            }
+
+            offset += ret;
+        }
+
+        ret = snprintf(&output[offset], length - offset,
+                       "Packets/sec: %.0f Lost: %.0f (%.2f%%)\n",
+                       stats.videoPps,
+                       stats.lostPps,
+                       (stats.lostPps / (stats.videoPps + stats.lostPps)) * 100.0);
+        if (ret < 0 || size_t(ret) >= length - offset) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Error: Stats::formatVideoStats length overflow");
             return;
         }
-
         offset += ret;
-    }
-    else {
-        // If all frames are duplicates this can happen, but let's avoid having the whole stats area change height
-        ret = snprintf(&output[offset], length - offset, "Host processing latency min/max/avg: -/-/- ms\n");
-        if (ret < 0 || (size_t) ret >= (length - offset)) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Error: Stats::formatVideoStats length overflow");
-            return;
+
+        if (m_VideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+            ret = snprintf(&output[offset], length - offset,
+                        "PyroWave partial frames/sec shown/dropped: %.0f/%.0f\n",
+                        stats.partialAcceptedPps,
+                        stats.partialRejectedPps);
+            if (ret < 0 || size_t(ret) >= length - offset) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Error: Stats::formatVideoStats length overflow");
+                return;
+            }
+            offset += ret;
         }
-
-        offset += ret;
     }
 
     if (stats.renderedFrames != 0) {
@@ -513,8 +655,10 @@ void Stats::RenderGraphs()
 
     // we malloc a buffer for each stat only once and reuse it each frame
     // for performance.
-    SDL_assert(PlotCount == 7);
-    static float* buffers[7] = {
+    SDL_assert(PlotCount == 9);
+    static float* buffers[9] = {
+        (float*) malloc(sizeof(float) * 512),
+        (float*) malloc(sizeof(float) * 512),
         (float*) malloc(sizeof(float) * 512),
         (float*) malloc(sizeof(float) * 512),
         (float*) malloc(sizeof(float) * 512),
@@ -537,10 +681,11 @@ void Stats::RenderGraphs()
 
     // Row 1: 3 graphs
     // Row 2: 3 graphs
+    // Row 3: optional/extra
     float itemSpacingX = ImGui::GetStyle().ItemSpacing.x;
     float itemSpacingY = ImGui::GetStyle().ItemSpacing.y;
     float row1Width = (3 * graphW) + (2 * itemSpacingX);
-    float totalHeight = (2 * graphH) + (2 * itemSpacingY) + 25;
+    float totalHeight = (3 * graphH) + (2 * itemSpacingY) + 25;
 
     // Anchor to top-right
     ImVec2 windowPos(workSize.x - 10.0f, 0.0f);  // 10px margin
@@ -675,6 +820,16 @@ void Stats::RenderGraphs()
             ImGui::SameLine(0.0f, itemSpacingX);
         }
         draw_plot(row2[c], graphW, graphH);
+    }
+
+    // extra 3rd row
+    ImGui::Dummy(ImVec2(1.0f, itemSpacingY));
+    const int row3[2] = {PLOT_PACKETS, PLOT_PACKETS_LOST};
+    for (int c = 0; c < 2; ++c) {
+        if (c > 0) {
+            ImGui::SameLine(0.0f, itemSpacingX);
+        }
+        draw_plot(row3[c], graphW, graphH);
     }
 
     ImGui::End();

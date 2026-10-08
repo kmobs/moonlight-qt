@@ -6,25 +6,6 @@
 #include <new>
 #include <vector>
 
-// Compact intact frames in either Vibeshine framing, removing envelope lengths
-// and padding while keeping the codec records unchanged.
-inline bool unpackPyroWaveBitstream(std::vector<uint32_t>& words, int width, int height, bool yuv444)
-{
-    PyroWaveFraming::Frame frame;
-    std::string error;
-    if (!PyroWaveFraming::parse(reinterpret_cast<const uint8_t*>(words.data()),
-                                words.size() * sizeof(uint32_t), {width, height, yuv444}, frame, error)) {
-        return false;
-    }
-    size_t output = 0;
-    for (const auto& span : frame.spans) {
-        std::memmove(words.data() + output, reinterpret_cast<const uint8_t*>(words.data()) + span.offset, span.size);
-        output += span.size / sizeof(uint32_t);
-    }
-    words.resize(output);
-    return true;
-}
-
 // RTP fragments may split PyroWave blocks, so parse the complete decode unit.
 inline bool assemblePyroWaveDecodeUnit(PDECODE_UNIT du, std::vector<uint32_t>& words,
                                        std::vector<PyroWaveFraming::Segment>* segments = nullptr)

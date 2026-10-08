@@ -28,6 +28,10 @@ private:
     static int decoderThread(void* context);
     int dropFrame(const char* reason);
     int decodeFailed(const char* reason);
+    void applyDevUIConfig();
+
+    std::atomic<int> m_NumPristineBands{2};
+    std::atomic<float> m_MinPacketRatio{0.9f};
 };
 
 #endif

@@ -73,6 +73,8 @@ struct DevUIConfig {
     bool showGraphs = true;
     bool enableDevUI = false;
     bool usePTSForVRR = false;
+    int pwNumPristineBands = 2;
+    float pwMinPacketRatio = 0.9;
 
     int audioRenderer = StreamingPreferences::AUDIO_RENDERER_SDL;
 
@@ -107,6 +109,7 @@ struct DevUIMetrics {
     int totalFrames = 0;
     int networkDroppedFrames = 0;
     int pacerDroppedFrames = 0;
+    int decoderDroppedFrames = 0;
     int presentMode = StreamingPreferences::PRESENT_AUTO;
     int windowMode = StreamingPreferences::WM_WINDOWED;
     double presentAtTime = 0.0;
@@ -129,6 +132,12 @@ struct DevUIMetrics {
     float minNits = 0.0f;
     float maxNits = 0.0f;
 #endif
+
+    // video
+    int videoFormat = -1;
+    int width = 1920;
+    int height = 1080;
+    int bitrateKbps = 20000;
 
     // audio
     char audioOutputDeviceName[32] = {};

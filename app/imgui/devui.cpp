@@ -568,10 +568,22 @@ void DevUISettings::Render()
                 }
             }
 
+            if (metrics.videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+                if (ImGui::CollapsingHeader("PyroWave")) {
+                    ImGui::Text("Show partial frames with at least:");
+                    ImGui::SetNextItemWidth(-ImGui::GetContentRegionAvail().x * 0.5f);
+                    configChanged |= ImGui::SliderInt("Pristine Bands", &cfg.pwNumPristineBands, 0, 4);
+                    ImGui::SameLine();
+                    HelpMarker("Requires a frame to have at least this many bands of complete data. Most information in a PyroWave frame is in the first 2 bands, so you should not need to change this. The default is 2.");
+                    ImGui::SetNextItemWidth(-ImGui::GetContentRegionAvail().x * 0.5f);
+                    configChanged |= ImGui::SliderFloat("Minimum Packet Ratio", &cfg.pwMinPacketRatio, 0.0f, 1.0f);
+                    ImGui::SameLine();
+                    HelpMarker("This is essentially a quality slider: the percentage of a frame's packets that have been received. Lower values will allow frames that are more blurry and lower resolution. The default is 0.9 (90%).");
+                }
+            }
+
             // Live metrics
-            static bool metricsVisible = true;
-            ImGui::SetNextItemOpen(metricsVisible);
-            if (ImGui::CollapsingHeader("Metrics"), &metricsVisible) {
+            if (ImGui::CollapsingHeader("Metrics")) {
                 ImGui::Text("FPS: %.02f / Display: %.02f Hz", metrics.streamFps, metrics.displayHz);
                 ImGui::Text("Frame queue: %zu/%d", FrameQueue::instance().count(), cfg.frameQueueHigh);
                 ImGui::SameLine();

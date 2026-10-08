@@ -2,6 +2,7 @@
 
 #ifdef HAVE_PYROWAVE
 
+#include "imgui/devui.h"
 #include "pyrowavebitstream.h"
 #include "pyrowavecolor.h"
 #include "metalframe.h"
@@ -10,6 +11,7 @@
 #include "streaming/session.h"
 #include "utils.h"
 #include <pyrowave_metal.h>
+#include <pyrowave_bitstream.hpp>
 
 #include <mutex>
 
@@ -85,6 +87,19 @@ struct PyroWaveVideoDecoder::Impl {
                          commandBuffer.error.localizedDescription.UTF8String ?: "no GPU error");
             return false;
         }
+
+        // Obtain more accurate GPU timing. This is called once for each of the two decode phases
+        // dequant, and idwt, so we add them.
+        if (device->handle) {
+            double elapsed = 0.0;
+            pyrowave_device_report_performance_stats(device->handle, [](void *userdata, double val) {
+                *static_cast<double *>(userdata) += val;
+            }, &elapsed, true);
+
+            uint64_t elapsedUs = (uint64_t)(elapsed * 1000);
+            Stats::instance().SubmitDecodeTimeUs(elapsedUs);
+        }
+
         return true;
     }
 
@@ -99,18 +114,14 @@ struct PyroWaveVideoDecoder::Impl {
     std::vector<uint32_t> bitstream;
     std::vector<PyroWaveFraming::Segment> packets;
     PyroWaveFraming::Frame parsed;
+    PyroWave::BlockLayout layout;
     SDL_Thread* thread = nullptr;
     SDL_atomic_t stopping = {};
     uint32_t lastFrameNumber = 0;
     bool haveLastFrameNumber = false;
     int failedDecodes = 0;
     int colorRange = COLOR_RANGE_FULL;
-    int width = 0;
-    int height = 0;
-    bool yuv444 = false;
     bool tenBit = false;
-    uint64_t nextPartialLogTimeUs = 0;
-    unsigned partialFrames = 0;
 };
 
 PyroWaveVideoDecoder::PyroWaveVideoDecoder(bool testOnly)
@@ -152,9 +163,10 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params)
     if (!yuv444 && ((params->width | params->height) & 1)) {
         return false;
     }
-    impl.width = params->width;
-    impl.height = params->height;
-    impl.yuv444 = yuv444;
+    if (!impl.layout.init(params->width, params->height,
+                          yuv444 ? PyroWave::ChromaSubsampling::Chroma444 : PyroWave::ChromaSubsampling::Chroma420)) {
+        return false;
+    }
     impl.tenBit = (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0;
     impl.renderer = VTMetalRendererFactory::createTextureRenderer();
     if (!impl.renderer->initialize(params)) {
@@ -194,15 +206,17 @@ bool PyroWaveVideoDecoder::initialize(PDECODER_PARAMETERS params)
 
     // A complete frame with no active wavelet blocks decodes to neutral gray.
     // Exercise real GPU decoding at the requested dimensions without a connection.
-    uint32_t testFrame[2] = {
-        uint32_t(params->width - 1) | (uint32_t(params->height - 1) << 14) | 0x80000000u,
-        yuv444 ? (1u << 26) : 0u,
-    };
+    PyroWave::BitstreamSequenceHeader testFrame = {};
+    testFrame.width_minus_1 = params->width - 1;
+    testFrame.height_minus_1 = params->height - 1;
+    testFrame.extended = 1;
+    testFrame.code = PyroWave::BITSTREAM_EXTENDED_CODE_START_OF_FRAME;
+    testFrame.chroma_resolution = yuv444 ? PyroWave::CHROMA_RESOLUTION_444 : PyroWave::CHROMA_RESOLUTION_420;
     AVFrame* frame = impl.pool->acquire();
     if (!frame) {
         return false;
     }
-    result = pyrowave_decoder_push_packet(impl.decoder, testFrame, sizeof(testFrame));
+    result = pyrowave_decoder_push_packet(impl.decoder, &testFrame, sizeof(testFrame));
     bool success = result == PYROWAVE_SUCCESS &&
                    pyrowave_decoder_decode_is_ready(impl.decoder, false) &&
                    impl.decode(frame) && impl.renderer->testRenderFrame(frame);
@@ -240,7 +254,6 @@ int PyroWaveVideoDecoder::decoderThread(void* context)
 
 int PyroWaveVideoDecoder::dropFrame(const char* reason)
 {
-    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave frame dropped: %s", reason);
     pyrowave_decoder_clear(m_Impl->decoder);
     Stats::instance().SubmitDroppedFrame(1);
     // Every frame is independent. A dropped frame needs neither an IDR request
@@ -251,10 +264,11 @@ int PyroWaveVideoDecoder::dropFrame(const char* reason)
 int PyroWaveVideoDecoder::decodeFailed(const char* reason)
 {
     auto& impl = *m_Impl;
-    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "PyroWave decode failed: %s", reason);
     pyrowave_decoder_clear(impl.decoder);
-    Stats::instance().SubmitDroppedFrame(1);
+    Stats::instance().SubmitDecoderDroppedFrame();
     if (++impl.failedDecodes == FailedDecodesResetThreshold) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "PyroWave decode failed %d times, aborting", impl.failedDecodes);
         SDL_Event event = {};
         event.type = SDL_RENDER_DEVICE_RESET;
         SDL_PushEvent(&event);
@@ -290,11 +304,12 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     std::string parseError;
     if (!PyroWaveFraming::parse(reinterpret_cast<const uint8_t*>(impl.bitstream.data()),
                                impl.bitstream.size() * sizeof(uint32_t), impl.packets,
-                               du->pyrowaveCriticalPackets, {impl.width, impl.height, impl.yuv444},
+                               du->pyrowaveCriticalPackets, impl.layout,
                                impl.parsed, parseError)) {
         return dropFrame(parseError.c_str());
     }
     if (impl.parsed.partial && !impl.parsed.coarseLevelIntact) {
+        Stats::instance().SubmitPyroWavePartialFrame(false);
         return dropFrame("part of the coarsest wavelet level was lost");
     }
     // Each Moonlight DU represents an independent frame. Reset the three-bit sequence
@@ -304,18 +319,32 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         auto result = pyrowave_decoder_push_packet(impl.decoder,
                          reinterpret_cast<const uint8_t*>(impl.bitstream.data()) + span.offset, span.size);
         if (result != PYROWAVE_SUCCESS) {
+            if (impl.parsed.partial) {
+                Stats::instance().SubmitPyroWavePartialFrame(false);
+            }
             return dropFrame("codec rejected a record");
         }
     }
-    // Match vrr18: an intact coarse prefix is sufficient; missing finer blocks
-    // become zero coefficients. The codec's pristine-band check cannot tell a
-    // lost block from a zero block the encoder never sent.
-    bool ready = impl.parsed.partial ?
-        pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.0f, nullptr, 0) :
-        pyrowave_decoder_decode_is_ready(impl.decoder, false);
+
+    // User can change a few of our variables in Dev UI
+    applyDevUIConfig();
+
+    // Upstream uses 2 / 0.9
+    int num_pristine_bands = m_NumPristineBands.load();
+    float minimum_packet_ratio = m_MinPacketRatio.load();
+    bool allow_partial_frame = impl.parsed.partial;
+    bool ready = pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder,
+                                                                allow_partial_frame,
+                                                                num_pristine_bands,
+                                                                minimum_packet_ratio,
+                                                                nullptr, 0);
+    if (impl.parsed.partial) {
+        Stats::instance().SubmitPyroWavePartialFrame(ready);
+    }
     if (!ready) {
         return dropFrame("corrupt or incomplete bitstream");
     }
+
     AVFrame* frame = impl.pool->acquire();
     if (!frame) {
         if (impl.pool->exhausted()) {
@@ -331,20 +360,13 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     impl.failedDecodes = 0;
     frame->pts = du->rtpTimestamp;
     frame->pkt_dts = LiGetMicroseconds();
-    if (impl.parsed.partial) {
-        impl.partialFrames++;
-        if (uint64_t(frame->pkt_dts) >= impl.nextPartialLogTimeUs) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave decoded %u partial frames; latest retained %u/%u block records",
-                        impl.partialFrames, impl.parsed.blockRecords, impl.parsed.announcedBlocks);
-            impl.partialFrames = 0;
-            impl.nextPartialLogTimeUs = frame->pkt_dts + 1000000;
-        }
-    }
+
     // Leave pict_type unset: every frame is independent, but the pacing queue
     // gives I-frames special treatment which would defeat normal queue limits.
     setPyroWaveFrameColors(frame, du, impl.colorRange);
-    Stats::instance().SubmitDecodeTimeUs(frame->pkt_dts - du->enqueueTimeUs);
-    // DU metadata stays valid until the pull loop completes the handle.
+
+    // Stats::instance().SubmitDecodeTimeUs(frame->pkt_dts - du->enqueueTimeUs);
+
     FramePacer::instance().submitFrame(frame, du);
     return DR_OK;
 }}
@@ -375,6 +397,32 @@ int PyroWaveVideoDecoder::getDecoderColorRange()
 bool PyroWaveVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 {
     return m_Impl->renderer->notifyWindowChanged(info);
+}
+
+void PyroWaveVideoDecoder::applyDevUIConfig()
+{
+#ifndef IMGUI_DISABLE
+    // we may need to apply changes from DevUI, but only check once per second
+    int64_t now = QpcNow();
+    static int64_t lastDevUI = 0;
+    if (lastDevUI > 0 && QpcToMs(now - lastDevUI) < 1000.0) {
+        return;
+    }
+    lastDevUI = now;
+
+    auto cfg = DevUISettings::instance().GetConfig();
+    if (m_NumPristineBands.load() != cfg.pwNumPristineBands) {
+        int val = std::clamp(cfg.pwNumPristineBands, 0, 4);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Applied change of pwNumPristineBands to %d", val);
+        m_NumPristineBands.store(val);
+    }
+
+    if (m_MinPacketRatio.load() != cfg.pwMinPacketRatio) {
+        float val = std::clamp(cfg.pwMinPacketRatio, 0.0f, 100.0f);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Applied change of pwMinPacketRatio to %.2f%%", val * 100.0f);
+        m_MinPacketRatio.store(val);
+    }
+#endif
 }
 
 #endif

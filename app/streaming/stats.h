@@ -20,6 +20,7 @@ typedef struct _VIDEO_STATS {
     uint32_t totalFrames;
     uint32_t networkDroppedFrames;
     uint32_t pacerDroppedFrames;
+    uint32_t decoderDroppedFrames;
     uint32_t hitDeadlines;
     uint32_t missedDeadlines;
     uint16_t minHostProcessingLatency;
@@ -40,6 +41,28 @@ typedef struct _VIDEO_STATS {
     double decodedFps;
     double renderedFps;
     uint64_t measurementStartUs;
+
+    // RTP packet stats
+    uint64_t expectedVideoPackets;
+    uint64_t expectedFecPackets;
+    uint64_t recoveredVideoPackets;
+    uint64_t unrecoveredVideoPackets;
+    uint64_t receivedVideoPackets;
+    uint64_t receivedFecPackets;
+    uint64_t lostVideoPackets;
+    uint32_t framesWithPacketLossStats;
+    double totalFramePacketLossPercent;
+    double maxFramePacketLossPercent;
+    double videoPps;
+    double fecPps;
+    double lostPps;
+    double recoveredPps;
+
+    // PyroWave
+    uint32_t partialFramesAccepted;
+    uint32_t partialFramesRejected;
+    double partialAcceptedPps;
+    double partialRejectedPps;
 } VIDEO_STATS, *PVIDEO_STATS;
 
 class Stats
@@ -49,6 +72,7 @@ class Stats
     static Stats& instance();
 
 	void SetMetadata(int videoFormat, int width, int height);
+    void Reset();
     bool GetShowGraphs();
     void SetShowGraphs(bool enabled);
     bool ShouldUpdateDisplay(bool isVisible, char* output, size_t length);
@@ -60,10 +84,12 @@ class Stats
     void SubmitVideoBytesAndReassemblyTime(PDECODE_UNIT decodeUnit, uint32_t droppedFrames);
     void SubmitDecodeTimeUs(uint64_t decodeUs);
     void SubmitDroppedFrame(int count);
+    void SubmitDecoderDroppedFrame();
     void SubmitAvgQueueSize(float avgQueueSize);
     void SubmitPacerTime(uint64_t pacerTimeUs);
     void SubmitPresentTimeUs(uint64_t presentTimeUs, int presentMode);
     void SubmitRenderStats(double preWaitTimeMs, double renderTimeMs, bool hitDeadline);
+    void SubmitPyroWavePartialFrame(bool accepted);
 
   private:
 	Stats();
@@ -72,6 +98,7 @@ class Stats
 
     void addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst);
     void formatVideoStats(VIDEO_STATS& stats, char* output, size_t length);
+    void sampleRtpStats(); // m_mutex must be held
 
     std::mutex m_mutex;
 
@@ -79,6 +106,7 @@ class Stats
     VIDEO_STATS m_ActiveWndVideoStats;
     VIDEO_STATS m_LastWndVideoStats;
     VIDEO_STATS m_GlobalVideoStats;
+    RTP_VIDEO_STATS m_LastRtpVideoStats = {};
     BandwidthTracker m_bwTracker;
     float m_avgQueueSize;
     double m_avgMbpsSmoothed;

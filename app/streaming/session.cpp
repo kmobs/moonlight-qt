@@ -1873,6 +1873,7 @@ void Session::start()
 {
     // Wait for any old session to finish cleanup
     s_ActiveSessionSemaphore.acquire();
+    Stats::instance().Reset();
 
     // We're now active
     s_ActiveSession = this;
