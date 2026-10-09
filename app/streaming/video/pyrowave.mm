@@ -12,6 +12,7 @@
 #include "utils.h"
 #include <pyrowave_metal.h>
 #include <pyrowave_bitstream.hpp>
+#include <pyrowave_common.hpp>
 
 #include <mutex>
 
@@ -27,6 +28,7 @@ void logPyroWave(void*, const char* message)
 
 struct PyroWaveDevice {
     pyrowave_device handle = nullptr;
+    int precision = -1;
     uint64_t registryId = 0;
     ~PyroWaveDevice() { pyrowave_device_destroy(handle); }
 };
@@ -37,7 +39,9 @@ std::shared_ptr<PyroWaveDevice> getSharedDevice(id<MTLDevice> mtlDevice)
     static std::mutex lock;
     static std::shared_ptr<PyroWaveDevice> cached;
     std::lock_guard<std::mutex> guard(lock);
-    if (cached && cached->registryId == mtlDevice.registryID) {
+    if (cached && cached->registryId == mtlDevice.registryID
+               && cached->precision == PyroWave::requested_precision()
+    ) {
         return cached;
     }
     auto device = std::make_shared<PyroWaveDevice>();
@@ -50,6 +54,7 @@ std::shared_ptr<PyroWaveDevice> getSharedDevice(id<MTLDevice> mtlDevice)
                      pyrowave_result_to_string(result));
         return nullptr;
     }
+    device->precision = PyroWave::requested_precision();
     device->registryId = mtlDevice.registryID;
     cached = device;
     return device;
@@ -254,6 +259,7 @@ int PyroWaveVideoDecoder::decoderThread(void* context)
 
 int PyroWaveVideoDecoder::dropFrame(const char* reason)
 {
+    (void)reason;
     pyrowave_decoder_clear(m_Impl->decoder);
     Stats::instance().SubmitDroppedFrame(1);
     // Every frame is independent. A dropped frame needs neither an IDR request
@@ -263,6 +269,7 @@ int PyroWaveVideoDecoder::dropFrame(const char* reason)
 
 int PyroWaveVideoDecoder::decodeFailed(const char* reason)
 {
+    (void)reason;
     auto& impl = *m_Impl;
     pyrowave_decoder_clear(impl.decoder);
     Stats::instance().SubmitDecoderDroppedFrame();
@@ -365,7 +372,7 @@ int PyroWaveVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     // gives I-frames special treatment which would defeat normal queue limits.
     setPyroWaveFrameColors(frame, du, impl.colorRange);
 
-    // Stats::instance().SubmitDecodeTimeUs(frame->pkt_dts - du->enqueueTimeUs);
+    // decode timing uses GPU time, see decode() above, around line 100
 
     FramePacer::instance().submitFrame(frame, du);
     return DR_OK;

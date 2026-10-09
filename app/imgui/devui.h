@@ -75,6 +75,8 @@ struct DevUIConfig {
     bool usePTSForVRR = false;
     int pwNumPristineBands = 2;
     float pwMinPacketRatio = 0.9;
+    int pwHighPrecision = 0; // because PYROWAVE_PRECISION=0 is slower,
+                             // we expose only options 1 (default=0) and 2 (high=1)
 
     int audioRenderer = StreamingPreferences::AUDIO_RENDERER_SDL;
 

@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cstdio>
 
+#include <QtEnvironmentVariables>
+
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
 #endif
@@ -27,6 +29,9 @@ DevUISettings::DevUISettings() {}
 
 void DevUISettings::InitFromPrefs(StreamingPreferences& prefs)
 {
+    // XXX: we need a way to persist advanced settings that don't need
+    // shown as a full preference. e.g. EDR, pwHighPrecsion
+
     DevUIConfig cfg;
     cfg.pacingMode = prefs.framePacingMode;
     cfg.presentMode = prefs.presentMode;
@@ -212,6 +217,24 @@ void DevUISettings::ChangeAndApplyConfig(DevUIConfig& config)
              Session::get()->getAudioRenderer()->setHeadTracking(config.useHeadTracking);
         }
     }
+
+    if (old.pwHighPrecision != config.pwHighPrecision) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "DevUI: Pyrowave high precision changed from %d to %d",
+            old.pwHighPrecision,
+            config.pwHighPrecision);
+
+        // PYROWAVE_PRECISION=0 slower and worse, FP16 for everything
+        // PYROWAVE_PRECISION=1 pwHighPrecision=0 default, FP32 math + FP16 storage
+        // PYROWAVE_PRECISION=2 pwHighPrecision=1 high, FP32 for everything
+        int precision = std::clamp(config.pwHighPrecision + 1, 1, 2);
+        qputenv("PYROWAVE_PRECISION", QByteArray::number(precision));
+
+        // This requires a decoder reset
+        SDL_Event event;
+        event.type = SDL_RENDER_DEVICE_RESET;
+        SDL_PushEvent(&event);
+    }
 #endif
 
     std::lock_guard<std::mutex> lock(m_Mutex);
@@ -245,8 +268,8 @@ static float LinearToPQ(float in)
     const float c1 = 0.8359375f;
     const float c2 = 18.8515625f;
     const float c3 = 18.6875f;
-    /* target 200 cd/m^2 as our maximum rather than 10000 cd/m^2 */
-    const float targetL = 200.f;
+    /* target 203 cd/m^2 as our maximum rather than 10000 cd/m^2 */
+    const float targetL = 203.f;
     const float maxL = 10000.0f;
 
     in = powf(in * (targetL / maxL), m1);
@@ -569,7 +592,20 @@ void DevUISettings::Render()
             }
 
             if (metrics.videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+                ImGui::SetNextItemOpen(true, ImGuiCond_Once);
                 if (ImGui::CollapsingHeader("PyroWave")) {
+                    ImGui::SetNextItemWidth(-ImGui::GetContentRegionAvail().x * 0.5f);
+                    static const char* pwHighPrecisionItems[] = {"Default", "High Precision"};
+                    configChanged |=
+                        ImGui::Combo("Precision", &cfg.pwHighPrecision, pwHighPrecisionItems, IM_ARRAYSIZE(pwHighPrecisionItems));
+                    ImGui::SameLine();
+                    HelpMarker(
+                        "This option selects the wavelet precision used during decoding. "
+                        "High Precision uses FP32 for all operations, "
+                        "while Default uses FP32 math with FP16 storage.\n\n"
+                        "High is slower and uses more memory."
+                    );
+
                     ImGui::Text("Show partial frames with at least:");
                     ImGui::SetNextItemWidth(-ImGui::GetContentRegionAvail().x * 0.5f);
                     configChanged |= ImGui::SliderInt("Pristine Bands", &cfg.pwNumPristineBands, 0, 4);
@@ -583,6 +619,7 @@ void DevUISettings::Render()
             }
 
             // Live metrics
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
             if (ImGui::CollapsingHeader("Metrics")) {
                 ImGui::Text("FPS: %.02f / Display: %.02f Hz", metrics.streamFps, metrics.displayHz);
                 ImGui::Text("Frame queue: %zu/%d", FrameQueue::instance().count(), cfg.frameQueueHigh);
