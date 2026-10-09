@@ -103,12 +103,6 @@ SystemProperties::SystemProperties()
     // Assume we can probably launch a browser if we're in a GUI environment
     hasBrowser = hasDesktopEnvironment;
 
-#ifdef HAVE_DISCORD
-    hasDiscordIntegration = true;
-#else
-    hasDiscordIntegration = false;
-#endif
-
     // These will be queried asynchronously to avoid blocking the UI
     hasHardwareAcceleration = true;
     rendererAlwaysFullScreen = false;

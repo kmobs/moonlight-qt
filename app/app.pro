@@ -152,13 +152,10 @@ win32 {
     LIBS += -llibssl -llibcrypto -lSDL2 -lSDL2_ttf -lavcodec -lavutil -lswscale -lopus -ldxgi -ld3d11 -llibplacebo
     CONFIG += ffmpeg libplacebo
 }
-win32:!winrt {
-    CONFIG += discord-rpc
-}
 macx {
     !disable-prebuilts {
         LIBS += -lssl.3 -lcrypto.3 -lavcodec.63 -lavutil.61 -lswscale.10 -lopus.0 -lSDL2 -lSDL2_ttf -lplacebo
-        CONFIG += discord-rpc libplacebo
+        CONFIG += libplacebo
     }
 
     LIBS += -lobjc \
@@ -191,7 +188,6 @@ SOURCES += \
     backend/nvpairingmanager.cpp \
     backend/computermanager.cpp \
     backend/boxartmanager.cpp \
-    backend/richpresencemanager.cpp \
     cli/commandlineparser.cpp \
     cli/listapps.cpp \
     cli/quitstream.cpp \
@@ -240,7 +236,6 @@ HEADERS += \
     backend/nvpairingmanager.h \
     backend/computermanager.h \
     backend/boxartmanager.h \
-    backend/richpresencemanager.h \
     cli/commandlineparser.h \
     cli/listapps.h \
     cli/quitstream.h \
@@ -463,12 +458,6 @@ macx {
         streaming/audio/renderers/coreaudio/TPCircularBuffer.h \
         streaming/video/ffmpeg-renderers/pacer/displaylink_source.h \
         streaming/video/ffmpeg-renderers/vt.h
-}
-discord-rpc {
-    message(Discord integration enabled)
-
-    LIBS += -ldiscord-rpc
-    DEFINES += HAVE_DISCORD
 }
 embedded {
     message(Embedded build)

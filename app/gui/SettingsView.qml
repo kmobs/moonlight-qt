@@ -1272,23 +1272,6 @@ Flickable {
                 }
 
                 CheckBox {
-                    visible: SystemProperties.hasDiscordIntegration
-                    id: discordPresenceCheck
-                    width: parent.width
-                    text: qsTr("Discord Rich Presence integration")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.richPresence
-                    onCheckedChanged: {
-                        StreamingPreferences.richPresence = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Updates your Discord status to display the name of the game you're streaming.")
-                }
-
-                CheckBox {
                     id: keepAwakeCheck
                     width: parent.width
                     text: qsTr("Keep the display awake while streaming")

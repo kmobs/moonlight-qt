@@ -1,7 +1,6 @@
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
-#include "backend/richpresencemanager.h"
 
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
@@ -2075,9 +2074,6 @@ void Session::exec()
     // (m_UnexpectedTermination is set back to true).
     m_UnexpectedTermination = false;
 
-    // Start rich presence to indicate we're in game
-    RichPresenceManager presence(*m_Preferences, m_App.name);
-
     // Toggle the stats overlay if requested by the user
     m_OverlayManager.setOverlayState(Overlay::OverlayDebug, m_Preferences->showPerformanceOverlay);
 
@@ -2099,7 +2095,6 @@ void Session::exec()
         // issues that could cause indefinite timeouts, delayed joystick detection,
         // and other problems.
         if (!SDL_WaitEventTimeout(&event, 1000)) {
-            presence.runCallbacks();
             continue;
         }
 #else
@@ -2115,7 +2110,6 @@ void Session::exec()
             // ARM core in the Steam Link, so we will wait 10 ms instead.
             SDL_Delay(10);
 #endif
-            presence.runCallbacks();
             continue;
         }
 #endif
@@ -2199,8 +2193,6 @@ void Session::exec()
                 m_InputHandler->notifyMouseLeave();
                 break;
             }
-
-            presence.runCallbacks();
 
             // Capture the mouse on SDL_WINDOWEVENT_ENTER if needed
             if (needsFirstEnterCapture && event.window.event == SDL_WINDOWEVENT_ENTER) {
@@ -2386,12 +2378,10 @@ void Session::exec()
 
         case SDL_KEYUP:
         case SDL_KEYDOWN:
-            presence.runCallbacks();
             m_InputHandler->handleKeyEvent(&event.key);
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
-            presence.runCallbacks();
             m_InputHandler->handleMouseButtonEvent(&event.button);
             break;
         case SDL_MOUSEMOTION:
@@ -2405,7 +2395,6 @@ void Session::exec()
             break;
         case SDL_CONTROLLERBUTTONDOWN:
         case SDL_CONTROLLERBUTTONUP:
-            presence.runCallbacks();
             m_InputHandler->handleControllerButtonEvent(&event.cbutton);
             break;
 #if SDL_VERSION_ATLEAST(2, 0, 14)
