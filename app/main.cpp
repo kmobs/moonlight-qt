@@ -60,6 +60,10 @@
 #include "settings/streamingpreferences.h"
 #include "gui/sdlgamepadkeynavigation.h"
 
+#if defined(Q_OS_DARWIN)
+#include "gui/macmenu.h"
+#endif
+
 #if defined(Q_OS_WIN32)
 #define IS_UNSPECIFIED_HANDLE(x) ((x) == INVALID_HANDLE_VALUE || (x) == NULL)
 
@@ -1081,6 +1085,10 @@ int main(int argc, char *argv[])
         engine.load(QUrl(QStringLiteral("qrc:/gui/main.qml")));
         if (engine.rootObjects().isEmpty())
             return -1;
+
+    #ifdef Q_OS_DARWIN
+        InitMacMenu();
+    #endif
     }
 
     int err = app.exec();

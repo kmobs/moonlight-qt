@@ -439,6 +439,7 @@ macx {
     # QMAKE_OBJECTIVE_CFLAGS = -fobjc-arc
 
     SOURCES += \
+        gui/macmenu.mm \
         streaming/audio/renderers/coreaudio/au_spatial_renderer.mm \
         streaming/audio/renderers/coreaudio/coreaudio.cpp \
         streaming/audio/renderers/coreaudio/TPCircularBuffer.c \
@@ -446,18 +447,19 @@ macx {
         streaming/video/ffmpeg-renderers/pacer/displaylink_source.mm \
         streaming/video/ffmpeg-renderers/vt_base.mm \
         streaming/video/ffmpeg-renderers/vt_avsamplelayer.mm \
-        streaming/video/ffmpeg-renderers/vt_metal.mm
-    SOURCES += streaming/video/metalframe.mm
-    HEADERS += streaming/video/metalframe.h
-    HEADERS += streaming/video/ffmpeg-renderers/vt_metal_types.h
+        streaming/video/ffmpeg-renderers/vt_metal.mm \
+        streaming/video/metalframe.mm
 
     HEADERS += \
+        gui/macmenu.h \
         streaming/audio/renderers/coreaudio/au_spatial_renderer.h \
         streaming/audio/renderers/coreaudio/coreaudio.h \
         streaming/audio/renderers/coreaudio/coreaudio_helpers.h \
         streaming/audio/renderers/coreaudio/TPCircularBuffer.h \
         streaming/video/ffmpeg-renderers/pacer/displaylink_source.h \
-        streaming/video/ffmpeg-renderers/vt.h
+        streaming/video/ffmpeg-renderers/vt.h \
+        streaming/video/ffmpeg-renderers/vt_metal_types.h \
+        streaming/video/metalframe.h
 }
 embedded {
     message(Embedded build)
