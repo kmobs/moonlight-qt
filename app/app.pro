@@ -473,11 +473,14 @@ win32:!winrt {
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
         streaming/video/ffmpeg-renderers/d3d11composition.h \
+        streaming/video/ffmpeg-renderers/compositionpresentpolicy.h \
         streaming/video/ffmpeg-renderers/d3d11pyrowave.h \
         streaming/video/pyrowave/pyrowavesurfaces.h \
         streaming/video/ffmpeg-renderers/presentationclock.h \
         streaming/video/ffmpeg-renderers/dxgipresent.h \
+        streaming/video/ffmpeg-renderers/dxgiwaitable.h \
         streaming/video/ffmpeg-renderers/d3d11fencewait.h \
+        streaming/video/ffmpeg-renderers/d3d11presentpolicy.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }
 macx {
@@ -714,10 +717,11 @@ macx {
     }
 }
 
-# Displayed version stays CI_VERSION (e.g. 6.1.0-vrr17.1). Windows PE/MSI
+# Displayed version stays CI_VERSION (e.g. 6.2.0-daily.183). Windows PE/MSI
 # ProductVersion can only use three numeric fields and must increase past
 # stock Moonlight 6.1.0, so VRR builds map 6.1.0-vrrN to 6.2.N and
 # 6.1.0-vrrN.P to 6.2.(N*10+P).
+# Both 6.1.0-daily.B and 6.2.0-daily.B retain Windows 6.2.B; never reset B.
 VERSION = "$$BASE_VERSION"
 PE_VERSION = $$(MOONLIGHT_PE_VERSION)
 !isEmpty(PE_VERSION) {

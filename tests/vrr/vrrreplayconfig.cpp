@@ -436,6 +436,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.nativeSynchronizedPresentation > 1) {
         return fail("native_synchronized_presentation must be 0 or 1");
     }
+    if (value.nativeScheduledPresentation > 1) {
+        return fail("native_scheduled_presentation must be 0 or 1");
+    }
     if (value.latencyFixEnabled > 1 || value.latencyFixAllRates > 1 || value.latencyFixDelayPeriodPerMille > 1000) {
         return fail("latency_fix_enabled and latency_fix_all_rates must be 0 or 1 and latency_fix_delay_period_per_mille must be in 0..1000");
     }
@@ -484,7 +487,7 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutIntervalInitialMinimumSamples > 512) {
         return fail("initial interval calibration requires 250000..1000000 us and 2..512 samples");
     }
-    if (value.playoutResponsiveBuffer > 9 || (value.playoutResponsiveBuffer &&
+    if (value.playoutResponsiveBuffer > 12 || (value.playoutResponsiveBuffer &&
             (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
         return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
     }

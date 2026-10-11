@@ -342,6 +342,7 @@ ApplicationWindow {
 
             NavigableToolButton {
                 property string browserUrl: ""
+                property string updateVersion: ""
 
                 id: updateButton
 
@@ -358,14 +359,37 @@ ApplicationWindow {
                 onClicked: {
                     if (SystemProperties.hasBrowser) {
                         Qt.openUrlExternally(browserUrl);
+                        AutoUpdateChecker.dismissUpdate(updateVersion)
+                        visible = false
                     }
                 }
+
+                Menu {
+                    id: updateMenu
+                    MenuItem {
+                        text: qsTr("Dismiss this update")
+                        onTriggered: {
+                            AutoUpdateChecker.dismissUpdate(updateButton.updateVersion)
+                            updateButton.visible = false
+                        }
+                    }
+                }
+                onPressAndHold: updateMenu.open()
 
                 function updateAvailable(version, url)
                 {
                     ToolTip.text = qsTr("Update available for Moonlight: Version %1").arg(version)
                     updateButton.browserUrl = url
+                    updateButton.updateVersion = version
                     updateButton.visible = true
+                }
+
+                Connections {
+                    target: AutoUpdateChecker
+                    onNotifyPrereleasesChanged: {
+                        updateButton.visible = false
+                        AutoUpdateChecker.start()
+                    }
                 }
 
                 Component.onCompleted: {

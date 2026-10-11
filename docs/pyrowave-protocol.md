@@ -361,10 +361,13 @@ record-start flag, the short frame header's nonzero critical packet count, and
 all packets in that critical prefix to be present. Unique arrivals renew the
 deadline, including reordered packets; duplicates do not. The receiver drains
 queued socket data before expiring the deadline. If the final data packet is
-absent, no silence deadline is armed: the frame waits for its remaining data or
-the next frame boundary. This prevents host batch/pacing gaps from becoming
-artificial loss. A genuinely lost tail may therefore delay partial delivery
-until the next frame. Interior detail arriving after expiry is discarded,
+absent, the tail may still be in flight, so the allowance must exceed a host
+pacing gap (1 ms groups, timer overshoot measured to ~1.1 ms): 3 ms of silence,
+or the frame's VRR slot but never sooner than 1.2 ms after the last unique
+packet. Loss costs detail, not timing; before this, a lost tail (typically a
+receiver dropping a whole 12-16 packet USB transfer) waited for the next frame
+and arrived 5+ ms late. The 800 us and 2.5 ms gap regressions still keep their
+tails. Interior detail arriving after expiry is discarded,
 trading a bounded reorder allowance for prompt partial-frame delivery. Parity-bearing
 blocks and unknown or incomplete critical prefixes retain boundary-based
 recovery. The frame is still dropped when its first packet
@@ -493,16 +496,17 @@ measurement. Changing host or target blocks results for another combination.
 
 Calibration offers four targets: Minimum is half the developer's recommended
 image bitrate rounded down to 5 Mbps (at least 5 Mbps), Recommended is the full
-image recommendation, Moderate allows 60% of measured stable wire bandwidth,
+image recommendation, Moderate aims for 60% of the slower known link speed (never below
+Recommended, lowered to the stable budget when the path cannot carry it),
 and Maximum uses the full stable budget. Applied rates include FEC and overhead;
 Moderate's 60% includes those costs.
 
 The UDP search starts at the ceiling bounded by known routed endpoint link
 speeds and the 3 Gbps UI limit. For Minimum and Recommended, the ceiling also
 stops at the largest quality target in the matrix, allowing applied rounding
-and the 5% confirmation margin. Failed ceilings are bisected to 5 Mbps. A pass requires all planned packets sent,
-no more than 0.1% aggregate loss or 1% loss in any 100 ms window, finite timing
-measurements, delay growth at most 2 ms, and sender duration within
+and the 5% confirmation margin. Failed ceilings are bisected to 5 Mbps. A pass requires at least 98% of planned packets sent
+(unsent packets count as lost), under 2% aggregate loss and under 5% in any
+100 ms window, finite timing measurements, delay growth at most 2 ms, and sender duration within
 2% of the requested duration. These are calibration policy thresholds, not FEC
 recovery guarantees. The highest passing rate is reduced by 5% where possible
 and measured twice afresh. Failed confirmation reduces the rate by 20% and
@@ -531,10 +535,61 @@ link speed is known. Host packet pacing uses the smaller known host/client link
 speed, preventing a faster host from sending oversized groups into a slower
 receiver. The host limits the total budget at physical link capacity; it no
 longer silently applies a second 20% reduction to an already tested allowance.
-Calibration results are not cached or silently reapplied at a later launch.
+
+Frame pacing. The capacity probe spreads each millisecond's share evenly, but
+the stream sends every frame back-to-back in 1 ms groups. A receiver can pass
+the capacity probe yet drop frame tails: a USB 2.5GbE dock (RTL8156B behind a
+hub) lost whole 12-16 packet USB transfers whenever a frame arrived above
+~2.2 Gbps, although both links reported 2.5 Gbps. Hosts advertising
+`PyroWaveUdpProbeBurstVersion=1` accept `&fps=N&pacekbps=P` on the UDP probe
+(10-500 FPS, `kbps <= P <= 9999999`): the same packets leave as `N` frames per
+second, each sent on the stream pacer's schedule of `P` kbps worth of
+back-to-back packets per 1 ms group. Only loss and the host's sending
+duration grade these probes (`PyroWaveLink::paceQualified`). Qualification
+requires under 2% overall packet loss and under 5% in every 100 ms window,
+no frame losing **more than 10%** of its packets, and fewer than 2% of frames
+with holes in the final 1 ms send group. Exactly 10% per-frame loss is allowed;
+a single frame above it fails, regardless of the aggregate loss. Small
+interior losses remain acceptable within the aggregate limits; the share of
+frames with any hole is recorded for diagnosis rather than used as a gate.
+The receiver reconstructs frame boundaries as
+`floor(expected * frame / frames)`, with `frames = fps * 2000 / 1000`, and
+matches the host's group size using the probe payload and actual IPv4/IPv6
+wire overhead. Counts include unsent packets, entirely missing frames and
+missing final tails; a surviving final packet does not hide holes in the
+tail group. Arrival ordering and duplicates cannot change frame membership.
+After the capacity search, calibration sends the selected video settings'
+bitrate for the chosen target (capped by the measured budget) as frames at the
+test frame rate and searches from the smaller known link speed down to 125%
+of the budget (`PyroWaveLink::searchPace`). The link is tried first and
+confirmed twice; otherwise a bisected qualifying edge is reduced 5% and
+confirmed twice, stepping down 10% on failure. If this path finds no passing
+speed, all remaining 50 Mbps steps are tested before concluding that no
+speed qualifies. Loss can be nonmonotonic; a failed floor is insufficient.
+If none qualifies, usable measurements are ranked by fewer violated limits,
+fewer tail-damaged frames, fewer frames over 10%, worst frame loss, aggregate
+loss and worst-window loss, then faster pace on ties. The worst observation
+at each speed includes failed confirmations. The selected fallback is
+measured twice afresh, and the status and summary warn explicitly if it
+still fails. Invalid or incomplete probes cannot become a fallback; exceptions
+invalidate the recommendation. Packet-speed failure does not automatically
+reduce the bitrate budget. Both fresh confirmations must satisfy all limits
+before a pace is described as confirmed. All format recommendations are
+capped by the actual frame-tested budget, even if aggregate capacity is higher.
+Applying a calibrated format
+stores the pace, and Moonlight announces it at launch as
+`x-ss-video[0].pyrowavePaceMbps`. The host paces PyroWave there, capped at its
+link and never below the frame's demand; uncalibrated sessions use 80% of the
+smaller link. Hosts without support ignore the attribute, but calibration
+requires burst-v1 support and a known endpoint link speed before issuing a
+recommendation; it cannot silently substitute an untested default pace.
+The PyroWave Packet speed (Mbps) control beside video bitrate edits this same
+saved value independently of calibration. Zero/Automatic uses the host's
+default; manual changes apply on the next stream, and applying a calibration
+result replaces the value. The host's link cap and minimum rate required by
+the frame still apply to manual requests.
 
 This tests fresh UDP delivery and synthetic GPU work separately. It does not
-prove sustained gameplay smoothness, host encoding speed, frame-burst delivery,
-or physical scanout. The older 32 MiB HTTPS download endpoint remains available
+prove sustained gameplay smoothness, host encoding speed, or physical scanout. The older 32 MiB HTTPS download endpoint remains available
 for older clients; new calibration does not use its loss-hidden throughput as
 proof of stability.

@@ -1,0 +1,58 @@
+{
+  "repository": "Nonary/moonlight-qt",
+  "audit_date_utc": "2026-10-11",
+  "method": "GitHub public release API metadata; downloaded assets checked against API SHA256 digests; WindowsInstaller.Installer OpenDatabase mode 0; extracted only ZIP Moonlight.exe and read FileVersionInfo. No executable was run and no MSI was installed.",
+  "releases": [
+    {
+      "tag": "v6.1.0-vrr",
+      "release_url": "https://github.com/Nonary/moonlight-qt/releases/tag/v6.1.0-vrr",
+      "msi": "MoonlightSetup-x64-6.1.0-vrr.msi",
+      "msi_sha256": "52d0a74a86de0d95a19293530ecd09cfff1984a53ae24b83adc5b2dad02c2020",
+      "msi_product_version": "6.1.0.0",
+      "zip": "MoonlightPortable-x64-6.1.0-vrr.zip",
+      "zip_sha256": "edcaebbd11845d4a1194e58be8a29d37f5fbb88fcbd1c4df181ec690e9bba4cc",
+      "pe_file_version": "6.1.0.0",
+      "pe_product_version": "6.1.0.0",
+      "exe_sha256": "bfe51fc29ce0a38f169b303945c3e867619b2a6b03647bd1dc243ffd85ee343d",
+      "tag_commit": "78176c9aa8ea35fcf66021229aa7332743ff4ab7"
+    },
+    {
+      "tag": "v6.1.0-vrr9.1.1",
+      "release_url": "https://github.com/Nonary/moonlight-qt/releases/tag/v6.1.0-vrr9.1.1",
+      "windows_release_source": "vrr9.1 unchanged Windows binaries, per release notes",
+      "msi": "MoonlightSetup-x64-6.1.0-vrr9.1.msi",
+      "msi_sha256": "8bbeb125b7eea85cb681ee3e2cfab1e391a234d2ead0348547a512e3b544a178",
+      "msi_product_version": "6.1.0.0",
+      "zip": "MoonlightPortable-x64-6.1.0-vrr9.1.zip",
+      "zip_sha256": "96aa82c32b556badadd0cff0d03ebfe62b748fd55a4a65733a56a1ca57cd72f4",
+      "pe_file_version": "6.1.0.0",
+      "pe_product_version": "6.1.0.0",
+      "exe_sha256": "f654c17d446da3ae6c11f9ccc436ca67389e969389871b8f32897c3241190b5c",
+      "tag_commit": "6c790dc591430b5d5a0171ee3d3f9818d1c8bd07"
+    }
+  ],
+  "recommendation": "Add exact historical exceptions for these two tags as Windows 6.1.0.0, which precedes the allocated 6.2.B family. Continue blocking all other unfamiliar custom-version families and preserve existing VRR tag mapping. Current recognized tag maximum remains vrr18 -> 6.2.180, so first daily is 6.1.0-daily.181 / Windows 6.2.181.",
+  "audited_tag_history": [
+    "v6.1.0-vrr",
+    "v6.1.0-vrr10",
+    "v6.1.0-vrr11",
+    "v6.1.0-vrr12",
+    "v6.1.0-vrr13",
+    "v6.1.0-vrr14",
+    "v6.1.0-vrr15",
+    "v6.1.0-vrr16",
+    "v6.1.0-vrr17",
+    "v6.1.0-vrr17.1",
+    "v6.1.0-vrr18",
+    "v6.1.0-vrr2",
+    "v6.1.0-vrr3",
+    "v6.1.0-vrr4",
+    "v6.1.0-vrr5",
+    "v6.1.0-vrr6",
+    "v6.1.0-vrr7",
+    "v6.1.0-vrr8",
+    "v6.1.0-vrr9",
+    "v6.1.0-vrr9.1",
+    "v6.1.0-vrr9.1.1"
+  ]
+}

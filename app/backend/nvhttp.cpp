@@ -221,10 +221,11 @@ int NvHTTP::probePyroWaveDownloadMbps()
 }
 
 PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const std::atomic<bool>& cancelled,
-                                           bool useHandshake)
+                                           bool useHandshake, int burstFps, int paceKbps)
 {
     if (m_ServerCert.isNull() || httpsPort() == 0 || kbps < 5000 || kbps > 3000000 ||
-        packetSize < 256 || packetSize > 1392) {
+        packetSize < 256 || packetSize > 1392 ||
+        (burstFps && (burstFps < 10 || burstFps > 500 || paceKbps < kbps || paceKbps > 9999999))) {
         throw std::runtime_error("Invalid or unauthenticated PyroWave UDP probe");
     }
     QUdpSocket socket;
@@ -277,7 +278,8 @@ PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const st
             return handshake.errorString();
         }) : std::function<QString(QNetworkReply*)>();
     QNetworkReply* networkReply = openConnection(probeUrl, "pyrowave-udp-probe",
-        (QString("kbps=%1&port=%2&packetsize=%3&token=%4") + (useHandshake ? "&handshake=1" : ""))
+        (QString("kbps=%1&port=%2&packetsize=%3&token=%4") + (useHandshake ? "&handshake=1" : "") +
+         (burstFps ? QString("&fps=%1&pacekbps=%2").arg(burstFps).arg(paceKbps) : QString()))
             .arg(kbps).arg(socket.localPort()).arg(packetSize).arg(QString::fromLatin1(token)),
         6000, NVLL_ERROR, receiveHeaders);
     const QString reply = QString::fromUtf8(networkReply->readAll());
@@ -295,6 +297,12 @@ PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const st
         !validElapsed || !std::isfinite(result.senderMs)) {
         throw std::runtime_error("Invalid PyroWave UDP probe result");
     }
+    // Optional host send diagnostics; older hosts omit them.
+    bool validRetries = false, validSendError = false;
+    const auto retries = getXmlString(reply, "sendRetries").toUInt(&validRetries);
+    const auto sendError = getXmlString(reply, "lastSendError").toInt(&validSendError);
+    if (validRetries) result.hostSendRetries = retries;
+    if (validSendError) result.hostLastSendError = sendError;
     // Allow a bounded reordered tail; its delay is still scored against the
     // sender schedule, never forgiven as good throughput.
     QEventLoop drain;
@@ -304,7 +312,12 @@ PyroWaveLink::Result NvHTTP::probePyroWaveUdp(int kbps, int packetSize, const st
     if (missingTimestamp) {
         throw std::runtime_error("PyroWave UDP packets arrived without valid kernel timestamps; calibration cannot grade delivery timing");
     }
-    PyroWaveLink::summarize(result, arrivals);
+    // Burst-v1 uses this exact wire charge for its 1 ms groups. Keep the
+    // final group's holes visible even when its last packet arrived.
+    const int burstWireBytes = packetSize + 48 + 8 +
+        (host.protocol() == QAbstractSocket::IPv6Protocol ? 40 : 20) + 38;
+    const uint32_t burstGroupPackets = (std::max)(1, paceKbps / 8 / burstWireBytes);
+    PyroWaveLink::summarize(result, arrivals, burstFps, burstGroupPackets);
     if (!readDelays.empty()) {
         std::sort(readDelays.begin(), readDelays.end());
         result.receiverReadDelayP99Ms = readDelays[(readDelays.size() - 1) * 99 / 100];

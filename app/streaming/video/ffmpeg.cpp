@@ -349,6 +349,7 @@ void FFmpegVideoDecoder::reset()
     m_FrameInfoQueue.clear();
     m_FrameSubmitTimeQueue.clear();
     m_FrameDecodeHoldQueue.clear();
+    m_FrameLostPacketsQueue.clear();
 
     while (!m_PyroWaveOutput.isEmpty()) {
         AVFrame* frame = m_PyroWaveOutput.dequeue();
@@ -1520,10 +1521,14 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             if (readiness.intervalPolicy) {
                 const auto& interval = readiness.interval;
                 char score[32], average[32];
-                const char* scoreWindow =
-                    stats.vrrOnTimeTargetPerMillion == 999900 ? "5m" :
-                    stats.vrrOnTimeTargetPerMillion == 995000 ? "2m" :
-                    stats.vrrOnTimeTargetPerMillion == 990000 ? "1m" : "30s";
+                char scoreWindow[32];
+                const auto historySeconds = interval.scoreWindowUs / 1000000;
+                if (historySeconds && historySeconds % 60 == 0)
+                    snprintf(scoreWindow, sizeof(scoreWindow), "%llum",
+                             static_cast<unsigned long long>(historySeconds / 60));
+                else
+                    snprintf(scoreWindow, sizeof(scoreWindow), "%llus",
+                             static_cast<unsigned long long>(historySeconds));
                 if (interval.evaluatedUs)
                     snprintf(score, sizeof(score), "%.2f%%",
                         interval.qualityPercent());
@@ -1551,28 +1556,70 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 else snprintf(presentTiming, sizeof(presentTiming), "unavailable");
                 if (advancedStats) {
                     ret = snprintf(&output[offset], length - offset,
-                        "Client timing: %s (target %.2f%% over %s)\n"
+                        "Client timing: %s (target %.2f%%)\n"
+                        "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Timing error (1s avg): %s | Allowed: %.2f ms | Drops (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
                         score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
-                        scoreWindow, average,
+                        interval.evaluatedUs / 1000000.0, scoreWindow, average,
                         interval.toleranceUs / 1000.0,
                         static_cast<unsigned long long>(readiness.dropped),
                         presentTiming);
                 }
                 else {
                     ret = snprintf(&output[offset], length - offset,
-                        "VRR pacing: %s | Smoothness (%s): %s / %.2f%% target%s\n"
+                        "VRR pacing: %s | Client timing: %s / %.2f%% target%s\n"
+                        "Scored time: %.1fs / %s history (gaps excluded)\n"
                         "Client interval error (1s): %s | Tolerance: %.2f ms | Dropped (30s): %llu\n"
                         "Present timing issues (30s): %s\n",
                         stats.vrrTelemetryActive ? "Active" : "Inactive",
-                        scoreWindow, score,
+                        score,
                         stats.vrrOnTimeTargetPerMillion / 10000.0,
-                        stats.vrrBufferAtLimit ? " (buffer limit)" : "", average,
+                        stats.vrrBufferAtLimit ? " (buffer limit)" : "",
+                        interval.evaluatedUs / 1000000.0, scoreWindow, average,
                         interval.toleranceUs / 1000.0,
                         static_cast<unsigned long long>(readiness.dropped),
                         presentTiming);
+                }
+                if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                offset += ret;
+                const auto cadenceText = [&fresh](const Vrr13::CadenceDetection::Stats& cadence,
+                                                  char* text, size_t size) {
+                    if (!cadence.intervals || !fresh(cadence.lastObservedUs)) {
+                        snprintf(text, size, "unavailable (no recent adjacent measurements)");
+                        return;
+                    }
+                    snprintf(text, size,
+                        "%llu/%llu deviations | recurring %llu | reversals %llu | uncertain %llu",
+                        static_cast<unsigned long long>(cadence.deviations),
+                        static_cast<unsigned long long>(cadence.intervals),
+                        static_cast<unsigned long long>(cadence.recurring),
+                        static_cast<unsigned long long>(cadence.reversals),
+                        static_cast<unsigned long long>(cadence.uncertain));
+                };
+                char submissions[192], displays[192];
+                cadenceText(interval.submissionCadence, submissions, sizeof(submissions));
+                cadenceText(interval.displayCadence, displays, sizeof(displays));
+                ret = snprintf(&output[offset], length - offset,
+                    "Source-relative submissions (2s): %s\n"
+                    "Source-relative OS display (2s): %s\n", submissions, displays);
+                if (advancedStats) {
+                    if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                    offset += ret;
+                    const auto detail = [&fresh](const Vrr13::CadenceDetection::Stats& c, char* text, size_t size) {
+                        if (!c.intervals || !fresh(c.lastObservedUs)) {
+                            snprintf(text, size, "unavailable"); return;
+                        }
+                        snprintf(text, size, "error floor %.2f%% of period | worst %.2f ms | jerk %.2f ms (%llu pairs) | coalesced %llu",
+                            c.normalizedErrorPercent(), c.worstErrorUs / 1000.0, c.worstJerkUs / 1000.0,
+                            static_cast<unsigned long long>(c.jerkPairs),
+                            static_cast<unsigned long long>(c.coalesced));
+                    };
+                    detail(interval.submissionCadence, submissions, sizeof(submissions));
+                    detail(interval.displayCadence, displays, sizeof(displays));
+                    ret = snprintf(&output[offset], length - offset,
+                        "Submission evidence: %s\nOS display evidence: %s\n", submissions, displays);
                 }
             }
             else if (readiness.meanMissPolicy) {
@@ -2831,6 +2878,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     // decoding or decoder backlog; keep it out of both stats.
                     const uint64_t decodeHoldUs = m_FrameDecodeHoldQueue.isEmpty() ?
                         0 : m_FrameDecodeHoldQueue.head();
+                    const uint32_t frameLostPackets = m_FrameLostPacketsQueue.isEmpty() ?
+                        0 : m_FrameLostPacketsQueue.head();
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
                         DECODE_UNIT du = m_FrameInfoQueue.dequeue();
@@ -2855,6 +2904,9 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     if (!m_FrameDecodeHoldQueue.isEmpty()) {
                         m_FrameDecodeHoldQueue.dequeue();
                     }
+                    if (!m_FrameLostPacketsQueue.isEmpty()) {
+                        m_FrameLostPacketsQueue.dequeue();
+                    }
 
                     m_ActiveWndVideoStats.decodedFrames++;
 
@@ -2869,6 +2921,7 @@ void FFmpegVideoDecoder::decoderThreadProc()
                                                        reassembledUs,
                                                        decodeSubmitUs);
                         pacedFrame.setDecodeHoldUs(decodeHoldUs);
+                        pacedFrame.setLostPackets(frameLostPackets);
 #ifdef HAVE_PYROWAVE
                         // Shared-surface output (Vulkan, D3D11 or Metal interop)
                         // returns at submission, not completion.
@@ -2967,18 +3020,18 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
 
     // Observe every delivered PyroWave frame before stale-frame shedding or
     // decoding. Missing detail can shimmer without dropping a whole frame.
-    if (!m_TestOnly) {
-        bool partial = false;
-        if (m_PyroWaveActive) {
-            for (PLENTRY packet = du->bufferList; packet != nullptr; packet = packet->next) {
-                if (packet->bufferType == BUFFER_TYPE_LOST) {
-                    partial = true;
-                    break;
-                }
-            }
+    uint64_t totalPackets = 0, lostPackets = 0;
+    if (m_PyroWaveActive) {
+        // PyroWave depacketization preserves one entry per data packet,
+        // including placeholders for holes that FEC could not recover.
+        for (PLENTRY packet = du->bufferList; packet != nullptr; packet = packet->next) {
+            ++totalPackets;
+            lostPackets += packet->bufferType == BUFFER_TYPE_LOST;
         }
+    }
+    if (!m_TestOnly) {
         const bool visible = m_PyroWavePacketLossWarning.observe(LiGetMicroseconds(),
-            m_PyroWaveActive && Session::get()->clientPacingWarningsEnabled(), partial);
+            m_PyroWaveActive && Session::get()->clientPacingWarningsEnabled(), totalPackets, lostPackets);
         Session::get()->getOverlayManager().setStatusMessage(Overlay::StatusSource::PacketLoss,
             visible ? PyroWavePacketLossWarning::Message : "");
     }
@@ -3138,6 +3191,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
             m_FrameInfoQueue.enqueue(*du);
             m_FrameSubmitTimeQueue.enqueue(decodeSubmitUs);
             m_FrameDecodeHoldQueue.enqueue(decodeHoldUs);
+            m_FrameLostPacketsQueue.enqueue(uint32_t((std::min)(lostPackets, uint64_t(UINT32_MAX))));
             m_FramesIn++;
         }
         return DR_OK;
@@ -3176,6 +3230,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     m_FrameInfoQueue.enqueue(*du);
     m_FrameSubmitTimeQueue.enqueue(decodeSubmitUs);
     m_FrameDecodeHoldQueue.enqueue(0);
+    m_FrameLostPacketsQueue.enqueue(0);
 
     m_FramesIn++;
     return DR_OK;

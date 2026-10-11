@@ -1,7 +1,8 @@
 @echo off
-rem Supported Windows VRR uses synchronized composition and native display events by default.
-rem Set MOONLIGHT_VRR_COMPOSITION=0 before launch for a DXGI comparison (no display-event lane).
-rem Production VRR queue: revision 7, with 0.5 ms Low Latency/Balanced Target tolerance, 0.2 ms Smooth tolerance, and severity-weighted 99/99.5/99.99 percent preset targets. Reconnect after changing the latency preset.
+rem Schema 5 appends lost_packets; use the bundled replay to preserve loss eligibility.
+rem Windows D3D11 VRR defaults to waitable DXGI queue admission.
+rem Set MOONLIGHT_VRR_COMPOSITION=1 before launch for composition display-event timing.
+rem The DXGI graph needs no UAC; Full Diagnostic adds optional PresentMon and scheduler tracing.
 setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%SystemRoot%"
 set "PORTABLE=\\allytwo\ChaseShare\MoonlightPortable-x64-6.1.0-vrr-lite"

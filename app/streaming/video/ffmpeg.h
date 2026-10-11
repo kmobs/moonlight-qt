@@ -169,6 +169,8 @@ private:
     QQueue<uint64_t> m_FrameSubmitTimeQueue;
     // Parallel to m_FrameSubmitTimeQueue: deliberate hold before submission.
     QQueue<uint64_t> m_FrameDecodeHoldQueue;
+    // Parallel to m_FrameDecodeHoldQueue: PyroWave packets zero-filled for loss.
+    QQueue<uint32_t> m_FrameLostPacketsQueue;
 
 #ifdef HAVE_PYROWAVE
     std::unique_ptr<PyroWaveDecoder> m_PyroWave;

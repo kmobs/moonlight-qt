@@ -6,9 +6,9 @@
 #include <QFile>
 #include <QFileInfo>
 
-#if defined(__linux__) && __has_include(<drm/amdgpu_drm.h>)
-#define HAVE_AMDGPU_STABLE_PSTATE
-#include <drm/amdgpu_drm.h>
+#include "gpuperformancehold_amdgpu.h"
+
+#ifdef HAVE_AMDGPU_STABLE_PSTATE
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -130,6 +130,9 @@ GpuPerformanceHold::GpuPerformanceHold(bool enabled)
                     readLine(gpu.devicePath + "/power_dpm_force_performance_level").toLatin1().constData());
         m_Holds.push_back({fd, context, gpu.renderNode});
     }
+#elif defined(__linux__)
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "GPU performance hold: unavailable in this build (AMDGPU stable-pstate headers required)");
 #endif
 }
 

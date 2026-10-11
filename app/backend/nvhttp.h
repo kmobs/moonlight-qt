@@ -127,8 +127,11 @@ public:
     // Returns measured Mbps, or throws on an unsupported/failed request.
     int probePyroWaveDownloadMbps();
 
+    // With burstFps set (PyroWaveUdpProbeBurstVersion 1), the host sends the
+    // same packets as video frames at that cadence, paced at paceKbps in the
+    // stream's 1 ms groups. Only loss is meaningful for those probes.
     PyroWaveLink::Result probePyroWaveUdp(int kbps, int packetSize, const std::atomic<bool>& cancelled,
-                                        bool useHandshake = true);
+                                        bool useHandshake = true, int burstFps = 0, int paceKbps = 0);
 
     static
     void

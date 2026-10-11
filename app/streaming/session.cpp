@@ -12,7 +12,6 @@
 #include "backend/richpresencemanager.h"
 #include "streaming/gpuperformancehold.h"
 #include "backend/networkbuffers.h"
-#include "video/pyrowave/pyrowavepacketlosswarning.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -73,7 +72,7 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clSetMotionEventState,
     Session::clSetControllerLED,
     Session::clSetAdaptiveTriggers,
-#if defined(Q_OS_LINUX) && SDL_VERSION_ATLEAST(2, 24, 0)
+#if (defined(Q_OS_LINUX) || defined(Q_OS_WIN)) && SDL_VERSION_ATLEAST(2, 24, 0)
     DualSenseHaptics::receive
 #else
     nullptr
@@ -200,8 +199,6 @@ void Session::clConnectionStatusUpdate(int connectionStatus)
     {
     case CONN_STATUS_POOR:
         s_ActiveSession->m_OverlayManager.setStatusMessage(Overlay::StatusSource::Network,
-                                                            (s_ActiveSession->m_ActiveVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) ?
-                                                                PyroWavePacketLossWarning::Message :
                                                             s_ActiveSession->m_StreamConfig.bitrate > 5000 ?
                                                                 "Slow connection to PC\nReduce your bitrate" : "Poor connection to PC");
         break;
@@ -1963,6 +1960,10 @@ bool Session::startConnectionAsync()
     if (m_StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) {
         m_StreamConfig.pyrowaveLinkMbps = NetworkBuffers::routedWiredLinkMbps(
             QHostAddress(m_Computer->activeAddress.address()));
+        // Calibration's loss-free frame pace. Hosts without support ignore it.
+        m_StreamConfig.pyrowavePaceMbps = (std::max)(0, m_Preferences->pyroWavePaceMbps);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave pacing hints: link %d Mbps, calibrated pace %d Mbps",
+                    m_StreamConfig.pyrowaveLinkMbps, m_StreamConfig.pyrowavePaceMbps);
     }
     int err = LiStartConnection(&hostInfo, &m_StreamConfig, &k_ConnCallbacks,
                                 &m_VideoCallbacks, &m_AudioCallbacks,

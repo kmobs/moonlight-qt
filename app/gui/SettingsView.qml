@@ -4,6 +4,7 @@ import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
 
 import StreamingPreferences 1.0
+import AutoUpdateChecker 1.0
 import ComputerManager 1.0
 import ComputerModel 1.0
 import SdlGamepadKeyNavigation 1.0
@@ -840,6 +841,13 @@ Flickable {
                     }
                 }
 
+                PyroWavePacketSpeedSettings {
+                    width: parent.width
+                    visible: SystemProperties.hasPyroWave && slider.pyroWave
+                    paceMbps: StreamingPreferences.pyroWavePaceMbps
+                    onPaceEdited: function(value) { StreamingPreferences.pyroWavePaceMbps = value }
+                }
+
                 Column {
                     width: parent.width
                     spacing: 5
@@ -920,8 +928,8 @@ Flickable {
                           description: qsTr("Half the developer's recommended image bitrate. Uses less bandwidth.") },
                         { text: qsTr("Recommended"), summary: qsTr("Developer choice"), value: PyroWaveCalibrator.Recommended,
                           description: qsTr("The developer's recommended image bitrate for each format.") },
-                        { text: qsTr("Moderate"), summary: qsTr("60% of measured link"), value: PyroWaveCalibrator.Moderate,
-                          description: qsTr("Use up to 60% of the measured bandwidth, including overhead.") },
+                        { text: qsTr("Moderate"), summary: qsTr("60% of link speed"), value: PyroWaveCalibrator.Moderate,
+                          description: qsTr("Aim for 60% of the link speed including overhead, never below Recommended. Calibration lowers it to what the connection sustains.") },
                         { text: qsTr("Maximum"), summary: qsTr("Full measured budget"), value: PyroWaveCalibrator.Maximum,
                           description: qsTr("Find the highest tested bitrate the connection and this device can sustain, with network headroom.") }
                     ]
@@ -1116,6 +1124,8 @@ Flickable {
                         StreamingPreferences.enableYUV444 = option.chroma444
                         StreamingPreferences.enableHdr = option.hdr
                         StreamingPreferences.bitrateKbps = option.bitrateKbps
+                        // The tested frame pace; 0 lets the host use its default.
+                        StreamingPreferences.pyroWavePaceMbps = PyroWaveCalibrator.paceMbps
                         StreamingPreferences.autoAdjustBitrate = false
                         slider.value = StreamingPreferences.bitrateKbps
 
@@ -2736,6 +2746,16 @@ Flickable {
                     ToolTip.timeout: 5000
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("This unlocks extremely high video bitrates for use with Sunshine hosts. It should only be used when streaming over an Ethernet LAN connection.")
+                }
+
+                CheckBox {
+                    width: parent.width
+                    text: qsTr("Notify me about prerelease and nightly updates")
+                    font.pointSize: 12
+                    checked: AutoUpdateChecker.notifyPrereleases
+                    onClicked: AutoUpdateChecker.notifyPrereleases = checked
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Enabled by default. Turn off to receive only stable update notifications. Updates are never installed automatically.")
                 }
 
                 CheckBox {

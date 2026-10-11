@@ -57,6 +57,10 @@ constexpr uint64_t kPlayoutSmoothingReserveMaxUs = 3000;
 constexpr uint64_t kPlayoutSmoothingReserveToleranceUs = 500;
 constexpr uint64_t kPlayoutSmoothingReservePercentilePerMille = 980;
 constexpr uint64_t kPlayoutSmoothingReserveReleaseUsPerSecond = 500;
+// Native future-target sessions in the 2026-10-10 capture trade away tail
+// latency for little cadence benefit above 2 ms. Retain the wider worker-paced
+// policy for host-quantized sources; explicit capture parameters remain exact.
+constexpr uint64_t kNativeScheduledSmoothingMaxLagUs = 2000;
 // A cadence reset (a few slow game frames, a burst, a stall) used to drop the
 // accumulated retiming in one frame: up to a 6 ms step on screen, the most
 // common client-made snap at 116/120 in capture 20260922-193211. Ease it back
@@ -119,6 +123,11 @@ void appendBounded(std::deque<T>& values, T value, size_t limit)
 
 uint64_t intervalQualityWindowUs(const VrrTimingParameters& parameters)
 {
+    // Live revision 11 honors the explicit history for presets and custom
+    // settings. Preserve the tuple-based histories of recorded revisions.
+    if (parameters.playoutResponsiveBuffer >= 11) {
+        return parameters.playoutReadinessWindowUs;
+    }
     // Revision 7 originally captured playoutReadinessWindowUs for the
     // readiness estimator, while IntervalBuffer used a fixed 30-second score
     // history. Identify the new preset tuples here so old revision-7 traces
@@ -160,7 +169,8 @@ uint64_t intervalQualityToleranceUs(const VrrTimingParameters& parameters)
 } // namespace
 
 VrrTimingParameters vrrTimingParametersForSession(
-    const VrrSessionConfig& config, bool nativeSynchronizedPresentation)
+    const VrrSessionConfig& config, bool nativeSynchronizedPresentation,
+    bool nativeScheduledPresentation)
 {
     // Present on a tracked source cadence plus a learned delay. The readiness
     // reserve, its per-frame slewing, and every phase re-anchor are off on this
@@ -170,6 +180,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     // Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
     parameters.nativeSynchronizedPresentation = nativeSynchronizedPresentation ? 1 : 0;
+    parameters.nativeScheduledPresentation = nativeScheduledPresentation ? 1 : 0;
     // Mode zero is the new Smooth profile. Captured parameters retain their
     // own defaults for exact replay.
     const int latencyMode = config.latencyMode >= 0 && config.latencyMode <= 2 ?
@@ -196,7 +207,10 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutPredictionOnly = 1;
     // Every normal VRR session uses the interval-quality queue. Historical
     // policies remain selectable only through explicit diagnostic parameters.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 9;
+    // Apply tolerance to each interval before averaging its loss. Isolated
+    // late/catch-up pairs must remain visible to both reporting and control.
+    // Revision 11 also honors custom history; recorded 7/9/10 stay replayable.
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 12;
     // Timeline mapping anchors to decode completion, absorbing hardware decode
     // duration into the sender offset instead of inflating client buffer delay.
     parameters.playoutSourceMappingDecoderOutput = 0;
@@ -259,7 +273,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutOffsetSlewUsPerSecond = 2400;
     // Local GPU and worker backlog must not age the sender-clock model or buy
     // a larger correction. The unwrapped RTP timeline supplies elapsed time;
-    // immutable decoder output supplies the source offset being corrected.
+    // decode completion supplies the source offset being corrected.
     parameters.playoutOffsetSourceClock = 1;
     parameters.playoutOffsetMaximumStepUs = 100;
     parameters.playoutDelayAdaptive = 1;
@@ -277,10 +291,12 @@ VrrTimingParameters vrrTimingParametersForSession(
         kPlayoutSmoothingGainPerMille;
     parameters.playoutSmoothingPeriodAlphaPerMille =
         kPlayoutSmoothingPeriodAlphaPerMille;
-    parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
+    parameters.playoutSmoothingMaxLagUs = nativeScheduledPresentation ?
+        kNativeScheduledSmoothingMaxLagUs : kPlayoutSmoothingMaxLagUs;
     parameters.playoutSmoothingPeriodFeedbackPerMillion =
         kPlayoutSmoothingPeriodFeedbackPerMillion;
-    parameters.playoutSmoothingReserveMaxUs = kPlayoutSmoothingReserveMaxUs;
+    parameters.playoutSmoothingReserveMaxUs = std::min(
+        kPlayoutSmoothingReserveMaxUs, parameters.playoutSmoothingMaxLagUs);
     parameters.playoutSmoothingReserveToleranceUs =
         kPlayoutSmoothingReserveToleranceUs;
     parameters.playoutSmoothingReservePercentilePerMille =
@@ -310,7 +326,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelaySlewAcrossBands = 1;
     // Spend the existing playout interval on preparation on both platforms.
     // Vulkan can hand off a pending GPU render using its present semaphore;
-    // D3D11 can execute during the target hold before its final fence check.
+    // D3D11 completes its verified render fence before the target hold.
     // Delaying preparation until just before Present would remove that overlap,
     // especially when no synchronous GPU wait is available to train a lead.
     // Acquisition still enforces native backpressure; it does not justify an
@@ -467,6 +483,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_IntervalBuffer.breakSequence();
     m_PresentationPrediction.reset();
     m_PresentTiming.breakSequence();
+    m_SubmissionCadence.breakSequence();
+    m_DisplayCadence.breakSequence();
     m_SubmissionSmoothness.breakSequence();
     m_NativeSmoothness.breakSequence();
     m_FeedbackModeValid = false;
@@ -476,6 +494,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
         m_MeanMissBuffer.reset();
         m_IntervalBuffer.reset();
         m_PresentTiming.reset();
+        m_SubmissionCadence.reset();
+        m_DisplayCadence.reset();
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
@@ -1174,6 +1194,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.sourceRateChanged = !rebased && cadence.sourceRateChanged;
     decision.phaseDiscontinuity = !rebased && cadence.phaseDiscontinuity;
     decision.rebased = rebased;
+    decision.diagnosticSourceTimestampUs = rtpUs;
+    decision.diagnosticSourceTimestampValid = timestampPlayout && !rebased && !cadence.phaseDiscontinuity;
 
     m_Pending.valid = true;
     m_Pending.smoothness = smoothnessSample(decision);
@@ -1221,6 +1243,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                     cadence.intervalUs >= m_SourcePeriodUs / 2;
             }
         }
+    }
+    // PyroWave delivers a frame with zero-filled detail rather than waiting
+    // for lost packets. Its lateness is loss, not delivery jitter or slow
+    // work, and more playout delay cannot recover it; it only moves every
+    // later frame. Present it as scheduled, but keep it out of the evidence
+    // that grows the readiness, interval, mean-miss and smoothness buffers.
+    if (frame.lostPackets() != 0) {
+        m_Pending.smoothness.eligible = false;
+        m_Pending.prediction.eligible = false;
     }
     m_LastDecodeCompleteUs = sourceMappingUs(frame);
     m_HaveLastDecodeComplete = true;
@@ -2174,11 +2205,18 @@ void VrrTimingController::noteSpacingDeficit(uint64_t deficitUs)
 }
 
 void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
-                                         uint64_t submissionUs)
+                                         uint64_t submissionUs, uint64_t actualSubmissionUs)
 {
     if (!m_Pending.valid) {
         return;
     }
+
+    const auto& cadenceSample = m_Pending.smoothness;
+    const uint64_t enqueueUs = actualSubmissionUs ? actualSubmissionUs : submissionUs;
+    m_SubmissionCadence.observe({cadenceSample.frame, cadenceSample.sourceTimestampUs,
+        enqueueUs, enqueueUs, 0,
+        submitted && !cancelled && cadenceSample.sourceTimestampValid},
+        intervalQualityToleranceUs(m_Parameters));
 
     if (m_Parameters.playoutResponsiveBuffer >= 5) {
         const auto& p = m_Pending.prediction;
@@ -2226,7 +2264,9 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutRecentPressureRelease,
                 m_Parameters.playoutSerialServiceGate,
                 m_Parameters.playoutHoldRenewBelowTarget,
-                m_Parameters.playoutResponsiveBuffer >= 9);
+                m_Parameters.playoutResponsiveBuffer >= 9,
+                m_Parameters.playoutResponsiveBuffer == 10,
+                m_Parameters.playoutResponsiveBuffer >= 12);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
             p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&
@@ -2367,6 +2407,8 @@ Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const Vr
 {
     Vrr13::SmoothnessFeedback::Sample sample;
     sample.frame = d.frameNumber;
+    sample.sourceTimestampUs = d.diagnosticSourceTimestampUs;
+    sample.sourceTimestampValid = d.diagnosticSourceTimestampValid;
     // Judge cadence against the intended source schedule. A newly learned
     // compositor lead changes our prediction, not the spacing we want to
     // display. Including its frame-to-frame changes manufactures buffer
@@ -2413,6 +2455,7 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
         if (m_FeedbackModeValid && m_FeedbackLatched != observation.latched) {
             m_NativeSmoothness.breakSequence();
             m_PresentTiming.breakSequence();
+            m_DisplayCadence.breakSequence();
         }
         m_FeedbackModeValid = true;
         m_FeedbackLatched = observation.latched;
@@ -2421,6 +2464,9 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
                                                                         uint64_t observed, uint64_t submittedUs,
                                                                         uint64_t plannedUs) {
         if (observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent) {
+            m_DisplayCadence.observe({sample.frame, sample.sourceTimestampUs, sample.at,
+                observed, sample.uncertainty, sample.sourceTimestampValid},
+                intervalQualityToleranceUs(m_Parameters));
             m_PresentTiming.observe({sample.frame, submittedUs, sample.at, plannedUs, sample.uncertainty, observed},
                                     {intervalQualityToleranceUs(m_Parameters), m_DisplayPeriodUs,
                                      m_SourcePeriodUs, m_Parameters.vrrFloorLatchGapUs});
@@ -2722,6 +2768,13 @@ uint64_t VrrTimingController::earliestSubmissionUs() const
 {
     if (!m_HaveLastSubmission) {
         return 0;
+    }
+    if (m_Parameters.nativeScheduledPresentation != 0) {
+        // A synchronized presentation manager may coalesce several overdue
+        // images into one refresh. Native acceptance does not promise each
+        // image a visible interval. Reserve an admissible display deadline;
+        // CPU enqueue may precede it on the native scheduled path.
+        return saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs);
     }
     if (m_Parameters.latchedFloorDisabled != 0 && m_LatchedPresentation) {
         // Latched presents omit the tearing flag, so the flip queue already

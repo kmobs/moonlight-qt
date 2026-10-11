@@ -51,6 +51,7 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       CI_VERSION: ${{ needs.setup.outputs.ci_version }}
+      CCACHE_DIR: ${{ github.workspace }}/.flatpak-builder/ccache
     steps:
       - uses: actions/checkout@v5
         with:
@@ -61,6 +62,22 @@ jobs:
           sudo apt-get install -y flatpak
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub org.flatpak.Builder org.kde.Sdk//6.10 org.kde.Platform//6.10
+      - name: Detect Flatpak build resources and SDK identity
+        id: flatpak-sdk
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_linux_build_budget.py
+          python3 scripts/linux-build-budget.py
+          { printf '%s\n' "$ImageOS" "$ImageVersion"; uname -m; flatpak --version; flatpak info --user --show-commit org.flatpak.Builder; flatpak info --user --show-commit org.kde.Sdk//6.10; flatpak info --user --show-commit org.kde.Platform//6.10; } > flatpak-sdk-fingerprint.txt
+          flatpak run --command=ccache org.kde.Sdk//6.10 --version
+          echo "abi=$(sha256sum flatpak-sdk-fingerprint.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Restore SDK and manifest keyed compiler cache
+        id: flatpak-ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .flatpak-builder/ccache
+          key: flatpak-ccache-v1-${{ runner.arch }}-${{ steps.flatpak-sdk.outputs.abi }}-${{ hashFiles('packaging/flatpak/**', 'app/deploy/linux/appimage/*.patch', '.github/workflows/build-release.yml') }}-${{ github.sha }}
+          restore-keys: |
+            flatpak-ccache-v1-${{ runner.arch }}-${{ steps.flatpak-sdk.outputs.abi }}-${{ hashFiles('packaging/flatpak/**', 'app/deploy/linux/appimage/*.patch', '.github/workflows/build-release.yml') }}-
       - name: Pin manifest to release source and version
         run: |
           python3 - <<'PY'
@@ -75,7 +92,7 @@ jobs:
           PY
       - name: Build Flatpak
         run: |
-          dbus-run-session -- flatpak run org.flatpak.Builder --user --force-clean --sandbox \
+          dbus-run-session -- flatpak run --env=CCACHE_DIR="$CCACHE_DIR" --env=CCACHE_MAXSIZE=512M org.flatpak.Builder --user --force-clean --sandbox --ccache --jobs="$BUILD_JOBS" --rebuild-on-sdk-change \
             --install-deps-from=flathub --repo=flatpak-repo flatpak-build \
             packaging/flatpak/com.moonlight_stream.Moonlight.json
           flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
@@ -97,3 +114,9 @@ jobs:
           path: Moonlight-VRR-${{ env.CI_VERSION }}-linux-x86_64.flatpak
           compression-level: 0
           if-no-files-found: error
+      - name: Save verified Flatpak compiler cache
+        if: success() && (github.ref_name == github.event.repository.default_branch || (github.repository == 'Nonary/moonlight-qt' && github.event_name == 'workflow_dispatch' && github.ref_type == 'branch')) && steps.flatpak-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .flatpak-builder/ccache
+          key: ${{ steps.flatpak-ccache.outputs.cache-primary-key }}

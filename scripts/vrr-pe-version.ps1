@@ -10,6 +10,18 @@ param(
     [string]$CiVersion
 )
 
+# Daily versions share the existing 6.2 MSI sequence. The allocator chooses
+# a build higher than every previously tagged VRR and daily version.
+if ($CiVersion -match '^6\.[12]\.0-daily\.([1-9][0-9]*)$') {
+    $build = [long]$Matches[1]
+    if ($build -lt 1 -or $build -gt 65535) {
+        Write-Error "Daily Windows build must be between 1 and 65535"
+        exit 1
+    }
+    Write-Output "6.2.$build"
+    exit 0
+}
+
 if ($CiVersion -match '-vrr(\d+)\.(\d+)$') {
     Write-Output ('6.2.' + ([int]$Matches[1] * 10 + [int]$Matches[2]))
     exit 0

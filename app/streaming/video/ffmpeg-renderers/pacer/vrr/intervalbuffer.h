@@ -6,12 +6,13 @@
 #include <vector>
 
 #include "presenttiming.h"
+#include "cadencedetection.h"
 
 namespace Vrr13 {
 // Client-added interval error, including zero-error intervals. Production
-// scores excess above tolerance per interval before averaging over history;
-// the one-second mean remains diagnostic. Recorded policies retain their
-// historical mean-before-tolerance behavior.
+// applies tolerance to each interval before averaging loss for both reporting
+// and control. Recorded revisions 7/8 average before tolerance; revision 10 uses a
+// separate mean-before-tolerance control history for exact historical replay.
 class IntervalBuffer {
 public:
     static constexpr uint64_t ToleranceUs = 500;
@@ -59,7 +60,11 @@ public:
         double averageErrorUs = 0;
         uint64_t evaluatedUs = 0, failedUs = 0;
         double weightedLossUs = 0;
+        // Separate control history: never substitute it for client timing.
+        uint64_t bufferFailedUs = 0;
+        double bufferWeightedLossUs = 0;
         uint64_t toleranceUs = ToleranceUs;
+        uint64_t scoreWindowUs = 30000000;
         bool severityWeighted = false;
         bool averageValid = false;
         bool serviceOverloaded = false; // Qualified one-second workload, diagnostic only.
@@ -71,12 +76,19 @@ public:
         // Filled by the controller; post-submission timing never changes
         // this buffer's score or requests.
         PresentTiming::Stats present;
+        CadenceDetection::Stats submissionCadence, displayCadence;
         double lossFraction() const {
             return evaluatedUs ? std::clamp(
                 (severityWeighted ? weightedLossUs : double(failedUs)) / evaluatedUs,
                 0.0, 1.0) : 0.0;
         }
         double qualityPercent() const { return 100.0 * (1.0 - lossFraction()); }
+        double bufferLossFraction() const {
+            return evaluatedUs ? std::clamp(
+                (severityWeighted ? bufferWeightedLossUs : double(bufferFailedUs)) / evaluatedUs,
+                0.0, 1.0) : 0.0;
+        }
+        double bufferQualityPercent() const { return 100.0 * (1.0 - bufferLossFraction()); }
     };
     void observe(const Sample& s, uint64_t minimum, uint64_t maximum,
                  uint64_t hold, uint64_t releaseRate,
@@ -88,8 +100,11 @@ public:
                  uint64_t recentPressureRelease = 0,
                  uint64_t serialServiceGate = 0,
                  uint64_t holdRenewBelowTarget = 0,
-                 bool perIntervalExcess = false) {
+                 bool perIntervalExcess = false,
+                 bool averageBufferControl = false,
+                 bool historyDriven = false) {
         m_Stats.toleranceUs = toleranceUs;
+        m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
         minimum = std::min(minimum, maximum);
         if (!m_Initialized) { m_Target = s.buffer; m_Initialized = true; }
@@ -170,12 +185,13 @@ public:
         m_Stats.calibrationCoverageUs = s.submitted - m_First;
         m_Stats.averageValid = samples >= 2 && m_SequenceSamples >= m_SequenceMinimumSamples &&
             m_Stats.calibrationCoverageUs >= m_SequenceWarmupUs;
-        if (!m_Stats.averageValid) {
+        if (!m_Stats.averageValid && !historyDriven) {
             updateScore(s.submitted, scoreWindowUs);
             return;
         }
-        m_Stats.initialCalibrationComplete = true;
-        m_Stats.serviceOverloaded = service > intendedTime || decoderQueue > intendedTime;
+        if (m_Stats.averageValid) m_Stats.initialCalibrationComplete = true;
+        m_Stats.serviceOverloaded = m_Stats.averageValid &&
+            (service > intendedTime || decoderQueue > intendedTime);
         const bool pressure = total > samples * toleranceUs;
         // Weight the score by evaluated time, not frame rate; gaps are unknown.
         // Revision 9 applies tolerance before averaging so clean intervals
@@ -191,15 +207,31 @@ public:
             (perIntervalExcess ? double(error) : m_Stats.averageErrorUs) - toleranceUs);
         const double loss = std::min(1.0, excessUs / intended);
         if (severityWeighted) score.weightedLoss += actual * loss;
+        // Revision 10 keeps the accurate report above, but restores revision
+        // 7/8's averaging for every control decision, including history-based
+        // growth qualification and hold/release. Relaxing attack alone would
+        // still let isolated reported misses pin the buffer's release hold.
+        const double bufferExcessUs = averageBufferControl ?
+            std::max(0.0, m_Stats.averageErrorUs - toleranceUs) : excessUs;
+        const double bufferLoss = std::min(1.0, bufferExcessUs / intended);
+        if (averageBufferControl ? pressure : (perIntervalExcess ? error > toleranceUs : pressure))
+            score.bufferFailed += actual;
+        if (severityWeighted) score.bufferWeightedLoss += actual * bufferLoss;
         updateScore(s.submitted, scoreWindowUs);
 
+        // Revision 12 retains every observed adjacent interval in the long
+        // history. Qualification guards buffer changes, not measurement:
+        // discarding a second after each break made a 2-minute score behave
+        // like a much shorter history in sessions with repeated frame gaps.
+        if (!m_Stats.averageValid) return;
+
         const double allowedLoss = (1000000 - std::min<uint64_t>(targetPerMillion, 1000000)) / 1000000.0;
-        const bool belowTarget = m_Stats.lossFraction() > allowedLoss;
-        const bool currentPressure = severityWeighted ? loss > allowedLoss : pressure;
+        const bool belowTarget = m_Stats.bufferLossFraction() > allowedLoss;
+        const bool currentPressure = severityWeighted ? bufferLoss > allowedLoss : pressure;
         // Old score debt holds protection, but cannot authorize another attack
         // without current, attributable error outside the preset's allowance.
         const bool historicalPressure = severityWeighted && belowTarget;
-        const bool historyHolds = !recentPressureRelease && historicalPressure;
+        const bool historyHolds = (!recentPressureRelease || historyDriven) && historicalPressure;
         const auto& delayed = actual >= intended ? s : previous;
         const auto lateness = delayed.ready > delayed.deadline ? delayed.ready - delayed.deadline : 0;
         const bool freshError = severityWeighted ? error > toleranceUs : error != 0;
@@ -271,7 +303,7 @@ public:
         if (grow && freshError && delayedAbsorbable && lateness &&
                 (!m_LastAttack || s.submitted - m_LastAttack >= 250000)) {
             const auto excess = severityWeighted ?
-                uint64_t(std::ceil(std::min(250.0, std::max(0.0, excessUs - allowedLoss * intended)))) :
+                uint64_t(std::ceil(std::min(250.0, std::max(0.0, bufferExcessUs - allowedLoss * intended)))) :
                 (total - samples * toleranceUs + samples - 1) / samples;
             const auto freshExcess = severityWeighted ? error - toleranceUs : error;
             const auto increase = std::min({uint64_t(250), excess, lateness,
@@ -344,10 +376,14 @@ private:
     struct ScoreBucket {
         uint64_t tick = 0, evaluated = 0, failed = 0;
         double weightedLoss = 0;
+        uint64_t bufferFailed = 0;
+        double bufferWeightedLoss = 0;
     };
     void updateScore(uint64_t at, uint64_t windowUs) {
         m_Stats.evaluatedUs = m_Stats.failedUs = 0;
         m_Stats.weightedLossUs = 0;
+        m_Stats.bufferFailedUs = 0;
+        m_Stats.bufferWeightedLossUs = 0;
         const uint64_t windowBuckets = std::clamp<uint64_t>(
             (windowUs + ScoreBucketUs - 1) / ScoreBucketUs,
             1, MaximumScoreBuckets);
@@ -356,6 +392,8 @@ private:
             if (tick >= b.tick && tick - b.tick < windowBuckets) {
                 m_Stats.evaluatedUs += b.evaluated; m_Stats.failedUs += b.failed;
                 m_Stats.weightedLossUs += b.weightedLoss;
+                m_Stats.bufferFailedUs += b.bufferFailed;
+                m_Stats.bufferWeightedLossUs += b.bufferWeightedLoss;
             }
         }
     }

@@ -184,6 +184,18 @@ public:
         return m_DecodeHoldUs;
     }
 
+    // PyroWave data packets that arrived as zero-filled holes. Loss costs this
+    // frame detail, not timing: its lateness must not teach the pacer to buffer.
+    void setLostPackets(uint32_t lostPackets)
+    {
+        m_LostPackets = lostPackets;
+    }
+
+    uint32_t lostPackets() const
+    {
+        return m_LostPackets;
+    }
+
     // Reassembled -> decode submission, excluding a deliberate hold.
     uint64_t decoderQueueUs() const
     {
@@ -225,4 +237,5 @@ private:
     uint64_t m_DecodeSubmitUs = 0;
     uint64_t m_DecodeHoldUs = 0;
     uint64_t m_DecodeBoundary = 0;
+    uint32_t m_LostPackets = 0;
 };

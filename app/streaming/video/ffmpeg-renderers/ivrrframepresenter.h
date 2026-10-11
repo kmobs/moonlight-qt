@@ -7,9 +7,17 @@
 struct AVFrame;
 class VrrPreparedFrame;
 
-// Renderer-facing VRR contract. Pacing timestamps and sender metadata never
-// cross this boundary: the presenter only prepares, adaptively presents, or
-// abandons a decoded image.
+// CPU service time and completion evidence are independent: an already-ready
+// GPU fence proves readiness even though checking it did not block.
+struct VrrDecodeReadiness {
+    uint64_t waitUs = 0;
+    bool completionObserved = false;
+    bool asynchronousOutput = false;
+};
+
+// Renderer-facing VRR contract. A backend with native timed presentation may
+// receive a display deadline on the shared monotonic clock. Sender metadata
+// remains worker-owned.
 enum class VrrFallbackReason : uint8_t {
     NoFallback,
     IneffectiveVsync,
@@ -77,6 +85,23 @@ struct VrrPresentFeedback {
     bool cancelled = false;
     bool submissionTimeValid = false;
     uint64_t submissionTimeUs = 0;
+    // Acceptance of a native future display deadline is independent of the
+    // actual CPU enqueue timestamp above. Never substitute one for the other.
+    bool nativeTargetValid = false;
+    uint64_t nativeTargetUs = 0;
+    uint64_t nativeTargetTime100ns = 0;
+    uint64_t nativeTargetReferenceTime100ns = 0;
+    uint64_t nativeTargetClockBeforeUs = 0;
+    uint64_t nativeTargetClockAfterUs = 0;
+    uint64_t nativeTargetUncertaintyUs = 0;
+    uint64_t nativeOutstandingPresents = 0;
+    uint64_t nativeRetiringPresentId = 0;
+    uint64_t nativeSkippedFrames = 0;
+    uint64_t nativeCanceledFrames = 0;
+    uint64_t nativeDisplayedDuration100ns = 0;
+    uint64_t nativeStatusId = 0;
+    uint64_t nativeStatus = 0;
+    uint64_t nativeDroppedStatusFrames = 0;
     // Backend and signed native result for the actual presentation call.
     // Both validity flags are set whenever that call was attempted, including
     // cancellation and failure paths. Vulkan's libplacebo wrapper and Metal
@@ -208,6 +233,8 @@ struct VrrPresentFeedback {
     // is retained separately so cross-clock translation can be audited.
     bool frameStatsQueryResultValid = false;
     int64_t frameStatsQueryResult = 0;
+    // Reset observation-only refresh matching across native timing epochs.
+    bool frameStatsDisjoint = false;
     uint64_t frameStatsQueryStartUs = 0;
     uint64_t frameStatsQueryEndUs = 0;
     bool latchRawSyncQpcValid = false;
@@ -271,10 +298,10 @@ struct VrrPresentFeedback {
     uint64_t gpuReadyTimeUs = 0;
 
     // Native flip protection (VrrPresentRequest::flipProtectionWindowUs).
-    // Unlike the observation fields above, this pre-Present frame-statistics
-    // query does gate the native mode: a planned tearing present is sent
-    // latched when the predecessor has not reached the screen (pending) or
-    // its refresh began less than the window before the query (reference).
+    // Unlike the graph observations above, this final native guard gates the
+    // present mode. Pending, active or unknown scanout selects synchronization.
+    // A raster-query time is not a measured flip time; reference remains zero
+    // unless a backend actually has that display-time evidence.
     bool flipProtectionChecked = false;
     int64_t flipProtectionQueryResult = 0;
     uint64_t flipProtectionQueryStartUs = 0;
@@ -294,9 +321,14 @@ struct VrrPresentFeedback {
 struct VrrPresentRequest {
     bool latchedPresentation = false;
     bool collectDiagnostics = false;
-    // Nonzero on an unlatched request asks a latch-capable backend to latch
-    // anyway if the predecessor is not yet displayed or its refresh started
-    // less than this long ago. Only presentAdaptive() consults it.
+    // Zero retains the immediate path. A supported native backend accepts
+    // this future display deadline before the worker completes its cadence
+    // hold. It echoes acceptance separately from actual enqueue timing.
+    uint64_t displayTargetUs = 0;
+    // Nonzero on an unlatched request requires native scanout protection,
+    // including startup or missing predecessor identity. Backends synchronize
+    // when evidence is missing, stale, pending or active. Only presentAdaptive()
+    // consults it; zero explicitly disables this additional protection.
     uint64_t flipProtectionWindowUs = 0;
 };
 
@@ -344,6 +376,10 @@ public:
     // Join preparation before renderer teardown. Must also cancel queued work.
     virtual void stopFramePreparation() {}
 
+    // Thread-safe interruption only: do not acquire rendering locks or release
+    // resources. Called before joining the worker, and on window transitions.
+    virtual void interruptFrameWait(bool /*stopping*/) {}
+
     // Some backends select native protection per present; persistent Vulkan
     // Mailbox already provides it. Vulkan Immediate/FIFO return false and keep
     // the controller's software floor. A latch request must never recreate the
@@ -360,6 +396,12 @@ public:
     {
         return false;
     }
+
+    virtual bool supportsScheduledPresentation() const { return false; }
+
+    // Invalidate native queued deadlines on suspension or a display epoch.
+    // This must not submit a replacement image.
+    virtual void clearScheduledPresentation() {}
 
     // Startup eligibility only. NoFallback means the presenter supports a worker-
     // thread split prepare/present path using its adaptive presentation mode.
@@ -381,6 +423,12 @@ public:
     virtual uint64_t waitForDecode(AVFrame* frame, uint64_t)
     {
         return waitForDecode(frame);
+    }
+
+    virtual VrrDecodeReadiness observeDecodeReadiness(AVFrame* frame, uint64_t boundary)
+    {
+        const auto waitUs = waitForDecode(frame, boundary);
+        return {waitUs, waitUs != 0, false};
     }
 
     // May acquire a swapchain image and submit rendering work, but must not

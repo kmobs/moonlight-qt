@@ -23,6 +23,9 @@ class PyroWaveCalibrator : public QObject
     Q_PROPERTY(bool running READ running NOTIFY changed)
     Q_PROPERTY(bool bandwidthReady READ bandwidthReady NOTIFY changed)
     Q_PROPERTY(int bandwidthKbps READ bandwidthKbps NOTIFY changed)
+    // Highest frame pace that delivered without loss (or lost least); 0 when
+    // the host cannot run frame-shaped probes or no wired link speed is known.
+    Q_PROPERTY(int paceMbps READ paceMbps NOTIFY changed)
     Q_PROPERTY(int bandwidthTargetKbps READ bandwidthTargetKbps NOTIFY changed)
     Q_PROPERTY(QString bandwidthQuality READ bandwidthQuality NOTIFY changed)
     Q_PROPERTY(QString message READ message NOTIFY changed)
@@ -44,6 +47,7 @@ public:
     bool running() const { return m_Running; }
     bool bandwidthReady() const { return m_BandwidthReady && !m_Running; }
     int bandwidthKbps() const { return m_LinkCapKbps; }
+    int paceMbps() const { return m_PaceMbps; }
     int bandwidthTargetKbps() const;
     QString bandwidthQuality() const;
     QString message() const { return m_Message; }
@@ -72,6 +76,8 @@ private:
     bool m_Running = false;
     bool m_BandwidthReady = false;
     int m_LinkCapKbps = 0;
+    int m_LinkSpeedKbps = 0; // Slower known endpoint link; Moderate budgets 60% of it.
+    int m_PaceMbps = 0;
     int m_Fps = 60;
     int m_DisplayWidth = 0;
     int m_DisplayHeight = 0;

@@ -11,8 +11,8 @@ constexpr int stepKbps = 5000;
 inline int roundDown(double kbps) { return int(kbps / stepKbps) * stepKbps; }
 inline int roundUp(double kbps) { return int(std::ceil(kbps / stepKbps)) * stepKbps; }
 
-// Minimum and Recommended refer to image quality. Moderate budgets 60% of
-// freshly confirmed usable wire bandwidth; Maximum uses the whole budget.
+// Minimum and Recommended refer to image quality. Moderate budgets 60% of the
+// link speed (see wireTarget); Maximum uses the whole confirmed budget.
 inline int imageTarget(Target target, int recommendedKbps, int imageCapKbps)
 {
     const int wanted = target == Minimum ? (std::max)(stepKbps, roundDown(recommendedKbps / 2.0)) :
@@ -20,9 +20,17 @@ inline int imageTarget(Target target, int recommendedKbps, int imageCapKbps)
     return (std::min)(wanted, imageCapKbps);
 }
 
-inline int wireTarget(Target target, int confirmedKbps)
+// Moderate sits between Recommended and Maximum: 60% of the physical link (the
+// slower known endpoint), never below the format's Recommended wire rate, and
+// never above the freshly confirmed budget, beyond which probes lost more than
+// the calibration allows. 60% of a 1135 Mbps confirmed budget on a 2.5 Gbps
+// link fell below Recommended. Without a known link speed it falls back to 60%
+// of the confirmed budget. Every other target is capped by the whole budget.
+inline int wireTarget(Target target, int confirmedKbps, int linkKbps = 0, int recommendedWireKbps = 0)
 {
-    return target == Moderate ? roundDown(confirmedKbps * 0.6) : confirmedKbps;
+    if (target != Moderate) return confirmedKbps;
+    const int share = roundDown((linkKbps > 0 ? linkKbps : confirmedKbps) * 0.6);
+    return (std::min)(confirmedKbps, (std::max)(share, recommendedWireKbps));
 }
 
 // Judge the uncapped quality guide. Capping it to the measured connection
