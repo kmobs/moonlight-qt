@@ -438,6 +438,14 @@ void configureSignalHandlers()
 
 int main(int argc, char *argv[])
 {
+    if (argc == 2 && strcmp(argv[1], "--lz4-license") == 0) {
+        QFile file(QStringLiteral(":/licenses/LZ4.txt"));
+        if (!file.open(QIODevice::ReadOnly)) return 1;
+        const auto contents = file.readAll();
+        if (fwrite(contents.constData(), 1, size_t(contents.size()), stdout) != size_t(contents.size())) return 1;
+        return fflush(stdout) == 0 ? 0 : 1;
+    }
+
     // Available headlessly from every package; includes the exact covered source.
     if (argc == 2 && strcmp(argv[1], "--haptics-license") == 0) {
         for (const char* name : {"PROVENANCE.md", "LICENSE-MPL-2.0", "LICENSE-GPL-3.0", "SAxense.c", "packet.h", "README.md"}) {

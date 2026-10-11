@@ -6,6 +6,62 @@ that separate build/deployment step.
 
 ## User workflow
 
+Enable **Show frametime graph while streaming** in Settings, or toggle it during a
+stream with **Ctrl+Alt+Shift+F** or **Select+L1+R1+Y** (Triangle). It is separate
+from the stats text (Ctrl+Alt+Shift+S / Select+L1+R1+X) and can be shown alone.
+During VRR playback it shows three aligned frametime lanes covering the newest
+240 frames:
+
+- **Planned cadence** (gray): the interval between scheduled targets. Buffer
+  steps show up here.
+- **Client submissions** (cyan): the interval between actual submissions.
+- **Display events** (magenta): the interval between OS-reported display events.
+
+All three share one millisecond axis centred on the planned interval (+/-2 ms),
+so a disturbance shows up in the lane where it starts. Variation within 1 ms
+of the reference is drawn flat because it is not noticeable; larger changes are
+drawn at their real size, and the captions keep raw values. When gray and cyan are
+flat and magenta jumps, the variation was added after submission by the GPU,
+compositor or display. Values beyond the axis are clipped with red markers; the
+captions give the latest interval and the peak. Missing display feedback leaves
+a gap rather than one long interval, and a backend without feedback shows
+**unavailable**. A Present return or DXGI refresh reference is never substituted
+for display feedback, and OS/compositor timestamps are not physical panel
+measurements.
+
+On a 4K output, the entire stats surface (text and chart) is about 30% larger.
+It follows the drawable window's pixel size, including high-DPI windows, and
+returns to normal size on smaller outputs. The chart refreshes at 10 Hz while it
+is shown and does not require recording.
+
+Below the Smoothness line, **Present timing issues (30s)** gives the share of
+display intervals the display made uneven: the on-screen spacing missed the
+planned spacing by more than the tolerance, and by more than the submitted
+spacing did. A display that smooths out uneven submissions (for example by
+queueing frames) is not blamed, and nothing faster than the panel's maximum
+refresh is expected. It is kept out of Smoothness and never grows the buffer,
+because more buffering cannot correct it. Smoothness only reflects timing the
+buffer can fix. A GPU that cannot finish its work in time (high GPU decode or
+rendering time in the stats) also shows up here. **Hitches** counts intervals
+at least one whole frame worse on screen than they were submitted, and
+**Worst** is the largest such delay in the window. A few large stalls are very
+visible but barely change the percentage.
+
+Hitches that start at the host (the game or host capture stalling) are not
+present timing issues: in the frametime graph they spike the Planned, Client and
+Display lanes together.
+
+Below about 50 fps the panel is under its adaptive-refresh range and the GPU
+driver repeats frames on its own schedule, so the line reads **paused below VRR
+range** instead of blaming the display; scoring resumes 250 ms after the stream
+is back above it. The line reads **unavailable** without current OS display
+feedback.
+
+If magenta jumps while the other lanes stay flat on an AMD GPU under Linux, try
+**High-performance GPU power while streaming** in the video settings. It holds the
+GPU at fixed high clocks for the stream so it cannot drop its clocks between
+frames, at the cost of more power.
+
 In Settings, under **VRR diagnostics**, check **Trace VRR frames for debugging**.
 Enable VRR, connect and reproduce the problem, then disconnect. Recordings are
 saved automatically under **vrr-diagnostics on your Desktop**, with a separate

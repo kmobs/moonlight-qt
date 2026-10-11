@@ -126,6 +126,11 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_SpecialKeyCombos[KeyComboToggleKeyboardGrab].scanCode = SDL_SCANCODE_K;
     m_SpecialKeyCombos[KeyComboToggleKeyboardGrab].enabled = WMUtils::isRunningDesktopEnvironment();
 
+    m_SpecialKeyCombos[KeyComboToggleTimingGraph].keyCombo = KeyComboToggleTimingGraph;
+    m_SpecialKeyCombos[KeyComboToggleTimingGraph].keyCode = SDLK_f;
+    m_SpecialKeyCombos[KeyComboToggleTimingGraph].scanCode = SDL_SCANCODE_F;
+    m_SpecialKeyCombos[KeyComboToggleTimingGraph].enabled = true;
+
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);
 

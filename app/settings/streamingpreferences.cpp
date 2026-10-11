@@ -32,7 +32,9 @@
 #define SER_ENABLEVRR "enablevrr"
 #define SER_VRRLATENCYFIX "vrrlatencyfix"
 #define SER_VRRLATENCYMODE "vrrlatencymode"
+#define SER_VRRTIMINGPRESETREVISION "vrrtimingpresetrevision"
 #define SER_SMOOTHVRRFRAMETIMING "smoothvrrframetiming"
+#define SER_HIGHPERFORMANCEGPUPOWER "highperformancegpupower"
 #define SER_TRACEVRRFRAMES "tracevrrframes"
 #define SER_GAMEOPTS "gameopts"
 #define SER_HOSTAUDIO "hostaudio"
@@ -56,8 +58,10 @@
 #define SER_GAMEPADMOUSE "gamepadmouse"
 #define SER_DEFAULTVER "defaultver"
 #define SER_PACKETSIZE "packetsize"
+#define SER_PYROWAVEPACE "pyrowavepacembps"
 #define SER_DETECTNETBLOCKING "detectnetblocking"
 #define SER_SHOWPERFOVERLAY "showperfoverlay"
+#define SER_SHOWFRAMETIMEGRAPH "showframetimegraph"
 #define SER_SWAPMOUSEBUTTONS "swapmousebuttons"
 #define SER_MUTEONFOCUSLOSS "muteonfocusloss"
 #define SER_BACKGROUNDGAMEPAD "backgroundgamepad"
@@ -69,6 +73,7 @@
 #define SER_RENDERER "renderer"
 
 #define CURRENT_DEFAULT_VER 2
+#define CURRENT_VRR_TIMING_PRESET_REVISION 2
 
 static StreamingPreferences* s_GlobalPrefs;
 
@@ -146,22 +151,56 @@ void StreamingPreferences::reload()
     autoAdjustBitrate = settings.value(SER_AUTOADJUSTBITRATE, true).toBool();
     enableVsync = settings.value(SER_VSYNC, true).toBool();
     enableVrr = settings.value(SER_ENABLEVRR, false).toBool();
+    // Waitable DXGI is the Windows VRR default, independent of the retired opt-in.
+    settings.remove(QStringLiteral("experimentaldxgiwaitable"));
     // VRR adaptive presentation always requires tearing permission. Remove
     // the retired override so stale profiles cannot disable native VRR.
     settings.remove(QStringLiteral("allowvrrtearing"));
     vrrLatencyMode = VLM_BALANCED;
+    bool haveSavedVrrLatencyMode = false;
     if (settings.contains(SER_VRRLATENCYMODE)) {
         bool validMode = false;
         const int savedMode = settings.value(SER_VRRLATENCYMODE).toInt(&validMode);
         if (validMode && savedMode >= VLM_SMOOTH && savedMode <= VLM_LOW_LATENCY) {
             vrrLatencyMode = savedMode;
+            haveSavedVrrLatencyMode = true;
         }
     }
     else if (settings.contains(SER_VRRLATENCYFIX)) {
         // Preserve the old checkbox choice while new users start on Balanced Target.
         vrrLatencyMode = settings.value(SER_VRRLATENCYFIX).toBool() ? VLM_BALANCED_TARGET : VLM_SMOOTH;
     }
+    const VrrTimingOptions savedVrrTimingOptions{
+        settings.value("vrrbufferpermille", 0).toInt(),
+        settings.value("vrrtargethundredths", 0).toInt(),
+        settings.value("vrrhistoryseconds", 0).toInt(),
+        settings.value("vrrtoleranceus", 0).toInt()
+    };
+    m_VrrTimingOptions = savedVrrTimingOptions.resolved(vrrLatencyMode);
+    const int savedPresetRevision = settings.value(SER_VRRTIMINGPRESETREVISION, 0).toInt();
+    if (savedPresetRevision < CURRENT_VRR_TIMING_PRESET_REVISION) {
+        // Saved presets had no separate preset/custom marker. Migrate only
+        // the complete old tuple for the explicitly saved mode; any edited
+        // value makes it custom and must survive the new preset defaults.
+        const VrrTimingOptions previousPreset = savedPresetRevision == 1 ?
+            (vrrLatencyMode == VLM_LOW_LATENCY ? VrrTimingOptions{500, 9500, 60, 500} :
+             vrrLatencyMode == VLM_SMOOTH ? VrrTimingOptions{4000, 9900, 300, 250} :
+                                          VrrTimingOptions{1000, 9750, 120, 500}) :
+            (vrrLatencyMode == VLM_LOW_LATENCY ? VrrTimingOptions{500, 9900, 60, 500} :
+             vrrLatencyMode == VLM_SMOOTH ? VrrTimingOptions{4000, 9999, 300, 250} :
+                                          VrrTimingOptions{1000, 9950, 120, 500});
+        if (haveSavedVrrLatencyMode &&
+            savedVrrTimingOptions.bufferPerMille == previousPreset.bufferPerMille &&
+            savedVrrTimingOptions.targetHundredths == previousPreset.targetHundredths &&
+            savedVrrTimingOptions.historySeconds == previousPreset.historySeconds &&
+            savedVrrTimingOptions.toleranceUs == previousPreset.toleranceUs) {
+            m_VrrTimingOptions = VrrTimingOptions::preset(vrrLatencyMode);
+            settings.setValue("vrrtargethundredths", vrrTargetHundredths());
+        }
+        settings.setValue(SER_VRRTIMINGPRESETREVISION, CURRENT_VRR_TIMING_PRESET_REVISION);
+    }
     smoothVrrFrameTiming = settings.value(SER_SMOOTHVRRFRAMETIMING, true).toBool();
+    highPerformanceGpuPower = settings.value(SER_HIGHPERFORMANCEGPUPOWER, false).toBool();
     traceVrrFrames = settings.value(SER_TRACEVRRFRAMES, false).toBool();
     settings.remove("vrrdiagnosticmode"); // Retired, unpublished timing comparison selector.
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
@@ -178,7 +217,9 @@ void StreamingPreferences::reload()
     gamepadMouse = settings.value(SER_GAMEPADMOUSE, true).toBool();
     detectNetworkBlocking = settings.value(SER_DETECTNETBLOCKING, true).toBool();
     showPerformanceOverlay = settings.value(SER_SHOWPERFOVERLAY, false).toBool();
+    showFrametimeGraph = settings.value(SER_SHOWFRAMETIMEGRAPH, false).toBool();
     packetSize = settings.value(SER_PACKETSIZE, 0).toInt();
+    pyroWavePaceMbps = settings.value(SER_PYROWAVEPACE, 0).toInt();
     swapMouseButtons = settings.value(SER_SWAPMOUSEBUTTONS, false).toBool();
     muteOnFocusLoss = settings.value(SER_MUTEONFOCUSLOSS, false).toBool();
     backgroundGamepad = settings.value(SER_BACKGROUNDGAMEPAD, false).toBool();
@@ -192,6 +233,9 @@ void StreamingPreferences::reload()
                                                   static_cast<int>(AudioConfig::AC_STEREO)).toInt());
     videoCodecConfig = static_cast<VideoCodecConfig>(settings.value(SER_VIDEOCFG,
                                                   static_cast<int>(VideoCodecConfig::VCC_AUTO)).toInt());
+    // Retired optional transports must not be restored by old settings.
+    settings.remove("pyrowavecompression");
+    settings.remove("pyrowavehybrid");
     videoDecoderSelection = static_cast<VideoDecoderSelection>(settings.value(SER_VIDEODEC,
                                                   static_cast<int>(VideoDecoderSelection::VDS_AUTO)).toInt());
     rendererSelection = static_cast<RendererSelection>(settings.value(SER_RENDERER,
@@ -366,11 +410,17 @@ void StreamingPreferences::save()
     settings.setValue(SER_VSYNC, enableVsync);
     settings.setValue(SER_ENABLEVRR, enableVrr);
     settings.setValue(SER_VRRLATENCYMODE, vrrLatencyMode);
+    settings.setValue(SER_VRRTIMINGPRESETREVISION, CURRENT_VRR_TIMING_PRESET_REVISION);
+    settings.setValue("vrrbufferpermille", vrrBufferPerMille());
+    settings.setValue("vrrtargethundredths", vrrTargetHundredths());
+    settings.setValue("vrrhistoryseconds", vrrHistorySeconds());
+    settings.setValue("vrrtoleranceus", vrrToleranceUs());
     settings.remove("vrrlatencyoscillation");
     settings.remove("gamescopemailbox"); // Retired Mailbox A/B experiment.
     settings.remove("gamescoperepaint");
     settings.remove("gamescopeforcecomposition");
     settings.setValue(SER_SMOOTHVRRFRAMETIMING, smoothVrrFrameTiming);
+    settings.setValue(SER_HIGHPERFORMANCEGPUPOWER, highPerformanceGpuPower);
     settings.setValue(SER_TRACEVRRFRAMES, traceVrrFrames);
     settings.remove("v2queue"); // The interval queue is now the production policy.
     settings.setValue(SER_GAMEOPTS, gameOptimizations);
@@ -386,12 +436,16 @@ void StreamingPreferences::save()
     settings.setValue(SER_RICHPRESENCE, richPresence);
     settings.setValue(SER_GAMEPADMOUSE, gamepadMouse);
     settings.setValue(SER_PACKETSIZE, packetSize);
+    settings.setValue(SER_PYROWAVEPACE, pyroWavePaceMbps);
     settings.setValue(SER_DETECTNETBLOCKING, detectNetworkBlocking);
     settings.setValue(SER_SHOWPERFOVERLAY, showPerformanceOverlay);
+    settings.setValue(SER_SHOWFRAMETIMEGRAPH, showFrametimeGraph);
     settings.setValue(SER_AUDIOCFG, static_cast<int>(audioConfig));
     settings.setValue(SER_HDR, enableHdr);
     settings.setValue(SER_YUV444, enableYUV444);
     settings.setValue(SER_VIDEOCFG, static_cast<int>(videoCodecConfig));
+    settings.remove("pyrowavecompression");
+    settings.remove("pyrowavehybrid");
     settings.setValue(SER_VIDEODEC, static_cast<int>(videoDecoderSelection));
     settings.setValue(SER_RENDERER, static_cast<int>(rendererSelection));
     settings.setValue(SER_WINDOWMODE, static_cast<int>(windowMode));
@@ -548,4 +602,45 @@ int StreamingPreferences::getDefaultPyroWaveBitrate(int width, int height, int f
 {
     // Match the author recommendation shown by calibration without running it.
     return pyroWaveRecommendedKbps(width, height, fps, yuv444, hdr);
+}
+
+void StreamingPreferences::applyVrrPreset(int mode)
+{
+    if (mode < VLM_SMOOTH || mode > VLM_LOW_LATENCY) return;
+    vrrLatencyMode = mode;
+    m_VrrTimingOptions = VrrTimingOptions::preset(mode);
+    emit vrrLatencyModeChanged();
+    emit vrrTimingChanged();
+}
+
+void StreamingPreferences::setVrrBufferPerMille(int value)
+{
+    value = qBound(250, value, 4000);
+    if (value == vrrBufferPerMille()) return;
+    m_VrrTimingOptions.bufferPerMille = value;
+    emit vrrTimingChanged();
+}
+
+void StreamingPreferences::setVrrTargetHundredths(int value)
+{
+    value = qBound(9000, value, 9999);
+    if (value == vrrTargetHundredths()) return;
+    m_VrrTimingOptions.targetHundredths = value;
+    emit vrrTimingChanged();
+}
+
+void StreamingPreferences::setVrrHistorySeconds(int value)
+{
+    value = qBound(10, value, 300);
+    if (value == vrrHistorySeconds()) return;
+    m_VrrTimingOptions.historySeconds = value;
+    emit vrrTimingChanged();
+}
+
+void StreamingPreferences::setVrrToleranceUs(int value)
+{
+    value = ((qBound(250, value, 2000) + 125) / 250) * 250;
+    if (value == vrrToleranceUs()) return;
+    m_VrrTimingOptions.toleranceUs = value;
+    emit vrrTimingChanged();
 }

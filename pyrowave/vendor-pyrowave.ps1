@@ -131,6 +131,17 @@ vulkan-headers:  $(& git -C $graniteSrc rev-parse HEAD:third_party/khronos/vulka
 The PyroWave bitstream carries no version field. The host and the client must be
 built from the same pyrowave commit; the RTSP handshake advertises it as
 PYROWAVE_BITSTREAM_ID in pyrowave_protocol.h.
+
+Local patch 0010-deterministic-record-padding.patch zeroes decoder-ignored
+sign bits and word-alignment tails on the GPU so identical coefficient records
+compress more consistently with optional independent LZ4 groups. It changes no decoded values or
+Vulkan feature requirements. scripts/regenerate-pyrowave-block-packing.py
+refreshes only the packing program, preserving all other programs/reflection.
+
+Local patch 0011-macos-portability.patch uses monotonic nanosleep waits on Darwin
+and permits MoltenVK's native subgroup width for the vendored SPIR-V 1.3
+programs. It does not request unsupported required-subgroup-size stages and
+retains the ordinary native-size contract by omitting the varying-size flag.
 "@ | Set-Content -Encoding utf8 (Join-Path (Split-Path $Destination) "VENDOR.txt")
 
 Write-Host "PyroWave vendored into $Destination"

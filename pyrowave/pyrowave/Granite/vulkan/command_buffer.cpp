@@ -1254,6 +1254,13 @@ bool CommandBuffer::setup_subgroup_size_control(
 	}
 	else
 	{
+		// No varying-size flag and no required-size structure means the
+		// native subgroup size for our SPIR-V 1.3 shaders. MoltenVK exposes
+		// that mode even though requiredSubgroupSizeStages is zero.
+		if (features.driver_id == VK_DRIVER_ID_MOLTENVK &&
+		    !(features.vk13_props.requiredSubgroupSizeStages & stage))
+			return true;
+
 		required_info = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
 
 		// Pick a fixed subgroup size. Prefer smallest subgroup size.

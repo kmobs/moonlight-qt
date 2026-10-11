@@ -11,6 +11,8 @@
 struct VrrTargetWaiterHooks {
     std::function<uint64_t()> nowUs;
     std::function<void(uint64_t)> sleepForUs;
+    // One active polling step. The historical name and trace yield-count
+    // fields are retained; the production default uses a CPU pause hint.
     std::function<void()> yield;
 };
 
@@ -41,7 +43,7 @@ class VrrTargetWaiter {
 public:
     static constexpr uint64_t kMaximumActiveWaitUs = 500;
     // Cap the active region so learned scheduler correction cannot turn a
-    // near-refresh stream into a multi-millisecond TIME_CRITICAL yield loop.
+    // near-refresh stream into a multi-millisecond active polling loop.
     static constexpr uint64_t kMaximumAdditionalWakeLeadUs = 500;
 
     explicit VrrTargetWaiter(VrrTargetWaiterHooks hooks = {});

@@ -1,8 +1,10 @@
 #pragma once
 
 #include "dxgipresent.h"
+#include "dxgiwaitable.h"
 #include "d3d11composition.h"
 #include "d3d11pyrowave.h"
+#include "d3d11presentpolicy.h"
 #include "ivrrframepresenter.h"
 #include "renderer.h"
 
@@ -34,9 +36,14 @@ public:
     // DXGI can switch to interval one; composition always provides native
     // presentation ordering. Both can honor a protected slot without a CPU floor.
     virtual bool canLatchAdaptivePresent() const override { return true; }
+    bool alwaysSynchronizesAdaptivePresent() const override { return m_CompositionPresenter.active(); }
+    bool supportsScheduledPresentation() const override { return m_CompositionPresenter.active(); }
+    void clearScheduledPresentation() override;
+    void interruptFrameWait(bool stopping) override { m_DxgiAdmission.interrupt(stopping); }
     virtual VrrFallbackReason checkSupport() const override;
     virtual uint64_t captureDecodeBoundary() override;
     uint64_t waitForDecode(AVFrame* frame, uint64_t decodeBoundary) override;
+    VrrDecodeReadiness observeDecodeReadiness(AVFrame* frame, uint64_t decodeBoundary) override;
     virtual VrrPrepareResult prepareFrame(AVFrame* frame,
                                           uint64_t decodeBoundary) override;
     virtual VrrPresentFeedback presentAdaptive(
@@ -68,6 +75,10 @@ private:
 
     bool setupRenderingResources();
     bool m_CompositionRequested = false;
+    Microsoft::WRL::Wrappers::HandleT<Microsoft::WRL::Wrappers::HandleTraits::HANDLENullTraits> m_DxgiFrameLatencyHandle;
+    DxgiWaitable::Admission m_DxgiAdmission;
+    bool m_DxgiWaitableActive = false;
+    uint64_t m_DxgiWaitWarningUs = 0;
     D3D11CompositionPresenter m_CompositionPresenter;
     uint64_t m_CompositionPresentId = 0;
     bool m_CompositionModeLogged = false;
@@ -102,7 +113,7 @@ private:
     void bindVideoVertexBuffer(bool frameChanged, AVFrame* frame);
     bool renderVideo(AVFrame* frame, uint64_t decodeBoundary = 0);
     bool renderPyroWaveVideo(AVFrame* frame, PyroWaveFrameRef* ref);
-    uint64_t waitForPyroWaveDecode(const PyroWaveFrameRef* ref);
+    VrrDecodeReadiness waitForPyroWaveDecode(const PyroWaveFrameRef* ref);
     bool isPyroWave() const { return (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0; }
     bool checkDecoderSupport(IDXGIAdapter* adapter);
     bool createDeviceByAdapterIndex(int adapterIndex, bool* adapterNotFound = nullptr);
@@ -210,18 +221,16 @@ private:
     // MOONLIGHT_VRR_SYNC_FLIPS=1 synchronizes every VRR flip instead of
     // per-frame tearing presents (see presentAdaptive).
     bool m_VrrSyncFlips = false;
-    // Flip protection's raster wait; disabled for the session if the raster
-    // never reports a vertical blank (see presentAdaptive).
-    bool m_VrrRasterGuardDisabled = false;
-    unsigned m_VrrRasterGuardTimeouts = 0;
     bool m_VrrRasterOpenResultValid;
     int64_t m_VrrRasterOpenResult;
     bool m_VrrRasterSourceValid;
+    HMONITOR m_VrrRasterMonitor = nullptr;
     D3DKMT_HANDLE m_VrrRasterAdapter;
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_VrrRasterVidPnSourceId;
     bool m_VrrSuspended;
     VrrFallbackReason m_VrrFallbackReason;
     bool m_VrrFramePrepared;
+    D3D11PresentPolicy::PreparedCompletion m_VrrPreparedCompletion;
     uint64_t m_VrrPreparedDecodeBoundary;
     bool m_VrrPresentationLocked;
     Microsoft::WRL::ComPtr<ID3D11Fence> m_VrrPresentReadyFence;

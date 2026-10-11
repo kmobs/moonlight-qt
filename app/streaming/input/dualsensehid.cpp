@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#if defined(_WIN32)
+// Include before SDL, whose Windows headers can lower the API target and
+// hide CancelIoEx when this transport is compiled as its own translation unit.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "dualsensehid.h"
 #include "../../../third-party/saxense/packet.h"
 #include <algorithm>
 
 #if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 extern "C" {
 #include <hidsdi.h>
 }

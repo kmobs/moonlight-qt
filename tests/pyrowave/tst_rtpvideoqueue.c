@@ -193,19 +193,45 @@ static void testOptionalHoleExpiresWithoutSuccessor(void) {
     RtpvCleanupQueue(&queue);
 }
 
-static void testMissingEofWaitsForSuccessor(void) {
+// A lost tail (often a whole dropped USB transfer) must cost detail, not the
+// 5+ ms until the next frame starts. Without the final packet only silence
+// longer than a host pacing gap shows the host has finished.
+static void testMissingTailReleasedAfterTailSilence(void) {
     RTP_VIDEO_QUEUE queue;
     beginQueue(&queue, PYROWAVE_FORMAT);
     addPacket(&queue, 1, 0, 0, 0, 100, FLAG_SOF | FLAG_CONTAINS_PIC_DATA, true, true, 1);
     addPacket(&queue, 1, 0, 0, 1, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
     addPacket(&queue, 1, 0, 0, 2, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
-    EXPECT(RtpvGetPendingFrameDeadlineUs(&queue) == 0, "an absent tail is not evidence of packet loss");
-    EXPECT(!RtpvExpirePendingFrame(&queue, fakeNowUs + 5000), "silence cannot discard a possibly unsent tail");
-    EXPECT(submittedPackets[1] == 0, "missing EOF waits for a successor boundary");
+    uint64_t deadline = RtpvGetPendingFrameDeadlineUs(&queue);
+    EXPECT(deadline != 0, "a missing tail arms the tail-silence deadline");
+    EXPECT(!RtpvPendingFrameDeadlineIsPrecise(&queue), "without an on-time slot the tail waits on silence");
+    EXPECT(deadline >= fakeNowUs + 2 * DEADLINE_US, "a missing tail waits longer than an interior hole");
+    EXPECT(!RtpvExpirePendingFrame(&queue, deadline - 1), "the tail may still be in flight before the deadline");
+    EXPECT(submittedPackets[1] == 0, "the frame waits for its tail until the deadline");
+    EXPECT(RtpvExpirePendingFrame(&queue, deadline), "tail silence releases the frame without a successor");
+    EXPECT(submittedPackets[1] == DATA_PACKETS && submittedLost[1] == 1, "only the missing EOF is filled");
+    EXPECT(addPacket(&queue, 1, 0, 0, 3, 100, FLAG_EOF | FLAG_CONTAINS_PIC_DATA, false, false, 0) == RTPF_RET_REJECTED,
+           "a tail arriving after release cannot change the delivered frame");
+    RtpvCleanupQueue(&queue);
+
+    // A successor arriving first still releases the frame at its boundary.
+    beginQueue(&queue, PYROWAVE_FORMAT);
+    addPacket(&queue, 1, 0, 0, 0, 100, FLAG_SOF | FLAG_CONTAINS_PIC_DATA, true, true, 1);
+    addPacket(&queue, 1, 0, 0, 1, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
+    addPacket(&queue, 1, 0, 0, 2, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
     addPacket(&queue, 2, 0, 0, 0, 104, FLAG_SOF | FLAG_CONTAINS_PIC_DATA, true, true, 1);
     EXPECT(submittedPackets[1] == DATA_PACKETS, "successor releases the previous partial frame");
     EXPECT(submittedLost[1] == 1, "only the missing EOF is synthesized at the boundary");
-    EXPECT(RtpvGetPendingFrameDeadlineUs(&queue) == 0, "successor does not inherit an expiry");
+    RtpvCleanupQueue(&queue);
+
+    // Missing critical data is never released early, tail or not.
+    beginQueue(&queue, PYROWAVE_FORMAT);
+    addPacket(&queue, 1, 0, 0, 0, 100, FLAG_SOF | FLAG_CONTAINS_PIC_DATA, true, true, 4);
+    addPacket(&queue, 1, 0, 0, 1, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
+    addPacket(&queue, 1, 0, 0, 2, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
+    deadline = RtpvGetPendingFrameDeadlineUs(&queue);
+    EXPECT(!RtpvExpirePendingFrame(&queue, deadline), "a tail holding critical data blocks tail release");
+    EXPECT(submittedPackets[1] == 0, "a frame missing critical data is not presented early");
     RtpvCleanupQueue(&queue);
 }
 
@@ -256,7 +282,7 @@ static void testStaleDeadlineAfterCleanupAndWrap(void) {
     uint64_t staleDeadline = RtpvGetPendingFrameDeadlineUs(&queue);
     EXPECT(staleDeadline != 0, "wrap case arms deadline");
     addPacket(&queue, 2, 0, 0, 0, 2, FLAG_SOF | FLAG_CONTAINS_PIC_DATA, true, true, 1);
-    EXPECT(RtpvGetPendingFrameDeadlineUs(&queue) == 0, "new tail has no stale deadline");
+    EXPECT(RtpvGetPendingFrameDeadlineUs(&queue) > staleDeadline, "the new frame arms its own deadline, not the stale one");
     addPacket(&queue, 2, 0, 0, 3, 2, FLAG_EOF | FLAG_CONTAINS_PIC_DATA, false, false, 0);
     EXPECT(RtpvGetPendingFrameDeadlineUs(&queue) > staleDeadline, "frame transition replaces old deadline with successor deadline");
     EXPECT(!RtpvExpirePendingFrame(&queue, staleDeadline), "stale deadline cannot flush successor frame");
@@ -443,6 +469,44 @@ static void testLateFrameStillReceivingIsNotCut(void) {
     RtpvCleanupQueue(&queue);
 }
 
+static void testMissingTailReleasedAtOnTimeDeadline(void) {
+    RTP_VIDEO_QUEUE queue;
+    beginOnTimeQueue(&queue, true, 2000);
+    addPacket(&queue, 1, 0, 0, 0, 100, FLAG_SOF | FLAG_CONTAINS_PIC_DATA, true, true, 1);
+    addPacket(&queue, 1, 0, 0, 1, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
+    addPacket(&queue, 1, 0, 0, 2, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
+    uint64_t deadline = RtpvGetPendingFrameDeadlineUs(&queue);
+    EXPECT(RtpvPendingFrameDeadlineIsPrecise(&queue), "the on-time slot governs a lost tail");
+    EXPECT(deadline < fakeNowUs + 2500, "a lost tail is released by its slot, not after tail silence");
+    EXPECT(!RtpvExpirePendingFrame(&queue, deadline - 1), "the tail may still arrive before the slot");
+    EXPECT(RtpvExpirePendingFrame(&queue, deadline), "the frame is released on time without its tail");
+    EXPECT(submittedPackets[1] == DATA_PACKETS && submittedLost[1] == 1, "slot release fills only the lost tail");
+    RtpvCleanupQueue(&queue);
+    LiSetVideoReassemblyDeadlineCallback(NULL);
+}
+
+// Past its slot, a frame still being sent is not cut inside an ordinary pacing
+// gap; once its burst stops for longer, the lost tail costs only detail.
+static void testLateFrameMissingTailWaitsOutPacingGap(void) {
+    RTP_VIDEO_QUEUE queue;
+    beginOnTimeQueue(&queue, true, -5000);
+    addPacket(&queue, 1, 0, 0, 0, 100, FLAG_SOF | FLAG_CONTAINS_PIC_DATA, true, true, 1);
+    addPacket(&queue, 1, 0, 0, 1, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
+    uint64_t first = RtpvGetPendingFrameDeadlineUs(&queue);
+    EXPECT(RtpvPendingFrameDeadlineIsPrecise(&queue), "a late frame missing its tail uses the late allowance");
+    EXPECT(first >= fakeNowUs + DEADLINE_US && first < fakeNowUs + 2 * DEADLINE_US,
+           "the late allowance exceeds one host pacing gap but not the tail silence");
+    fakeNowUs += 800;
+    EXPECT(!RtpvExpirePendingFrame(&queue, fakeNowUs), "a pacing gap does not cut a frame still being sent");
+    addPacket(&queue, 1, 0, 0, 2, 100, FLAG_CONTAINS_PIC_DATA, false, false, 0);
+    uint64_t second = RtpvGetPendingFrameDeadlineUs(&queue);
+    EXPECT(second > first, "the next group renews the allowance");
+    EXPECT(RtpvExpirePendingFrame(&queue, second), "a quiet burst releases the frame without its tail");
+    EXPECT(submittedPackets[1] == DATA_PACKETS && submittedLost[1] == 1, "only the lost tail is filled");
+    RtpvCleanupQueue(&queue);
+    LiSetVideoReassemblyDeadlineCallback(NULL);
+}
+
 static void testOnTimeDeadlineRequeriedPerFrame(void) {
     RTP_VIDEO_QUEUE queue;
     beginOnTimeQueue(&queue, true, 10000);
@@ -501,8 +565,9 @@ static void testEofFlagBeforeLastDataPacketIsNotCompletion(void) {
     RTP_VIDEO_QUEUE queue;
     beginOnTimeQueue(&queue, true, -5000);
     addPacket(&queue, 1, 0, 0, 0, 100, FLAG_SOF | FLAG_EOF | FLAG_CONTAINS_PIC_DATA, true, true, 1);
-    EXPECT(RtpvGetPendingFrameDeadlineUs(&queue) == 0, "an early EOF flag cannot prove the tail arrived");
-    EXPECT(!RtpvExpirePendingFrame(&queue, fakeNowUs + 5000), "packet count controls end-of-block evidence");
+    EXPECT(RtpvGetPendingFrameDeadlineUs(&queue) >= fakeNowUs + DEADLINE_US,
+           "an early EOF flag gets the tail allowance, not the interior one");
+    EXPECT(!RtpvExpirePendingFrame(&queue, fakeNowUs + DEADLINE_US / 2), "packet count controls end-of-block evidence");
     for (unsigned i = 1; i < 4; ++i) {
         unsigned flags = FLAG_CONTAINS_PIC_DATA | (i == 3 ? FLAG_EOF : 0);
         EXPECT(addPacket(&queue, 1, 0, 0, i, 100, flags, false, false, 0) == RTPF_RET_QUEUED,
@@ -518,7 +583,7 @@ int main(void) {
     testCodecControls();
     testIntactFrameImmediate();
     testOptionalHoleExpiresWithoutSuccessor();
-    testMissingEofWaitsForSuccessor();
+    testMissingTailReleasedAfterTailSilence();
     testProgressExtendsDeadline();
     testReorderedRecoveryBeforeDeadline();
     testStaleDeadlineAfterCleanupAndWrap();
@@ -529,6 +594,8 @@ int main(void) {
     testOnTimeDeadlineShortensSilence();
     testLateFrameStillReceivingIsNotCut();
     testOnTimeDeadlineRequeriedPerFrame();
+    testMissingTailReleasedAtOnTimeDeadline();
+    testLateFrameMissingTailWaitsOutPacingGap();
     testSpacedBatchesKeepTheirTail();
     testEofFlagBeforeLastDataPacketIsNotCompletion();
     if (failures != 0) {

@@ -67,10 +67,12 @@ inline uint64_t maximumAgeUs(const VrrTimingDecision& decision, bool metronome,
 
 inline bool beforeRender(const VrrTimingDecision& decision, uint64_t displayPeriodUs,
                          uint64_t ageUs, bool metronome, bool latencyFix,
-                         uint64_t playoutDelayUs = 0)
+                         uint64_t playoutDelayUs = 0, bool lateRecovery = false)
 {
     const bool oversupply = displayPeriodUs != 0 && decision.sourcePeriodUs <= displayPeriodUs;
-    const bool floorBacklog = (oversupply || latencyFix) &&
+    // A display-safe later slot is a valid rescue opportunity. New sessions
+    // shed sustained overload by age/capacity, not by the spacing floor alone.
+    const bool floorBacklog = !lateRecovery && (oversupply || latencyFix) &&
         decision.presentationFloorPushUs > decision.sourcePeriodUs / 2;
     return decision.sourcePeriodUs != 0 &&
         (ageUs > maximumAgeUs(decision, metronome, latencyFix, playoutDelayUs) ||

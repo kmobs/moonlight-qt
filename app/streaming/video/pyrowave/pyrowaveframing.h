@@ -45,6 +45,7 @@ enum class Framing {
 struct Span {
     size_t offset;
     size_t size;
+    bool expanded = false;
 };
 
 // The part of the frame one RTP packet carried, whether that packet was lost
@@ -66,6 +67,9 @@ struct StreamGeometry {
 struct Frame {
     Framing framing = Framing::Records;
     std::vector<Span> spans;
+    // Native detail records expanded from independent LZ4 groups. Spans marked
+    // expanded index this buffer; other spans still index the original wire.
+    std::vector<uint8_t> expanded;
     // Number of block records passed on (excluding sequence headers and padding)
     uint32_t blockRecords = 0;
     // total_blocks from the sequence header, or 0 if none was present
@@ -93,7 +97,8 @@ uint32_t coarseBlockCount(const StreamGeometry& geometry);
 // whole and whose packet boundaries are unknown. criticalPackets is the number
 // of leading packets the host announced as holding the coarsest level, or 0.
 bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
-           size_t criticalPackets, const StreamGeometry& geometry, Frame& frame, std::string& error);
+           size_t criticalPackets, const StreamGeometry& geometry, Frame& frame, std::string& error,
+           bool allowCompression = false);
 
 bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
            const StreamGeometry& geometry, Frame& frame, std::string& error);

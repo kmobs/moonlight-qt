@@ -21,16 +21,13 @@ constexpr uint64_t kPlayoutStartUs = 6000;
 constexpr uint64_t kPlayoutMinimumUs = 1000;
 constexpr uint64_t kPlayoutMaximumUs = 8000;
 // Profile buffer allowances are measured in fitted source frames, independent
-// of display refresh: one for Low Latency, two for Balanced, four for Smooth.
-constexpr uint64_t kSmoothPlayoutCapSourcePeriodPerMille = 4000;
+// of display refresh: half for Low Latency, one for Balanced, four for Smooth.
 // Every profile waits in the same four-frame queue and differs only in how
 // much of it its delay ceiling uses. With three frames, Balanced's 16 ms
 // ceiling filled the queue budget near 120 FPS, so capacity rather than the
 // profile clipped its delay.
 constexpr uint64_t kPlayoutQueueFrames = VrrLargestQueuedFrames;
-// Smooth's tighter cadence target is intentionally a separate policy value;
-// keep the historical default below unchanged for old captures and direct
-// IntervalBuffer callers.
+// Historical Smooth tolerance, used only when a capture has no explicit value.
 constexpr uint64_t kSmoothIntervalToleranceUs = 200;
 // The whole reservoir tail: the delay covers the largest lateness seen in
 // the last thousand admitted frames plus the margin, so a late present is
@@ -60,6 +57,10 @@ constexpr uint64_t kPlayoutSmoothingReserveMaxUs = 3000;
 constexpr uint64_t kPlayoutSmoothingReserveToleranceUs = 500;
 constexpr uint64_t kPlayoutSmoothingReservePercentilePerMille = 980;
 constexpr uint64_t kPlayoutSmoothingReserveReleaseUsPerSecond = 500;
+// Native future-target sessions in the 2026-10-10 capture trade away tail
+// latency for little cadence benefit above 2 ms. Retain the wider worker-paced
+// policy for host-quantized sources; explicit capture parameters remain exact.
+constexpr uint64_t kNativeScheduledSmoothingMaxLagUs = 2000;
 // A cadence reset (a few slow game frames, a burst, a stall) used to drop the
 // accumulated retiming in one frame: up to a 6 ms step on screen, the most
 // common client-made snap at 116/120 in capture 20260922-193211. Ease it back
@@ -122,6 +123,11 @@ void appendBounded(std::deque<T>& values, T value, size_t limit)
 
 uint64_t intervalQualityWindowUs(const VrrTimingParameters& parameters)
 {
+    // Live revision 11 honors the explicit history for presets and custom
+    // settings. Preserve the tuple-based histories of recorded revisions.
+    if (parameters.playoutResponsiveBuffer >= 11) {
+        return parameters.playoutReadinessWindowUs;
+    }
     // Revision 7 originally captured playoutReadinessWindowUs for the
     // readiness estimator, while IntervalBuffer used a fixed 30-second score
     // history. Identify the new preset tuples here so old revision-7 traces
@@ -143,6 +149,9 @@ uint64_t intervalQualityWindowUs(const VrrTimingParameters& parameters)
 
 uint64_t intervalQualityToleranceUs(const VrrTimingParameters& parameters)
 {
+    if (parameters.playoutIntervalToleranceUs != 0) {
+        return parameters.playoutIntervalToleranceUs;
+    }
     // Revision 7 originally used the shared 500 us default. Identify only
     // the current Smooth tuple so existing revision-7 traces replay exactly;
     // explicit revision 8 retains its historical 250 us tolerance.
@@ -160,7 +169,8 @@ uint64_t intervalQualityToleranceUs(const VrrTimingParameters& parameters)
 } // namespace
 
 VrrTimingParameters vrrTimingParametersForSession(
-    const VrrSessionConfig& config)
+    const VrrSessionConfig& config, bool nativeSynchronizedPresentation,
+    bool nativeScheduledPresentation)
 {
     // Present on a tracked source cadence plus a learned delay. The readiness
     // reserve, its per-frame slewing, and every phase re-anchor are off on this
@@ -169,16 +179,20 @@ VrrTimingParameters vrrTimingParametersForSession(
     // moves renderStart earlier without moving the presentation deadline.
     // Explicit parameters keep older policies replayable.
     VrrTimingParameters parameters;
+    parameters.nativeSynchronizedPresentation = nativeSynchronizedPresentation ? 1 : 0;
+    parameters.nativeScheduledPresentation = nativeScheduledPresentation ? 1 : 0;
     // Mode zero is the new Smooth profile. Captured parameters retain their
     // own defaults for exact replay.
     const int latencyMode = config.latencyMode >= 0 && config.latencyMode <= 2 ?
         config.latencyMode : 1;
-    parameters.latencyFixEnabled = config.latencyFix || latencyMode != 0 ? 1 : 0;
-    parameters.latencyFixAllRates = latencyMode != 0 ? 1 : 0;
-    parameters.latencyFixDelayPeriodPerMille = latencyMode == 2 ? 0 : 500;
-    parameters.playoutDelayCapSourcePeriodPerMille = config.latencyFix ? 0 :
-        latencyMode == 2 ? 1000 : latencyMode == 1 ? 2000 :
-        kSmoothPlayoutCapSourcePeriodPerMille;
+    const auto options = config.timingOptions.resolved(latencyMode);
+    parameters.playoutIntervalToleranceUs = options.toleranceUs;
+    // Presets change only the four user-visible values. Admission, release,
+    // and late-frame recovery use the same policy for every combination.
+    parameters.latencyFixEnabled = 1;
+    parameters.latencyFixAllRates = config.latencyFix ? 0 : 1;
+    parameters.latencyFixDelayPeriodPerMille = 500;
+    parameters.playoutDelayCapSourcePeriodPerMille = config.latencyFix ? 0 : options.bufferPerMille;
     // The nominal 116 Hz period was shorter than the measured ~99 Hz source
     // in the deep capture, so it clipped the queue exactly when GPU stalls
     // needed more room. New live sessions use the fitted source period;
@@ -186,12 +200,17 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutDelayCapUsesObservedPeriod = 1;
     parameters.playoutQueueFrames = kPlayoutQueueFrames;
     parameters.playoutCapacityTelemetry = 1;
-    parameters.playoutCatchupPerMille = config.smoothFrameTiming ? 20 : 0;
+    // Late-frame recovery is independent of optional source-cadence smoothing.
+    parameters.playoutCatchupPerMille = 20;
+    parameters.playoutLateRecovery = 1;
     parameters.playoutGpuReadinessAdaptation = 1;
     parameters.playoutPredictionOnly = 1;
     // Every normal VRR session uses the interval-quality queue. Historical
     // policies remain selectable only through explicit diagnostic parameters.
-    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 7;
+    // Apply tolerance to each interval before averaging its loss. Isolated
+    // late/catch-up pairs must remain visible to both reporting and control.
+    // Revision 11 also honors custom history; recorded 7/9/10 stay replayable.
+    parameters.playoutResponsiveBuffer = config.readinessHitchFeedback ? 0 : 12;
     // Timeline mapping anchors to decode completion, absorbing hardware decode
     // duration into the sender offset instead of inflating client buffer delay.
     parameters.playoutSourceMappingDecoderOutput = 0;
@@ -209,23 +228,20 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutIntervalInitialMinimumSamples = 32;
     // Retain earned protection between bursts instead of repeatedly shedding
     // it and reacquiring it. Explicit captured values preserve older release.
-    parameters.playoutMeanMissHoldUs = latencyMode == 2 ? 6000000 : latencyMode == 1 ? 8000000 : 10000000;
+    parameters.playoutMeanMissHoldUs = 8000000;
     // Balanced's 250 us/s recovery is the measured latency/smoothness knee:
-    // faster recovery saved little additional latency and noticeably raised
-    // presented jerk. Profiles order every trade the same way, so Low Latency
-    // releases at least as fast as Balanced, and Smooth slowest.
-    parameters.playoutMeanMissReleaseUsPerSecond = latencyMode == 0 ? 50 : 250;
-    // A dip that leaves the quality score above target does not restart the
-    // hold, so release resumes at the rate above once the dip passes.
-    parameters.playoutHoldRenewBelowTarget = parameters.playoutResponsiveBuffer >= 7 ? 1 : 0;
+    // faster recovery saved little additional latency and raised presented
+    // jerk. All custom settings use this shared release policy.
+    parameters.playoutMeanMissReleaseUsPerSecond = 250;
+    // Above-target score changes neither renew the hold nor pause recovery.
+    // Captured revisions 0/1/2 retain their historical pressure behavior.
+    parameters.playoutHoldRenewBelowTarget = parameters.playoutResponsiveBuffer >= 7 ? 3 : 0;
     // No profile floors its delay at a recent ready-offset percentile. Such a
     // floor counts every late frame, including a decoder that has fallen
     // behind, and held Balanced at its ceiling after an ordinary startup
     // backlog. The parameter remains for captures that recorded it.
-    parameters.playoutOnTimeTargetPerMillion = latencyMode == 2 ? 990000 :
-        latencyMode == 1 ? 995000 : 999900;
-    parameters.playoutReadinessWindowUs = latencyMode == 2 ? 60000000 :
-        latencyMode == 1 ? 120000000 : 300000000;
+    parameters.playoutOnTimeTargetPerMillion = uint64_t(options.targetHundredths) * 100;
+    parameters.playoutReadinessWindowUs = uint64_t(options.historySeconds) * 1000000;
     parameters.playoutReadinessHitchThresholdUs = config.readinessHitchFeedback ? 2000 : 0;
     parameters.playoutNativeHitchAdaptation = 0;
     // Display observations remain diagnostics; the queue uses interval quality.
@@ -257,7 +273,7 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutOffsetSlewUsPerSecond = 2400;
     // Local GPU and worker backlog must not age the sender-clock model or buy
     // a larger correction. The unwrapped RTP timeline supplies elapsed time;
-    // immutable decoder output supplies the source offset being corrected.
+    // decode completion supplies the source offset being corrected.
     parameters.playoutOffsetSourceClock = 1;
     parameters.playoutOffsetMaximumStepUs = 100;
     parameters.playoutDelayAdaptive = 1;
@@ -275,10 +291,12 @@ VrrTimingParameters vrrTimingParametersForSession(
         kPlayoutSmoothingGainPerMille;
     parameters.playoutSmoothingPeriodAlphaPerMille =
         kPlayoutSmoothingPeriodAlphaPerMille;
-    parameters.playoutSmoothingMaxLagUs = kPlayoutSmoothingMaxLagUs;
+    parameters.playoutSmoothingMaxLagUs = nativeScheduledPresentation ?
+        kNativeScheduledSmoothingMaxLagUs : kPlayoutSmoothingMaxLagUs;
     parameters.playoutSmoothingPeriodFeedbackPerMillion =
         kPlayoutSmoothingPeriodFeedbackPerMillion;
-    parameters.playoutSmoothingReserveMaxUs = kPlayoutSmoothingReserveMaxUs;
+    parameters.playoutSmoothingReserveMaxUs = std::min(
+        kPlayoutSmoothingReserveMaxUs, parameters.playoutSmoothingMaxLagUs);
     parameters.playoutSmoothingReserveToleranceUs =
         kPlayoutSmoothingReserveToleranceUs;
     parameters.playoutSmoothingReservePercentilePerMille =
@@ -286,6 +304,11 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutSmoothingReserveReleaseUsPerSecond =
         kPlayoutSmoothingReserveReleaseUsPerSecond;
     parameters.playoutSmoothingResetSlewUs = kPlayoutSmoothingResetSlewUs;
+    // Reduce judder may spend available readiness slack, but cannot buy a
+    // larger interval buffer by advancing an otherwise on-time deadline.
+    // Zero preserves both the old smoother and its attribution for replay.
+    parameters.playoutSmoothingReadinessBound =
+        parameters.playoutResponsiveBuffer >= 6 && config.smoothFrameTiming ? 1 : 0;
     parameters.playoutSmoothingWindowedCadence = 2;
     // Four consecutive intervals qualify the new window. Source-rate changes
     // already have their own confirmation gate; another 200 ms without
@@ -294,16 +317,16 @@ VrrTimingParameters vrrTimingParametersForSession(
     parameters.playoutMetronomeEnabled = 0;
     parameters.playoutDelayStartPeriodPerMille = kPlayoutStartPeriodPerMille;
     // The maximum and cap both express the selected total buffer in source
-    // frames: one for Low Latency, two for Balanced, four for Smooth. Use the
+    // frames: half for Low Latency, one for Balanced, four for Smooth. Use the
     // fitted source period, never the display refresh, for this allowance.
     parameters.playoutDelayMaximumPeriodPerMille =
-        latencyMode == 2 ? 1000 : latencyMode == 1 ? 2000 : 4000;
+        options.bufferPerMille;
     parameters.playoutSmoothingSnapPerMille = kPlayoutMetronomeSnapPerMille;
     parameters.playoutOffsetReseedFrames = kPlayoutOffsetReseedFrames;
     parameters.playoutDelaySlewAcrossBands = 1;
     // Spend the existing playout interval on preparation on both platforms.
     // Vulkan can hand off a pending GPU render using its present semaphore;
-    // D3D11 can execute during the target hold before its final fence check.
+    // D3D11 completes its verified render fence before the target hold.
     // Delaying preparation until just before Present would remove that overlap,
     // especially when no synchronous GPU wait is available to train a lead.
     // Acquisition still enforces native backpressure; it does not justify an
@@ -425,7 +448,8 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_LatencyFixActive = false;
     updateLatencyFixState();
     m_MetronomePeriodUsQ16 = m_ConfiguredStreamPeriodQ16;
-    m_LatchedPresentation = m_Parameters.playoutAdaptiveOnly ? false :
+    m_LatchedPresentation = m_CanLatchPresentation && m_Parameters.nativeSynchronizedPresentation ? true :
+        m_Parameters.playoutAdaptiveOnly ? false :
         m_Parameters.playoutRateProtectionEnabled ?
         rateProtectedPresentation() : m_CanLatchPresentation && m_SourcePeriodUs <
         saturatingAdd(m_DisplayPeriodUs,
@@ -458,6 +482,9 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     m_MeanMissBuffer.breakSequence();
     m_IntervalBuffer.breakSequence();
     m_PresentationPrediction.reset();
+    m_PresentTiming.breakSequence();
+    m_SubmissionCadence.breakSequence();
+    m_DisplayCadence.breakSequence();
     m_SubmissionSmoothness.breakSequence();
     m_NativeSmoothness.breakSequence();
     m_FeedbackModeValid = false;
@@ -466,6 +493,9 @@ void VrrTimingController::clearTimeline(bool retainLearnedBudgets)
     if (!retainLearnedBudgets) {
         m_MeanMissBuffer.reset();
         m_IntervalBuffer.reset();
+        m_PresentTiming.reset();
+        m_SubmissionCadence.reset();
+        m_DisplayCadence.reset();
         m_SubmissionSmoothness.reset();
         m_NativeSmoothness.reset();
         m_RequestedPlayoutDelayUs = 0;
@@ -662,8 +692,13 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     int64_t readyOffsetUs = 0;
     int64_t smoothingUs = 0;
     uint64_t smoothingReserveUs = 0;
+    int64_t desiredRetimingUs = 0;
+    uint64_t smoothingReadyPushUs = 0;
     uint64_t missedTicks = 0;
     uint64_t delayBeforeUs = 0;
+    const bool readinessBoundedSmoothing = timestampPlayout &&
+        !metronomeEnabled() && m_Parameters.playoutResponsiveBuffer >= 6 &&
+        m_Parameters.playoutSmoothingReadinessBound != 0;
     const uint64_t leadUs = saturatingAdd(m_Parameters.playoutPredictionEnabled ? typicalRenderUs() : m_RenderLeadUs,
                                           m_Parameters.presentationSafetyUs);
     if (timestampPlayout) {
@@ -725,6 +760,18 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
                     std::min(m_Parameters.playoutSmoothingMaxLagUs, smoothingReserveUs)));
                 retimingUs = std::max(retimingUs, -static_cast<int64_t>(
                     saturatingAdd(delayBeforeUs, smoothingReserveUs)));
+            }
+            desiredRetimingUs = retimingUs;
+            if (readinessBoundedSmoothing) {
+                // Decode readiness is already known. Spend only the time left
+                // before the raw slot, retaining its typical render allowance.
+                // A raw-late frame keeps that deadline for real buffer feedback;
+                // it must not advance it even further to satisfy the smoother.
+                const int64_t readyFloorUs = std::min<int64_t>(0,
+                    readyOffsetUs - static_cast<int64_t>(delayBeforeUs));
+                retimingUs = std::max(retimingUs, readyFloorUs -
+                    static_cast<int64_t>(smoothingReserveUs));
+                smoothingReadyPushUs = static_cast<uint64_t>(retimingUs - desiredRetimingUs);
             }
             m_LastSmoothingRetimingUs = retimingUs;
             smoothingUs = retimingUs + static_cast<int64_t>(smoothingReserveUs);
@@ -859,6 +906,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     if (reseedPhase) {
         m_FutureProjectionFrames = 0;
         smoothingUs = 0;
+        desiredRetimingUs = 0;
+        smoothingReadyPushUs = 0;
         m_LastSmoothingRetimingUs = 0;
         missedTicks = 0;
         resetCadenceSmoothing();
@@ -907,14 +956,20 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         // shifts with the reserve, and would otherwise feed it back into itself.
         const int64_t rawLatenessUs = readyOffsetUs -
             static_cast<int64_t>(playoutDelayUs);
-        const int64_t retimingUs = smoothingUs -
-            static_cast<int64_t>(smoothingReserveUs);
+        // Learn from the requested retiming, before its readiness bound. The
+        // bounded smoothing reserve can then cover future early slots without
+        // asking the independent interval buffer to grow or hold for them.
+        const int64_t retimingUs = readinessBoundedSmoothing ? desiredRetimingUs :
+            smoothingUs - static_cast<int64_t>(smoothingReserveUs);
         observeSmoothingReserve(m_SmoothingEngaged && !reseedPhase,
                                 std::min<int64_t>(rawLatenessUs, 0) - retimingUs,
                                 nowUs);
     }
 
-    if (m_Parameters.playoutAdaptiveOnly != 0) {
+    if (m_CanLatchPresentation && m_Parameters.nativeSynchronizedPresentation != 0) {
+        m_LatchedPresentation = true;
+    }
+    else if (m_Parameters.playoutAdaptiveOnly != 0) {
         m_LatchedPresentation = false;
     }
     else if (m_Parameters.playoutRateProtectionEnabled != 0) {
@@ -966,17 +1021,30 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
         m_SourcePeriodUs <= 1000000 && cadence.intervalUs >= m_SourcePeriodUs * 9 / 10 &&
         cadence.intervalUs <= m_SourcePeriodUs * 11 / 10;
     if (recoveryEligible && (m_CatchupActive || queueAge > m_SourcePeriodUs)) {
+        const bool lateRecovery = m_Parameters.playoutLateRecovery != 0;
+        // Intentional playout residence is not overload pressure. Rescue a
+        // late image without immediately accelerating its successors merely
+        // because the selected jitter buffer occupies more than one period.
+        const uint64_t pressureAge = lateRecovery ?
+            queueAge - std::min(queueAge, playoutDelayUs) : queueAge;
         const uint64_t floor = VrrCatchUp::floorUs(m_LastSubmissionUs, m_SourcePeriodUs,
-            saturatingAdd(m_DisplayPeriodUs, m_GuardUs), queueAge,
+            saturatingAdd(m_DisplayPeriodUs, m_GuardUs), pressureAge,
             m_Parameters.playoutCatchupPerMille);
+        const uint64_t horizon = lateRecovery ?
+            std::max(m_SourcePeriodUs * 2, saturatingAdd(playoutDelayUs, m_SourcePeriodUs)) :
+            m_SourcePeriodUs * 2;
         const uint64_t hardDeadline = saturatingAdd(frame.decoderOutputUs(),
-            saturatingAdd(m_SourcePeriodUs * 2, frame.decodeSyncWaitUs()));
+            saturatingAdd(horizon, frame.decodeSyncWaitUs()));
         m_CatchupActive = floor != 0 && (floor > targetUs || queueAge > m_SourcePeriodUs) &&
-            queueAge < m_SourcePeriodUs * 2 && targetUs < hardDeadline;
-        // Recovery may spend at most 1 ms beyond the otherwise safe slot.
-        // A slow drain must not turn repeated stalls into standing latency.
+            queueAge < horizon && targetUs < hardDeadline;
+        // Bound temporary recovery separately from the adaptive jitter buffer.
+        // The older 1 ms bound could still produce a sharp short interval
+        // immediately after a small render stall. Allow at most half a source
+        // period, capped at 4 ms, without moving the underlying source clock.
+        const uint64_t extraLimit = lateRecovery ?
+            std::min<uint64_t>(4000, m_SourcePeriodUs / 2) : 1000;
         if (m_CatchupActive) targetUs = std::max(targetUs,
-            std::min({floor, hardDeadline, saturatingAdd(targetUs, 1000)}));
+            std::min({floor, hardDeadline, saturatingAdd(targetUs, extraLimit)}));
     }
     else {
         m_CatchupActive = false;
@@ -1084,7 +1152,10 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             --m_CadenceStabilityLatchFramesRemaining;
         }
     }
-    if (m_Parameters.playoutAdaptiveOnly != 0) {
+    if (m_CanLatchPresentation && m_Parameters.nativeSynchronizedPresentation != 0) {
+        m_LatchedPresentation = true;
+    }
+    else if (m_Parameters.playoutAdaptiveOnly != 0) {
         m_LatchedPresentation = false;
     }
     else if (m_Parameters.playoutRateProtectionEnabled != 0 ||
@@ -1123,6 +1194,8 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     decision.sourceRateChanged = !rebased && cadence.sourceRateChanged;
     decision.phaseDiscontinuity = !rebased && cadence.phaseDiscontinuity;
     decision.rebased = rebased;
+    decision.diagnosticSourceTimestampUs = rtpUs;
+    decision.diagnosticSourceTimestampValid = timestampPlayout && !rebased && !cadence.phaseDiscontinuity;
 
     m_Pending.valid = true;
     m_Pending.smoothness = smoothnessSample(decision);
@@ -1171,6 +1244,15 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
             }
         }
     }
+    // PyroWave delivers a frame with zero-filled detail rather than waiting
+    // for lost packets. Its lateness is loss, not delivery jitter or slow
+    // work, and more playout delay cannot recover it; it only moves every
+    // later frame. Present it as scheduled, but keep it out of the evidence
+    // that grows the readiness, interval, mean-miss and smoothness buffers.
+    if (frame.lostPackets() != 0) {
+        m_Pending.smoothness.eligible = false;
+        m_Pending.prediction.eligible = false;
+    }
     m_LastDecodeCompleteUs = sourceMappingUs(frame);
     m_HaveLastDecodeComplete = true;
     if (timestampPlayout && metronomeEnabled()) {
@@ -1202,11 +1284,12 @@ VrrTimingDecision VrrTimingController::schedule(const PacedFrame& frame,
     }
     else if (timestampPlayout &&
             m_Parameters.playoutSmoothingGainPerMille != 0) {
-        // VRR14 smooths the source schedule independently of readiness. Feeding
-        // a late execution time back into that clock carries delay into later
-        // frames instead of letting the available recovery headroom drain it.
-        // Old captures retain VRR13's execution-anchored smoothing.
-        const uint64_t basis = m_Parameters.playoutPredictionEnabled ? originalTargetUs : targetUs;
+        // Keep the source schedule independent of readiness. Feeding a late
+        // execution time or a readiness-bounded slot back into this clock
+        // carries delay into later frames and undoes host-quantized smoothing.
+        // Old captures retain their original/execution-anchored policy.
+        const uint64_t basis = m_Parameters.playoutPredictionEnabled ?
+            originalTargetUs - std::min(originalTargetUs, smoothingReadyPushUs) : targetUs;
         m_LastSmoothedBasisUs = basis > leadUs ? basis - leadUs : 0;
         m_HaveSmoothedBasis = true;
     }
@@ -2122,11 +2205,18 @@ void VrrTimingController::noteSpacingDeficit(uint64_t deficitUs)
 }
 
 void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
-                                         uint64_t submissionUs)
+                                         uint64_t submissionUs, uint64_t actualSubmissionUs)
 {
     if (!m_Pending.valid) {
         return;
     }
+
+    const auto& cadenceSample = m_Pending.smoothness;
+    const uint64_t enqueueUs = actualSubmissionUs ? actualSubmissionUs : submissionUs;
+    m_SubmissionCadence.observe({cadenceSample.frame, cadenceSample.sourceTimestampUs,
+        enqueueUs, enqueueUs, 0,
+        submitted && !cancelled && cadenceSample.sourceTimestampValid},
+        intervalQualityToleranceUs(m_Parameters));
 
     if (m_Parameters.playoutResponsiveBuffer >= 5) {
         const auto& p = m_Pending.prediction;
@@ -2150,7 +2240,14 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
             (work <= p.period && p.decoderQueue <= p.period);
         const auto ready = std::max(m_Pending.deferredGpuReadyUs,
             m_Pending.preparationCompleteUs ? m_Pending.preparationCompleteUs : saturatingAdd(p.decoded, work));
-        const auto deadline = m_Pending.smoothness.intended;
+        // Early retiming has its own bounded reserve. Only readiness beyond
+        // the raw deadline may grow or renew the interval buffer's hold. Keep
+        // a later smoothed deadline when it already covers genuine raw lateness.
+        const uint64_t smoothingAdvanceUs =
+            m_Parameters.playoutSmoothingReadinessBound != 0 &&
+            m_Parameters.playoutResponsiveBuffer >= 6 ? p.smoothingAdvance : 0;
+        const auto deadline = saturatingAdd(m_Pending.smoothness.intended,
+                                             smoothingAdvanceUs);
         if (m_Parameters.playoutResponsiveBuffer >= 6) {
             m_IntervalBuffer.observe({m_Pending.smoothness.frame, m_Pending.intervalIntendedUs,
                 submissionUs, deadline, ready, p.applied,
@@ -2166,7 +2263,10 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
                 m_Parameters.playoutIntervalInitialMinimumSamples,
                 m_Parameters.playoutRecentPressureRelease,
                 m_Parameters.playoutSerialServiceGate,
-                m_Parameters.playoutHoldRenewBelowTarget != 0);
+                m_Parameters.playoutHoldRenewBelowTarget,
+                m_Parameters.playoutResponsiveBuffer >= 9,
+                m_Parameters.playoutResponsiveBuffer == 10,
+                m_Parameters.playoutResponsiveBuffer >= 12);
         }
         else m_MeanMissBuffer.observe(submissionUs, ready > deadline ? ready - deadline : 0,
             p.applied, submitted && !cancelled && m_Pending.hasPreparationDuration &&
@@ -2233,6 +2333,15 @@ void VrrTimingController::noteSubmission(bool submitted, bool cancelled,
     }
     const bool nativeLatch = m_NativeLatchPending;
     m_NativeLatchPending = false;
+    if (m_Parameters.playoutLateRecovery != 0) {
+        // Preparation/submission may miss a target after schedule() returned,
+        // with no old queued frames at all. Arm recovery from that actual
+        // result as well as from queue age. Small timer noise does not arm it;
+        // failed/cancelled work cannot establish a recovery anchor.
+        m_CatchupActive = submitted && !cancelled && m_Pending.intervalValid &&
+            (m_CatchupActive || submissionUs >
+                saturatingAdd(m_Pending.smoothness.intended, 500));
+    }
     if (submitted) {
         // Cancellation is a reason, not proof that nothing reached the native
         // presentation queue (Vulkan must submit some abandoned images).
@@ -2298,6 +2407,8 @@ Vrr13::SmoothnessFeedback::Sample VrrTimingController::smoothnessSample(const Vr
 {
     Vrr13::SmoothnessFeedback::Sample sample;
     sample.frame = d.frameNumber;
+    sample.sourceTimestampUs = d.diagnosticSourceTimestampUs;
+    sample.sourceTimestampValid = d.diagnosticSourceTimestampValid;
     // Judge cadence against the intended source schedule. A newly learned
     // compositor lead changes our prediction, not the spacing we want to
     // display. Including its frame-to-frame changes manufactures buffer
@@ -2341,12 +2452,25 @@ void VrrTimingController::notePresentation(const Vrr13::PresentationObservation&
         return;
     }
     if (observation.submitted) {
-        if (m_FeedbackModeValid && m_FeedbackLatched != observation.latched)
+        if (m_FeedbackModeValid && m_FeedbackLatched != observation.latched) {
             m_NativeSmoothness.breakSequence();
+            m_PresentTiming.breakSequence();
+            m_DisplayCadence.breakSequence();
+        }
         m_FeedbackModeValid = true;
         m_FeedbackLatched = observation.latched;
     }
-    m_PresentationPrediction.observe(observation, [this, &observation](const Vrr13::SmoothnessFeedback::Sample& sample, uint64_t observed) {
+    m_PresentationPrediction.observe(observation, [this, &observation](const Vrr13::SmoothnessFeedback::Sample& sample,
+                                                                        uint64_t observed, uint64_t submittedUs,
+                                                                        uint64_t plannedUs) {
+        if (observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent) {
+            m_DisplayCadence.observe({sample.frame, sample.sourceTimestampUs, sample.at,
+                observed, sample.uncertainty, sample.sourceTimestampValid},
+                intervalQualityToleranceUs(m_Parameters));
+            m_PresentTiming.observe({sample.frame, submittedUs, sample.at, plannedUs, sample.uncertainty, observed},
+                                    {intervalQualityToleranceUs(m_Parameters), m_DisplayPeriodUs,
+                                     m_SourcePeriodUs, m_Parameters.vrrFloorLatchGapUs});
+        }
         const auto intervalsBefore = m_NativeSmoothness.observedIntervals();
         const uint64_t demand = m_NativeSmoothness.observe(sample, observed,
             observation.timeKind == Vrr13::PresentationTimeKind::DisplayEvent ||
@@ -2644,6 +2768,13 @@ uint64_t VrrTimingController::earliestSubmissionUs() const
 {
     if (!m_HaveLastSubmission) {
         return 0;
+    }
+    if (m_Parameters.nativeScheduledPresentation != 0) {
+        // A synchronized presentation manager may coalesce several overdue
+        // images into one refresh. Native acceptance does not promise each
+        // image a visible interval. Reserve an admissible display deadline;
+        // CPU enqueue may precede it on the native scheduled path.
+        return saturatingAdd(m_LastSubmissionUs, m_DisplayPeriodUs);
     }
     if (m_Parameters.latchedFloorDisabled != 0 && m_LatchedPresentation) {
         // Latched presents omit the tearing flag, so the flip queue already

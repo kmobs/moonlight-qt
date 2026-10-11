@@ -84,7 +84,9 @@
                     "-DSDL_KMSDRM=OFF",
                     "-DSDL_INSTALL_DOCS=OFF",
                     "-DSDL_TEST_LIBRARY=OFF",
-                    "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -flto=1",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-flto=1"
                 ]
             },
             "sources": [
@@ -154,7 +156,7 @@
                     "--fatal-warnings",
                     "--disable-stripping",
                     "--enable-pic",
-                    "--enable-lto",
+                    "--enable-lto=1",
                     "--enable-shared",
                     "--disable-static",
                     "--disable-all",

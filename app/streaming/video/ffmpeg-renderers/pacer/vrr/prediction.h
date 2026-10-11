@@ -79,7 +79,7 @@ struct PresentationObservation {
 class PresentationPrediction {
 public:
     void observe(const PresentationObservation& o, bool requireDisplayEvents = true) {
-        observe(o, [](const SmoothnessFeedback::Sample&, uint64_t) {}, requireDisplayEvents);
+        observe(o, [](const SmoothnessFeedback::Sample&, uint64_t, uint64_t, uint64_t) {}, requireDisplayEvents);
     }
     template<class Observer>
     void observe(const PresentationObservation& o, Observer&& onPresentation,
@@ -124,7 +124,7 @@ public:
                 auto sample = p.smoothness;
                 sample.at = shifted(presented, p.shift);
                 sample.uncertainty = o.uncertainty;
-                onPresentation(sample, m_Observed);
+                onPresentation(sample, m_Observed, p.at, p.deadline);
                 p = {};
             }
             else if (o.observed >= p.at && o.observed - p.at > 100000) p = {};

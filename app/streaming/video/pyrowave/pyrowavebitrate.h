@@ -28,7 +28,7 @@ inline double pyroWaveRegressionMbits(int width, int height, int fps, bool chrom
     }
     db = std::clamp(db, PYROWAVE_REGRESSION_MIN_PSNR_HVS_M_H, PYROWAVE_REGRESSION_MAX_PSNR_HVS_M_H);
     return pyrowave_psnr_hvs_m_h_estimate_mbits(db, w, h, PYROWAVE_HEIGHT_FACTOR_2_00,
-                                                chroma444 ? 1 : 0, std::max(fps, 1));
+                                                chroma444 ? 1 : 0, (std::max)(fps, 1));
 }
 
 // The author allows 1.2x for HDR10.
@@ -43,7 +43,7 @@ inline double pyroWaveKbpsForQuality(int width, int height, int fps, bool chroma
 {
     db = std::clamp(db, double(PYROWAVE_REGRESSION_MIN_PSNR_HVS_M_H), double(PYROWAVE_REGRESSION_MAX_PSNR_HVS_M_H));
     const int lower = int(std::floor(db));
-    const int upper = std::min(lower + 1, PYROWAVE_REGRESSION_MAX_PSNR_HVS_M_H);
+    const int upper = (std::min)(lower + 1, PYROWAVE_REGRESSION_MAX_PSNR_HVS_M_H);
     const double lowerMbits = pyroWaveRegressionMbits(width, height, fps, chroma444, lower);
     const double upperMbits = pyroWaveRegressionMbits(width, height, fps, chroma444, upper);
     const double mbits = lowerMbits + (upperMbits - lowerMbits) * (db - lower);
@@ -60,13 +60,13 @@ inline double pyroWaveQualityDb(int width, int height, int fps, bool chroma444, 
     if (mbits < previous) {
         const double next = pyroWaveRegressionMbits(width, height, fps, chroma444,
                                                     PYROWAVE_REGRESSION_MIN_PSNR_HVS_M_H + 1);
-        const double slope = std::max(next - previous, 1e-6);
-        return std::max(0.0, PYROWAVE_REGRESSION_MIN_PSNR_HVS_M_H - (previous - mbits) / slope);
+        const double slope = (std::max)(next - previous, 1e-6);
+        return (std::max)(0.0, PYROWAVE_REGRESSION_MIN_PSNR_HVS_M_H - (previous - mbits) / slope);
     }
     for (int db = PYROWAVE_REGRESSION_MIN_PSNR_HVS_M_H + 1; db <= PYROWAVE_REGRESSION_MAX_PSNR_HVS_M_H; ++db) {
         const double current = pyroWaveRegressionMbits(width, height, fps, chroma444, db);
         if (mbits <= current) {
-            return db - 1 + (mbits - previous) / std::max(current - previous, 1e-6);
+            return db - 1 + (mbits - previous) / (std::max)(current - previous, 1e-6);
         }
         previous = current;
     }

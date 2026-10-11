@@ -7,3 +7,5 @@ SOURCES += \
     $$PWD/tst_pyrowaveframing.cpp \
     $$PWD/../../app/streaming/video/pyrowave/pyrowaveframing.cpp
 HEADERS += $$PWD/../../app/streaming/video/pyrowave/pyrowaveframing.h
+
+include($$PWD/../../pyrowave/compression/compression.pri)

@@ -1,5 +1,51 @@
 # VRR deterministic tests
 
+`tst_vrrtimingcontroller` also exercises the source-relative cadence detector:
+constant latency, genuine irregular/51 ms source intervals, isolated late/catch-up
+pairs versus recurring oscillation, 60/90/120/144/240 FPS, uncertainty bounds
+(including the shared middle timestamp in residual jerk), missing/out-of-order
+identities, coincident OS display reports, expiry, deadband changes and clock
+restart. A native feedback fixture verifies that actual early CPU enqueues are
+measured separately from accepted future deadlines and that neither CPU nor
+display evidence changes buffering or deadlines. Scheduled presentation that absorbs
+uneven CPU enqueues remains clean in the independent display detector.
+The new rows are diagnostics, not a perceptual score. Schema 5 additionally
+records `lost_packets`; replay restores that frame input so loss-affected
+delivery cannot falsely grow the interval buffer. Historical captures without
+the column retain zero-loss input and may require separately documented log
+reconstruction. The deep and warm-history fixtures carry loss through exact
+replay. Native scheduled retiming is capped at 2 ms while worker-paced sessions
+retain their wider quantized-source policy; runtime tests cover deadline floors
+and reserve bounds across source rates and presets.
+
+Windows D3D11 VRR defaults to waitable DXGI queue admission, with ordinary DXGI
+as fallback. `MOONLIGHT_VRR_COMPOSITION=1` explicitly requests composition;
+unset, zero and other values retain DXGI. DXGI’s magenta graph joins submitted
+image IDs and reported display-refresh counts to measured refresh-clock anchors,
+with separate `ConfirmedRefresh` provenance. `tst_overlay` and the worker's DXGI
+fixture cover delayed matching, invalid evidence, missing samples and epoch resets.
+This graph feed requires successful vblank-virtualization disabling and does not
+change controller adaptation or require PresentMon or elevation.
+DXGI protection separately samples live scanout immediately before otherwise
+adaptive native calls. Unknown predecessor IDs, failed/disjoint statistics,
+pending work, active/missing raster and stale observations synchronize rather
+than treating missing timing as safe. `tst_dxgipresent` verifies the native
+arguments for these cases, and the worker verifies first-frame protection.
+Set `MOONLIGHT_VRR_TEST_EXPORT_GUARD_TRACE` to a CSV path while running
+`tst_vrrpacingworker` to export the four-frame guard-only fixture. Run
+`check_dxgi_raster_trace_audit.py` with the replay executable and that CSV to
+verify exact replay, optional raster omission and rejection of corrupted guard
+qualification/timing evidence. The fixture keeps alignment and deep tracing off.
+Composition is requested only with `MOONLIGHT_VRR_COMPOSITION=1`; initialization
+still requires independent-flip capability and retains DXGI on setup failure. `native_synchronized_presentation=1`
+records its constant synchronized mode; historical captures default that parameter to zero.
+`tst_vrrtimingcontroller` verifies startup, rate changes and omission of the
+software display-period floor. The worker's composition fixture verifies delayed
+display-ID matching into the magenta graph and can be exported with
+`MOONLIGHT_VRR_TEST_EXPORT_COMPOSITION_TRACE` for an exact replay gate.
+The native `compositionprobe --run` remains a separate hardware test: capability
+and display coverage do not establish sub-refresh latency or optical VRR.
+
 User-facing Windows/Linux frame tracing and log export is documented in
 [VRR diagnostics](../../docs/vrr-diagnostics.md). `tst_vrrdiagnostics` covers
 the Desktop destination, capture lifetime, external-launcher precedence, Unicode
@@ -8,33 +54,71 @@ Set `MOONLIGHT_DIAGNOSTICS_TEST_EXPORT` to a new `.zip` path to export its fixtu
 then run `python3 tests/vrr/check_diagnostic_zip.py PATH` for independent CRC and
 content verification. Cold/warm worker exports use the current production policy.
 
-The interval-quality queue is now the production VRR policy (responsive
-revision 7). There is no legacy queue-policy A/B checkbox; saved `v2queue` values are ignored and
-removed when settings are saved. Every normal session uses 0.5 ms tolerance for
-Low Latency and Balanced Target and 0.2 ms for Smooth, with severity-weighted
-preset histories and targets of
-99% / 99.5% / 99.99% for Low Latency / Balanced Target / Smooth. Their clean
-holds are 6 / 8 / 10 seconds and release speeds are 250 / 250 / 50 us per
-second. Their score histories are 1 / 2 / 5 minutes respectively. Growth
-requires below-target long-window quality, current pressure, fresh readiness-
+The interval-quality queue is the production VRR policy (responsive revision 12).
+The four customizable timing settings and their bounds are documented in
+[the architecture](../../architecture.md). Low Latency / Balanced / Smooth
+presets use 0.5 / 1 / 4 source frames, 99 / 99.5 / 99.95 percent targets,
+1 / 2 / 5 minute histories, and 0.5 / 0.5 / 0.25 ms interval tolerances.
+All share an eight-second clean hold and 250 us/s release. Custom tolerance
+accepts 0.25–2 ms in 0.25 ms increments; zero is reserved for historical traces.
+Growth
+requires below-target long-window buffer-control quality, current per-interval pressure, fresh readiness-
 related interval error, and serial local work that fits the intended interval.
-Only current pressure renews the clean-time release hold; old score debt remains
-useful for qualifying future growth but cannot pin the live delay by itself.
-While the long-window score still meets the target, current pressure only
-pauses release for that frame (`playout_hold_renew_below_target`); it restarts
-the hold once the score falls below target.
-Preset allowances are 1/2/4 fitted source frames, additionally limited by
+Below-target retained history holds existing protection; it cannot authorize
+growth without fresh attributable pressure. Short-term recovery cannot override
+the selected history. Historical revisions through 11 retain their earlier
+release behavior for exact replay.
+While the long-window score meets the target, score changes in either direction
+allow qualified recovery and release to continue (`playout_hold_renew_below_target=3`).
+Above-target capacity dips pause recovery without erasing earned time;
+captured revision 2 retains its earlier capacity reset.
+Below-target attributable pressure restarts the hold. Captured revision 1 still
+pauses release above target without restarting the hold, and revision 0 retains
+its historical pressure-based hold.
+Preset allowances are 0.5/1/4 fitted source frames, additionally limited by
 the four-waiting-frame queue-capacity bound. Initial interval
 calibration needs at least 500 ms and 32 consecutive valid intervals. Growth
 still requests at most 250 us per 250 ms and applies at most 125 us per frame.
 Completing calibration is sticky across sequence breaks and FPS changes;
-subsequent requalification retains the historical one-second gate. Production
+subsequent control requalification retains the historical one-second gate,
+while valid adjacent intervals remain measured throughout it. Production
 release revision 3 preserves earned clean time across short gaps but never
 credits the gap itself; recorded revisions 0-2 retain their prior behavior. The controller
 suite checks 20/30/60/116/240 FPS startup, repeated 120/19/30/99/116/60 FPS
 transitions across all presets and smoothing settings, unchanged attack bounds,
 and no padding growth from clean variable-rate source intervals alone.
 See architecture.md for the complete measurement and bounds.
+
+`tst_vrrpreferences` uses isolated temporary QSettings files to test preset
+migration, custom-value round trips, preset resets and bounds. Controller tests
+verify identical policies for identical values regardless of preset name, all
+tolerance steps, and custom caps through late readiness. `custom-timing-stress.json`
+covers presets and custom endpoint values under nominal and injected work.
+
+The headless controller-navigation checks use the same key mappings as SDL:
+
+```sh
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software qmltestrunner \
+    -input tests/qml -import tests/qml/mocks
+```
+
+They cover preset resets, custom detection, numeric entry, bounded adjustments,
+focus traversal, and calibration-host popup select/cancel. The mock modules
+replace only the platform navigation/theme singletons, not the tested controls.
+
+The SDL dispatcher regression test uses isolated preferences and injected
+controller events, with mapping downloads stubbed out. On Linux with SDL2:
+
+```sh
+mkdir -p build/controller-navigation
+cd build/controller-navigation
+qmake ../../tests/qml/controller-navigation.pro
+make
+QT_QPA_PLATFORM=offscreen SDL_VIDEODRIVER=dummy ./tst_controllernavigation
+```
+
+It checks that popup-triggered mode changes keep press/release keys paired,
+including modifiers, face-button remapping and simultaneous controllers.
 
 Historical policy implementations remain available through explicit captured
 controller parameters; session configuration no longer selects the legacy queue-policy
@@ -150,8 +234,8 @@ persistent swapchain; per-frame latch decisions never destroy or recreate it.
 Persistent Mailbox counts as protected presentation and omits the redundant
 software spacing floor, while Immediate and FIFO retain that floor. The
 Gamescope WSI FIFO compatibility path retains its compositor-owned behavior.
-The latency presets cap adaptive padding independently of native mode: one,
-two, and four fitted source frames for Low Latency, Balanced Target, and
+The latency presets cap adaptive padding independently of native mode: half,
+one, and four fitted source frames for Low Latency, Balanced Target, and
 Smooth in live sessions. Explicit historical replay parameters can
 retain the configured stream-rate basis. The effective maximum remains subject to queue capacity. The current stale-work
 rule also protects the learned playout delay; old captured policies retain
@@ -167,6 +251,53 @@ absent historical permission still requires `ALLOW_TEARING`. Native capability
 checks remain unchanged. A replay of one arm cannot model the other arm's
 driver blocking or establish optical tear freedom; that comparison needs fresh
 captures and visual checks on the affected Windows/Linux device.
+
+The Metal worker fixture reports local serial submission IDs, asynchronous
+`DisplayEvent` feedback for the previous submission, and command-buffer
+completion brackets without DXGI query, QPC, fence, or capability fields.
+It verifies native cadence matching across requested latch-mode transitions
+and excludes feedback whose clock uncertainty exceeds 500 us. Set
+`MOONLIGHT_VRR_TEST_EXPORT_METAL_TRACE` to export its schema-5 fixture, then run
+`vrrreplay --require-exact-baseline` or `check_metal_trace_audit.py` with the
+replay executable and fixture paths. A matching `.failed` fixture captures
+preparation failure and drawable cancellation without a native Present. The
+audit checks exact controller replay for both success and failure
+and rejects forged backend, result, ID, event-kind, DXGI, and GPU-ready evidence.
+This fixture does not establish live display refresh behavior or optical
+scanout timing; the strict DXGI raster gate remains unavailable on Metal.
+
+The native `tst_metalpresenter` smoke accepts `--fps N` and `--frames N`
+(100-10000, default 100), plus its existing optional output trace path. Run it
+from its build directory so shader lookup resolves. Use an extended 90 FPS run
+on a continuous 120 Hz display to expose drawable starvation that a short
+near-maximum-rate run can miss. The harness requires at least 90% submission
+throughput and exercises real software/VideoToolbox surfaces, cancellation,
+suspension, teardown, and fixed fallback; `CONFIG+=pyrowave` also exercises
+shared PyroWave surfaces. A passing smoke does not establish adaptive cadence.
+The harness settles fullscreen before frame delivery, logs activation, focus,
+and Low Power Mode, and rejects focus loss. Keep the test fullscreen for its
+duration. Low Power Mode can limit presentation despite an advertised variable
+refresh range; record the power state alongside any hardware cadence result.
+
+After the native smoke, independently gate a constant-rate capture with:
+
+```sh
+python3 tests/vrr/check_metal_cadence.py /absolute/path/native-metal.vrrtrace \
+    --fps 90 --output build/metal-cadence.json
+```
+
+This requires at least 90% OS display-event coverage after 32 warmup submissions,
+at least 32 consecutive matched intervals, and at least 95% of those intervals
+within 500 us of the requested period. It uses drawable presentation events,
+never CPU submission timing, and exits nonzero when coverage or cadence fails.
+It is for constant-rate native hardware smokes, not variable-rate gameplay or
+optical panel measurements. The 2026-10-04 LG TV result fails this gate even
+after three drawable resources restore zero-drop submission throughput.
+With Automatic power and fullscreen held focused, a later 900-frame production
+smoke submitted every frame, passed exact replay, and produced display intervals
+around 11.11 ms, but still failed the strict uniformity threshold. The TV's
+numerical refresh rate varied toward 90 Hz in the native control. This gate
+scores interval regularity; a failure alone does not establish that VRR is off.
 
 The FPS picker offers native VRR rates and preserves saved custom values; the
 reduced-rate Low Latency VRR recommendation has been removed. The worker no
@@ -187,15 +318,21 @@ interval safety separately; they do not claim 99.95% under post-target faults.
 The all-arrival queue simulator uses the capture's `can_latch_present` capability;
 forcing it off invents software-floor backlog on a latch-capable session.
 
-Production sets `playout_responsive_buffer=7`: Low Latency targets 99% over
-1 minute, Balanced Target 99.5% over 2 minutes, and Smooth 99.99% over 5 minutes.
-It measures the one-second mean absolute submission-interval error against the
-preset's 0.5/0.5/0.2 ms tolerance, then weights long-window quality loss by the
-excess relative to the intended interval. Growth requires both below-target
-history and current excess, a fresh readiness-late frame, and decoder-queue and
+Production sets `playout_responsive_buffer=12`: Low Latency targets 95% over
+1 minute, Balanced Target 97.5% over 2 minutes, and Smooth 99% over 5 minutes.
+It applies the selected interval tolerance to each absolute
+submission-interval error, then weights long-window quality loss by the excess
+relative to the intended interval. Reporting and buffer control use that same
+per-interval loss. Custom settings use their explicit history duration.
+Isolated spikes remain visible; the score is a severity-based control metric,
+not a count of perfect frames or a guarantee of visible smoothness. Growth requires both below-target
+control history and current per-interval excess, a fresh readiness-late frame, and decoder-queue and
 serial-service costs that each fit that interval. Requests can rise by at most
-250 us per 250 ms. Old score debt remains reportable but does not renew the
-clean-time release hold. The 500 us scheduling margin and 1 ms minimum remain.
+250 us per 250 ms. Below-target retained history holds existing protection;
+recent clean time alone cannot shrink it. Valid adjacent intervals remain in
+the score through control requalification after a dropped frame or phase break.
+The overlay exposes actual scored seconds beside the history setting. The
+500 us scheduling margin and 1 ms minimum remain.
 Preset limits use the fitted source period in live sessions, so 120/19/30 FPS
 desktop changes cannot expand them and a below-nominal source is not clipped to
 the negotiated rate. Smoothing follows raw source slots during rate transitions
@@ -203,8 +340,9 @@ until 200 ms of credible cadence returns; delivery learning continues against
 RTP spacing. Historical traces default the observed-period switch to zero.
 
 Windows D3D11 also enables bounded GPU-readiness adaptation. Preparation queues
-the present-ready fence, and the target-boundary present path waits only for any
-residual work after the cadence hold. Completed residual waits are kept in a ten-second p99 window with a 500 us
+and verifies the present-ready fence before the cadence hold. Final presentation
+checks the cached completion proof for the exact prepared marker. Completed
+waits are kept in a ten-second p99 window with a 500 us
 margin, slewed by at most 1 ms per sample and released at 250 us/s, capped at
 12 ms and one source period. The resulting lead advances render start only;
 it does not move the presentation target or turn a failed fence into a valid
@@ -388,6 +526,10 @@ scan line, and VidPn source ID. It does not poll, sleep, align, or otherwise
 change presentation policy. A sample in active scanout proves where the raster
 was around the CPU Present call; it does not prove when the queued flip took
 effect or that the panel showed an optical tear.
+The production protection veto also records before-only raster evidence with
+alignment off. This is distinguished by the protection-query bracket and keeps
+its native Present timing for correlation. It does not add polling or turn a
+raster observation into a timestamp of a visible image.
 
 Schema 4 introduced two deliberately separate tear signals and an explicit
 `spacing_guard_feedback_us` value. The latter distinguishes a harmless wait at
@@ -1480,7 +1622,7 @@ and does not claim live Gamescope smoothness validation.
 
 The retired readiness-hitch policy can select readiness-attributed growth for a
 declared Vulkan backend (`playout_readiness_hitch_threshold_us=2000`). Current
-session-policy replay uses responsive interval-buffer revision 7 and a zero
+session-policy replay uses responsive interval-buffer revision 12 and a zero
 threshold. Exact replay retains recorded parameters. When isolating the older
 policy with a custom scenario, provide the complete captured controller snapshot
 before overriding the threshold: partial custom scenarios start from generic
@@ -1502,13 +1644,30 @@ It does not substitute replay scenarios for missing measured presets.
 
 ### Responsive buffer history
 
-Production resolves `playout_responsive_buffer=7`; revisions 0 through 6 remain
-available for exact historical replay. Revision 3 records the selected target
+Production resolves `playout_responsive_buffer=12`, applying tolerance before
+averaging interval loss for both reporting and control and honoring the explicit
+history for custom settings. It records valid adjacent intervals during control
+qualification and retains protection while the history is below target.
+`testTwoMinuteScoreCoverage` covers full history, frequent sequence breaks,
+startup responsiveness and the earlier undercoverage regression.
+`testHistoryControlsBufferRelease` verifies history holds, no growth from debt
+alone, expiry and eventual release. Revisions 0 through 11
+remain available for exact historical replay. Revision 3 records the selected target
 in `playout_on_time_target_per_million` and learning window in
 `playout_readiness_window_us`; revision 4 added thresholded misses and excluded
 pacing-queue residence from its then-current decode-ready timestamp. Revisions
 5 through 7 move adaptation to interval quality, add severity weighting, and
-keep long score history separate from current release pressure. The rolling
+keep long score history separate from current release pressure. Revision 9
+applies tolerance per interval; revisions 7/8 preserve their mean-before-tolerance
+score and growth pressure. Historical
+revision 10 keeps revision 9's
+accurate report and independently restores revision 7/8's mean-based buffer
+control, including history, attack amount and hold/release qualification.
+`testRelaxedBufferControlPreservesAccurateReporting` checks both references on
+every observation across all presets, rare and sustained misses, submission-only
+jitter, serial/decoder overload, short breaks, epoch restore and long silence.
+Rare spikes remain reportable while raised buffer releases to its minimum.
+The rolling
 30-second outcome readout always counts client drops and lateness over 2 ms as
 misses, counts 1-2 ms lateness only above 50% prevalence, tolerates lateness
 through 1 ms, and measures lateness before deadline recovery clamps.
@@ -1536,6 +1695,49 @@ captures without immutable output retain their historical boundary. Busy-worker
 reconstruction caps a learned idle floor by the current row's observed readiness;
 a long startup wait cannot shift an otherwise unchanged replay. Both contracts
 have deterministic regressions in `tst_vrrreplayconfig`.
+
+## Native macOS Metal and PyroWave integration smoke test
+
+Build this target explicitly after the application has produced
+`build/mac-client/pyrowave/libpyrowave.a`. `CONFIG+=pyrowave` opts into the GPU
+codec cases; the ordinary native target does not compile the codec. Run from
+the repository root:
+
+```sh
+nativeRoot="$PWD"
+mkdir -p build/mac-metal-pyrowave-smoke
+cd build/mac-metal-pyrowave-smoke
+"$nativeRoot/build/vrr-hybrid/qt/6.11.1/macos/bin/qmake" \
+  "$nativeRoot/tests/vrr/metalpresenter.pro" \
+  QMAKE_APPLE_DEVICE_ARCHS=arm64 CONFIG+=release CONFIG-=debug \
+  CONFIG+=pyrowave \
+  "PYROWAVE_STATIC_LIBRARY=$nativeRoot/build/mac-client/pyrowave/libpyrowave.a"
+make -j6
+DYLD_LIBRARY_PATH="$nativeRoot/libs/mac/lib" \
+GRANITE_VULKAN_LIBRARY="$nativeRoot/libs/mac/lib/libMoltenVK.dylib" \
+  ./tst_metalpresenter "$PWD/native-metal-pyrowave.vrrtrace"
+DYLD_LIBRARY_PATH="$nativeRoot/libs/mac/lib" \
+  "$nativeRoot/build/mac-tests/vrr/vrrreplay" \
+  "$PWD/native-metal-pyrowave.vrrtrace" --require-exact-baseline \
+  --output "$PWD/native-metal-pyrowave-baseline.json"
+```
+
+The test opens a temporary native fullscreen window. On a variable display it
+first verifies rejection of windowed and V-sync-disabled VRR, then exercises
+the actual Metal presenter with software and VideoToolbox frames. The two
+combined codec cases encode 128×96 patterns on the GPU and decode to exported
+Metal textures in 4:2:0/8-bit and 4:4:4/10-bit. Their AVFrames have no CPU plane
+data. The presenter waits for asynchronous decode, renders, cancels, prepares
+again, frees the source frame and decoder, and presents the retained drawable.
+A shared-frame fixed/CAMetalDisplayLink case also runs after VRR fallback.
+
+The separate 100-frame worker fixture uses synthetic software frames at 116 FPS
+on the 120 Hz panel and records real command-completion and presented-time
+feedback for exact replay. On a fixed display the adaptive cases are skipped
+after verifying fixed fallback. These tests establish native pipeline behavior;
+the PyroWave GPU round-trip suite covers full-resolution plane equality, while
+live streaming, external-display scanout and sustained performance require
+separate validation.
 
 # Buffer accounting extension (2026-09-18)
 
@@ -1589,3 +1791,14 @@ trace. Export the contention fixture with
 `MOONLIGHT_VRR_TEST_EXPORT_CONTENTION_TRACE` for the exact replay gate. Genuine
 queue age, the sole-image rule, and post-wait scheduler stalls remain covered by
 the other worker tests; this fixture does not model GPU throughput.
+
+
+DXGI waitable checks: `tst_dxgipresent` covers default eligibility and the
+exclusive `MOONLIGHT_VRR_COMPOSITION=1` override, first-frame admission, timeouts,
+native failures, cancellation/resize races, retained permits, and permanent
+shutdown interruption. `tst_vrrpacingworker` checks interruption before joining a
+blocked renderer and on minimize, with exact decoded-frame release.
+`tst_vrrpreferences` verifies removal of both values of the retired waitable opt-in
+without changing renderer selection. The experimental checkbox is removed.
+A subsequent live comparison is still needed to validate driver behavior,
+resizing, stop/reconnect, tearing and visible pacing.

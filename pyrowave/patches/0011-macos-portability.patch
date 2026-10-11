@@ -1,0 +1,71 @@
+From: Moonlight macOS port
+Subject: [PATCH] Permit native MoltenVK subgroups and Darwin deadline sleeps
+
+Darwin has no POSIX clock_nanosleep; recompute monotonic relative waits after
+interruptions. MoltenVK does not expose requiredSubgroupSizeStages, but the
+vendored SPIR-V 1.3 shaders can use the reported native subgroup size without
+ALLOW_VARYING_SUBGROUP_SIZE or a required-size pNext. Scope that admission to
+MoltenVK and ranges that contain its native subgroup width. Native GPU
+roundtrip and coefficient comparisons validate the Apple Silicon path.
+
+diff --git a/Granite/util/timer.cpp b/Granite/util/timer.cpp
+index a1408352..5c2d954c 100644
+--- a/Granite/util/timer.cpp
++++ b/Granite/util/timer.cpp
+@@ -138,6 +138,20 @@ void sleep_until_nsecs(int64_t timepoint)
+ 		_mm_pause();
+ #endif
+ 	}
++#elif defined(__APPLE__)
++	// Darwin has no clock_nanosleep(). Recompute a relative monotonic wait
++	// after interruptions so this uses the same clock as get_current_time_nsecs().
++	for (;;)
++	{
++		int64_t remaining = timepoint - get_current_time_nsecs();
++		if (remaining <= 0)
++			break;
++		struct timespec ts = { remaining / 1000000000ll, remaining % 1000000000ll };
++		if (nanosleep(&ts, nullptr) == 0)
++			break;
++		if (errno != EINTR)
++			break;
++	}
+ #else
+ 	constexpr auto timebase = CLOCK_MONOTONIC;
+ 	struct timespec ts = {};
+diff --git a/Granite/vulkan/command_buffer.cpp b/Granite/vulkan/command_buffer.cpp
+index 9f2534de..67371aaf 100644
+--- a/Granite/vulkan/command_buffer.cpp
++++ b/Granite/vulkan/command_buffer.cpp
+@@ -1254,6 +1254,13 @@ bool CommandBuffer::setup_subgroup_size_control(
+ 	}
+ 	else
+ 	{
++		// No varying-size flag and no required-size structure means the
++		// native subgroup size for our SPIR-V 1.3 shaders. MoltenVK exposes
++		// that mode even though requiredSubgroupSizeStages is zero.
++		if (features.driver_id == VK_DRIVER_ID_MOLTENVK &&
++		    !(features.vk13_props.requiredSubgroupSizeStages & stage))
++			return true;
++
+ 		required_info = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+ 
+ 		// Pick a fixed subgroup size. Prefer smallest subgroup size.
+diff --git a/Granite/vulkan/device.cpp b/Granite/vulkan/device.cpp
+index 11aeadbd..404eedaa 100644
+--- a/Granite/vulkan/device.cpp
++++ b/Granite/vulkan/device.cpp
+@@ -5872,6 +5872,13 @@ bool Device::supports_subgroup_size_log2(bool subgroup_full_group, uint8_t subgr
+ 	}
+ 
+ 	// We need requiredSubgroupSizeStages support here.
++	// MoltenVK cannot request a subgroup size, but its ordinary SPIR-V 1.3
++	// pipelines use the reported native size when ALLOW_VARYING is absent.
++	// PyroWave's embedded shaders use that older SPIR-V contract.
++	if (ext.driver_id == VK_DRIVER_ID_MOLTENVK &&
++	    !(ext.vk13_props.requiredSubgroupSizeStages & stage))
++		return min_subgroups <= ext.vk11_props.subgroupSize &&
++		       max_subgroups >= ext.vk11_props.subgroupSize;
+ 	return (ext.vk13_props.requiredSubgroupSizeStages & stage) != 0;
+ }
+ 

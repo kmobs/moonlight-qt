@@ -215,5 +215,13 @@ void VrrTargetWaiter::defaultSleepForUs(uint64_t durationUs)
 
 void VrrTargetWaiter::defaultYield()
 {
-    std::this_thread::yield();
+    // This is the bounded final deadline region, not a dependency wait.
+    // Giving up our scheduler timeslice here can move submission past the
+    // target. SDL maps the pause hint to the CPU architecture (or a no-op)
+    // without asking the OS to run another thread. Coarse waits still sleep.
+#ifdef SDL_CPUPauseInstruction
+    SDL_CPUPauseInstruction();
+#else
+    SDL_CompilerBarrier();
+#endif
 }

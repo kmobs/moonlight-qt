@@ -56,7 +56,7 @@ win32 {
     }
 
     INCLUDEPATH += $$PWD/../libs/windows/include
-    LIBS += dcomp.lib advapi32.lib ws2_32.lib iphlpapi.lib shell32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib hid.lib
+    LIBS += dcomp.lib advapi32.lib cfgmgr32.lib ws2_32.lib iphlpapi.lib shell32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib hid.lib
 }
 macx:!disable-prebuilts {
     !exists($$PWD/../libs/mac) {
@@ -180,6 +180,7 @@ SOURCES += \
     backend/identitymanager.cpp \
     backend/nvcomputer.cpp \
     backend/nvhttp.cpp \
+    backend/pyrowaveudpprobe.cpp \
     backend/nvpairingmanager.cpp \
     backend/computermanager.cpp \
     backend/boxartmanager.cpp \
@@ -203,6 +204,7 @@ SOURCES += \
     streaming/input/mouse.cpp \
     streaming/input/reltouch.cpp \
     streaming/session.cpp \
+    streaming/gpuperformancehold.cpp \
     streaming/gamescopecomposition.cpp \
     streaming/audio/audio.cpp \
     streaming/audio/renderers/sdlaud.cpp \
@@ -222,6 +224,8 @@ SOURCES += \
     wm.cpp
 
 HEADERS += \
+    streaming/video/videothreadpriority.h \
+    streaming/video/timinggraph.h \
     streaming/input/dualsensehid.h \
     streaming/input/dualsensetriggers.h \
     ../third-party/saxense/packet.h \
@@ -237,6 +241,7 @@ HEADERS += \
     backend/nvcomputer.h \
     backend/framelimitercapabilities.h \
     backend/nvhttp.h \
+    backend/pyrowaveudpprobe.h \
     backend/nvpairingmanager.h \
     backend/computermanager.h \
     backend/boxartmanager.h \
@@ -246,14 +251,19 @@ HEADERS += \
     cli/quitstream.h \
     cli/startstream.h \
     settings/streamingpreferences.h \
+    settings/vrrtimingoptions.h \
     diagnostics/diagnosticcapture.h \
     diagnostics/gputrace.h \
     diagnostics/diagnosticzip.h \
     streaming/input/dualsensehaptics.h \
     streaming/input/input.h \
     streaming/session.h \
+    streaming/gpuperformancehold.h \
     streaming/video/amddecodepolicy.h \
     streaming/video/pyrowave/pyrowavecalibrator.h \
+    streaming/video/pyrowave/pyrowavecalibrationpolicy.h \
+    streaming/video/pyrowave/pyrowavebandwidth.h \
+    streaming/video/pyrowave/pyrowavelinkpolicy.h \
     streaming/video/pyrowave/pyrowavebitrate.h \
     streaming/gamescopecomposition.h \
     streaming/audio/renderers/renderer.h \
@@ -270,6 +280,7 @@ HEADERS += \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
     streaming/video/clientpacingwarning.h \
+    streaming/video/pyrowave/pyrowavepacketlosswarning.h \
     backend/systemproperties.h \
     backend/networkbuffers.h \
     windowsvblankvirtualization.h
@@ -462,11 +473,14 @@ win32:!winrt {
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
         streaming/video/ffmpeg-renderers/d3d11composition.h \
+        streaming/video/ffmpeg-renderers/compositionpresentpolicy.h \
         streaming/video/ffmpeg-renderers/d3d11pyrowave.h \
         streaming/video/pyrowave/pyrowavesurfaces.h \
         streaming/video/ffmpeg-renderers/presentationclock.h \
         streaming/video/ffmpeg-renderers/dxgipresent.h \
+        streaming/video/ffmpeg-renderers/dxgiwaitable.h \
         streaming/video/ffmpeg-renderers/d3d11fencewait.h \
+        streaming/video/ffmpeg-renderers/d3d11presentpolicy.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }
 macx {
@@ -475,10 +489,12 @@ macx {
     SOURCES += \
         streaming/video/ffmpeg-renderers/vt_base.mm \
         streaming/video/ffmpeg-renderers/vt_avsamplelayer.mm \
-        streaming/video/ffmpeg-renderers/vt_metal.mm
+        streaming/video/ffmpeg-renderers/vt_metal.mm \
+        streaming/video/ffmpeg-renderers/macdisplaytiming.mm
 
     HEADERS += \
-        streaming/video/ffmpeg-renderers/vt.h
+        streaming/video/ffmpeg-renderers/vt.h \
+        streaming/video/ffmpeg-renderers/macdisplaytiming.h
 }
 discord-rpc {
     message(Discord integration enabled)
@@ -527,7 +543,8 @@ wayland {
 }
 
 # PyroWave decoding runs on Vulkan. Windows shares D3D11 surfaces; Linux
-# presents the decoded planes through the libplacebo Vulkan renderer.
+# presents the decoded planes through libplacebo. macOS exports MoltenVK images
+# as Metal textures so decoding and presentation share the same GPU planes.
 win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave
@@ -536,7 +553,12 @@ linux:contains(QT_ARCH, x86_64):!disable-pyrowave:contains(CONFIG, libplacebo) {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave
 }
+macx:!disable-prebuilts:!disable-pyrowave {
+    message(PyroWave decoder enabled via MoltenVK and Metal)
+    CONFIG += pyrowave
+}
 pyrowave {
+    include($$PWD/../pyrowave/compression/compression.pri)
     DEFINES += HAVE_PYROWAVE
 
     SOURCES += \
@@ -549,6 +571,12 @@ pyrowave {
     linux {
         SOURCES += streaming/video/pyrowave/pyrowaveplacebo.cpp
         HEADERS += streaming/video/pyrowave/pyrowaveplacebo.h
+    }
+    macx {
+        SOURCES += streaming/video/pyrowave/pyrowavemetal.mm \
+                   streaming/video/pyrowave/pyrowavemetalcalibrator.mm
+        HEADERS += streaming/video/pyrowave/pyrowavemetal.h \
+                   streaming/video/pyrowave/pyrowavemetalcalibrator.h
     }
 
     # Only pyrowave.h is included from the vendored tree
@@ -689,10 +717,11 @@ macx {
     }
 }
 
-# Displayed version stays CI_VERSION (e.g. 6.1.0-vrr17.1). Windows PE/MSI
+# Displayed version stays CI_VERSION (e.g. 6.2.0-daily.183). Windows PE/MSI
 # ProductVersion can only use three numeric fields and must increase past
 # stock Moonlight 6.1.0, so VRR builds map 6.1.0-vrrN to 6.2.N and
 # 6.1.0-vrrN.P to 6.2.(N*10+P).
+# Both 6.1.0-daily.B and 6.2.0-daily.B retain Windows 6.2.B; never reset B.
 VERSION = "$$BASE_VERSION"
 PE_VERSION = $$(MOONLIGHT_PE_VERSION)
 !isEmpty(PE_VERSION) {

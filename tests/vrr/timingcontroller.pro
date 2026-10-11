@@ -27,7 +27,8 @@ win32 {
 
 macx {
     !disable-prebuilts {
-        INCLUDEPATH += $$PWD/../../libs/mac/include
+        INCLUDEPATH += $$PWD/../../libs/mac/include \
+                       $$PWD/../../libs/mac/include/SDL2
         LIBS += -L$$PWD/../../libs/mac/lib -lavutil.60 -lSDL2
     } else {
         CONFIG += link_pkgconfig
@@ -42,6 +43,7 @@ unix:!macx {
 
 # Track the header-only feedback models in incremental builds.
 HEADERS += \
+    $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/cadencedetection.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
     $$PWD/../../app/streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \

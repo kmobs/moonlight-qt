@@ -3,6 +3,12 @@
 #define AVMediaType AVMediaType_FFmpeg
 #include "vt.h"
 #include "pacer/pacer.h"
+#include "ivrrframepresenter.h"
+#include "macdisplaytiming.h"
+#include "presentationclock.h"
+#ifdef HAVE_PYROWAVE
+#include "streaming/video/pyrowave/pyrowavemetal.h"
+#endif
 #undef AVMediaType
 
 #include <SDL_syswm.h>
@@ -10,6 +16,10 @@
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
 #include "path.h"
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 #import <Cocoa/Cocoa.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -45,13 +55,40 @@ struct Vertex
 
 class VTMetalRenderer;
 
+// Metal's presented handlers can outlive the renderer. Their only destination
+// is this shared observation state, never a renderer or a decoder surface.
+struct MetalPresentationObservation {
+    std::mutex lock;
+    uint64_t submissionId = 0;
+    PresentationClockSample timestamp;
+};
+
+struct MetalCommandCompletion {
+    std::mutex lock;
+    std::condition_variable ready;
+    bool complete = false;
+};
+
+struct MetalFrameResources {
+    AVFrame* frame = nullptr;
+    std::array<CVMetalTextureRef, MAX_VIDEO_PLANES> textures{};
+
+    ~MetalFrameResources()
+    {
+        for (auto texture : textures) {
+            if (texture != nullptr) CFRelease(texture);
+        }
+        av_frame_free(&frame);
+    }
+};
+
 @interface DisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
 
 - (id)initWithRenderer:(VTMetalRenderer *)renderer;
 
 @end
 
-class VTMetalRenderer : public VTBaseRenderer
+class VTMetalRenderer : public VTBaseRenderer, public IVrrFramePresenter
 {
 public:
     VTMetalRenderer(bool hwAccel)
@@ -61,6 +98,13 @@ public:
           m_HwContext(nullptr),
           m_MetalLayer(nullptr),
           m_MetalDisplayLink(nullptr),
+          m_VrrEnabled(false),
+          m_VrrSuspended(false),
+          m_FixedVsyncEnabled(false),
+          m_RendererFailed(false),
+          m_PreparedDrawable(nullptr),
+          m_NextSubmissionId(0),
+          m_PresentationObservation(std::make_shared<MetalPresentationObservation>()),
           m_LatestUnrenderedFrame(nullptr),
           m_FrameLock(SDL_CreateMutex()),
           m_FrameReady(SDL_CreateCond()),
@@ -86,6 +130,7 @@ public:
     { @autoreleasepool {
         // Stop the display link and free associated state
         stopDisplayLink();
+        cancelFrame();
         av_frame_free(&m_LatestUnrenderedFrame);
         SDL_DestroyCond(m_FrameReady);
         SDL_DestroyMutex(m_FrameLock);
@@ -439,6 +484,7 @@ public:
             if (err != kCVReturnSuccess) {
                 for (size_t j = 0; j < i; j++) {
                     CFRelease(cvMetalTextures[j]);
+                    cvMetalTextures[j] = nullptr;
                 }
                 SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                              "CVMetalTextureCacheCreateTextureFromImage() failed: %d",
@@ -473,16 +519,22 @@ public:
         return true;
     }}
 
-    // Caller frees frame after we return
-    virtual void renderFrameIntoDrawable(AVFrame* frame, id<CAMetalDrawable> drawable)
-    { @autoreleasepool {
-        std::array<CVMetalTextureRef, MAX_VIDEO_PLANES> cvMetalTextures;
+    // The returned command buffer retains every bound Metal resource. Imported
+    // CoreVideo texture-cache references are released only after GPU completion.
+    id<MTLCommandBuffer> encodeFrameIntoDrawable(AVFrame* frame, id<CAMetalDrawable> drawable)
+    {
+        auto resources = std::make_shared<MetalFrameResources>();
+        resources->frame = av_frame_clone(frame);
+        if (resources->frame == nullptr) {
+            return nullptr;
+        }
+        auto& cvMetalTextures = resources->textures;
         size_t planes = getFramePlaneCount(frame);
         SDL_assert(planes <= MAX_VIDEO_PLANES);
 
         if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
             if (!createTexturesFromFrame(frame, cvMetalTextures)) {
-                return;
+                return nullptr;
             }
         }
 
@@ -494,6 +546,9 @@ public:
         renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
         auto commandBuffer = [m_CommandQueue commandBuffer];
         auto renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+        if (renderEncoder == nullptr) {
+            return nullptr;
+        }
 
         // Bind textures and buffers then draw the video region
         [renderEncoder setRenderPipelineState:m_VideoPipelineState];
@@ -501,16 +556,28 @@ public:
             for (size_t i = 0; i < planes; i++) {
                 [renderEncoder setFragmentTexture:CVMetalTextureGetTexture(cvMetalTextures[i]) atIndex:i];
             }
-            [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
-                // Free textures after completion of rendering per CVMetalTextureCache requirements
-                for (size_t i = 0; i < planes; i++) {
-                    CFRelease(cvMetalTextures[i]);
-                }
-            }];
         }
         else {
+#ifdef HAVE_PYROWAVE
+            void* sharedTextures[MAX_VIDEO_PLANES]{};
+            const bool sharedPyroWave = m_PyroWavePool && m_PyroWavePool->ownsFrame(frame);
+            if (sharedPyroWave && !m_PyroWavePool->mapFrame(frame, sharedTextures)) {
+                [renderEncoder endEncoding];
+                return nullptr;
+            }
+#endif
             for (size_t i = 0; i < planes; i++) {
-                [renderEncoder setFragmentTexture:mapPlaneForSoftwareFrame(frame, i) atIndex:i];
+                id<MTLTexture> texture;
+#ifdef HAVE_PYROWAVE
+                if (sharedPyroWave) texture = (id<MTLTexture>)sharedTextures[i];
+                else
+#endif
+                    texture = mapPlaneForSoftwareFrame(frame, i);
+                if (texture == nullptr) {
+                    [renderEncoder endEncoding];
+                    return nullptr;
+                }
+                [renderEncoder setFragmentTexture:texture atIndex:i];
             }
         }
         [renderEncoder setFragmentBuffer:m_CscParamsBuffer offset:0 atIndex:0];
@@ -564,6 +631,22 @@ public:
 
         [renderEncoder endEncoding];
 
+        // Keep the decoder surface alive even if the bounded readiness wait
+        // fails and recovery destroys the renderer before GPU completion.
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+            (void)resources;
+        }];
+        return commandBuffer;
+    }
+
+    // Caller frees frame after we return
+    virtual void renderFrameIntoDrawable(AVFrame* frame, id<CAMetalDrawable> drawable)
+    { @autoreleasepool {
+        auto commandBuffer = encodeFrameIntoDrawable(frame, drawable);
+        if (commandBuffer == nullptr) {
+            return;
+        }
+
         // Flip to the newly rendered buffer
         [commandBuffer presentDrawable:drawable];
         [commandBuffer commit];
@@ -572,9 +655,236 @@ public:
         [commandBuffer waitUntilCompleted];
     }}
 
+    IVrrFramePresenter* getVrrFramePresenter() override
+    {
+        return this;
+    }
+
+    QString getCalibrationIdentity() override
+    {
+        return m_CalibrationIdentity;
+    }
+
+#ifdef HAVE_PYROWAVE
+    IPyroWaveVulkanPool* getPyroWaveVulkanPool() override
+    {
+        if (!m_PyroWavePool) {
+            auto pool = std::make_unique<PyroWaveMetalPool>();
+            if (!pool->initialize((void*)m_CommandQueue.device)) {
+                return nullptr;
+            }
+            m_PyroWavePool = std::move(pool);
+        }
+        return m_PyroWavePool.get();
+    }
+
+    uint64_t waitForDecode(AVFrame* frame) override
+    {
+        if (!m_PyroWavePool || !m_PyroWavePool->ownsFrame(frame)) {
+            return 0;
+        }
+        if (m_PyroWavePool->waitForFrame(frame, 0) == VK_SUCCESS) {
+            return 0; // Already complete; do not manufacture a completion time.
+        }
+        const auto beforeUs = LiGetMicroseconds();
+        const auto result = m_PyroWavePool->waitForFrame(frame, 50000000);
+        if (result != VK_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Metal PyroWave decode did not complete within 50 ms: %d", result);
+            SDL_Event event{};
+            event.type = SDL_RENDER_DEVICE_RESET;
+            SDL_PushEvent(&event);
+            m_RendererFailed = true;
+            return 0;
+        }
+        return LiGetMicroseconds() - beforeUs;
+    }
+#endif
+
+    VrrFallbackReason checkSupport() const override
+    {
+        if (!m_VrrEnabled || m_RendererFailed || m_MetalLayer == nullptr ||
+                !m_DisplayTiming.nativeFullscreen ||
+                !m_DisplayTiming.supportsVariableRefresh()) {
+            return VrrFallbackReason::AdaptivePresentationUnavailable;
+        }
+        return VrrFallbackReason::NoFallback;
+    }
+
+    bool canLatchAdaptivePresent() const override
+    {
+        // Every VRR drawable is synchronized and requests at least one native
+        // minimum refresh interval. This is permanent native protection rather
+        // than a per-frame switch of the layer or presentation path.
+        return checkSupport() == VrrFallbackReason::NoFallback;
+    }
+
+    VrrPrepareResult prepareFrame(AVFrame* frame, uint64_t) override
+    { @autoreleasepool {
+        cancelFrame();
+        VrrPrepareResult result;
+        if (m_VrrSuspended || checkSupport() != VrrFallbackReason::NoFallback) {
+            return result;
+        }
+        const uint64_t beforeUpdate = LiGetMicroseconds();
+        if (!updateColorSpaceForFrame(frame) || !updateVideoRegionSizeForFrame(frame)) {
+            SDL_Event event{};
+            event.type = SDL_RENDER_DEVICE_RESET;
+            SDL_PushEvent(&event);
+            return result;
+        }
+        const uint64_t beforeAcquire = LiGetMicroseconds();
+        id<CAMetalDrawable> drawable = [m_MetalLayer nextDrawable];
+        const uint64_t afterAcquire = LiGetMicroseconds();
+        if (drawable == nullptr) {
+            return result;
+        }
+        auto commandBuffer = encodeFrameIntoDrawable(frame, drawable);
+        if (commandBuffer == nullptr) {
+            return result;
+        }
+        const uint64_t beforeFlush = LiGetMicroseconds();
+        auto completion = std::make_shared<MetalCommandCompletion>();
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+            {
+                std::lock_guard<std::mutex> guard(completion->lock);
+                completion->complete = true;
+            }
+            completion->ready.notify_one();
+        }];
+        [commandBuffer commit];
+        const uint64_t afterFlush = LiGetMicroseconds();
+        result.feedback.gpuReadyAttempted = true;
+        result.feedback.gpuReadyWaitStartUs = afterFlush;
+        {
+            std::unique_lock<std::mutex> guard(completion->lock);
+            completion->ready.wait_for(guard, std::chrono::milliseconds(50),
+                                      [&] { return completion->complete; });
+        }
+        const uint64_t readyUs = LiGetMicroseconds();
+        result.feedback.gpuReadyPollStartUs = afterFlush;
+        result.feedback.gpuReadyPollEndUs = readyUs;
+        result.feedback.gpuReadyWaitResultValid = true;
+        const auto status = commandBuffer.status;
+        result.feedback.gpuReadyWaitResult = status == MTLCommandBufferStatusCompleted ?
+            0 : (status == MTLCommandBufferStatusError ? 2 : 1);
+        result.feedback.gpuReadyTimeUs = readyUs;
+        m_PreparedFeedback = result.feedback;
+        if (status != MTLCommandBufferStatusCompleted) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Metal VRR render failed or exceeded 50 ms: status %ld (%s)",
+                         (long)status,
+                         commandBuffer.error.localizedDescription.UTF8String ?: "no native error");
+            SDL_Event event{};
+            event.type = SDL_RENDER_DEVICE_RESET;
+            SDL_PushEvent(&event);
+            m_RendererFailed = true;
+            return result;
+        }
+        result.feedback.gpuReadyTimingValid = true;
+        result.feedback.gpuReadyTimeUs = readyUs;
+        // Completing the render before the target hold releases the decoder's
+        // source pool safely, and cancellation can drop the drawable outright.
+        m_PreparedDrawable = [drawable retain];
+        m_PreparedFeedback = result.feedback;
+        result.prepared = true;
+        result.sourceFrameReusable = true;
+        result.timingValid = true;
+        result.acquireUs = afterAcquire - beforeAcquire;
+        result.renderUs = beforeAcquire - beforeUpdate + beforeFlush - afterAcquire + readyUs - afterFlush;
+        result.flushUs = afterFlush - beforeFlush;
+        return result;
+    }}
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest&) override
+    { @autoreleasepool {
+        if (m_PreparedDrawable == nullptr || m_VrrSuspended ||
+                checkSupport() != VrrFallbackReason::NoFallback) {
+            return cancelFrame();
+        }
+        VrrPresentFeedback feedback = m_PreparedFeedback;
+        const uint64_t submissionId = ++m_NextSubmissionId;
+        auto observation = m_PresentationObservation;
+        [m_PreparedDrawable addPresentedHandler:^(id<MTLDrawable> drawable) {
+            if (drawable.presentedTime <= 0) {
+                return; // The compositor skipped this drawable.
+            }
+            const uint64_t beforeUs = LiGetMicroseconds();
+            const double referenceSeconds = CACurrentMediaTime();
+            const uint64_t afterUs = LiGetMicroseconds();
+            const auto timestamp = PresentationClockSample::translate(
+                static_cast<uint64_t>(drawable.presentedTime * 10000000.0),
+                static_cast<uint64_t>(referenceSeconds * 10000000.0), beforeUs, afterUs);
+            if (timestamp.timeUs == 0) {
+                return;
+            }
+            std::lock_guard<std::mutex> guard(observation->lock);
+            if (submissionId > observation->submissionId) {
+                observation->submissionId = submissionId;
+                observation->timestamp = timestamp;
+            }
+        }];
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Metal;
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = LiGetMicroseconds();
+        feedback.submissionTimeValid = true;
+        feedback.submissionTimeUs = feedback.nativePresentStartUs;
+        [m_PreparedDrawable presentAfterMinimumDuration:m_DisplayTiming.minimumRefreshInterval];
+        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentResult = 0; // Metal's presentation method returns void.
+        feedback.presented = true;
+        feedback.submissionIdValid = true;
+        feedback.submissionId = submissionId;
+        {
+            std::lock_guard<std::mutex> guard(observation->lock);
+            if (observation->timestamp.timeUs != 0) {
+                feedback.latchSampleValid = true;
+                feedback.latchSubmissionId = observation->submissionId;
+                feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+                feedback.latchTimeUs = observation->timestamp.timeUs;
+                feedback.presentationUncertaintyUs = observation->timestamp.uncertaintyUs;
+            }
+        }
+        [m_PreparedDrawable release];
+        m_PreparedDrawable = nullptr;
+        m_PreparedFeedback = {};
+        return feedback;
+    }}
+
+    VrrPresentFeedback cancelFrame() override
+    {
+        [m_PreparedDrawable release];
+        m_PreparedDrawable = nullptr;
+        VrrPresentFeedback feedback = m_PreparedFeedback;
+        m_PreparedFeedback = {};
+        feedback.cancelled = true;
+        return feedback;
+    }
+
+    void setSuspended(bool suspended) override
+    {
+        m_VrrSuspended = suspended;
+        if (suspended) cancelFrame();
+    }
+
+    bool restoreFixedPresentation(VrrFallbackReason) override
+    {
+        cancelFrame();
+        m_VrrEnabled = false;
+        m_MetalLayer.displaySyncEnabled = m_FixedVsyncEnabled;
+        m_MetalLayer.maximumDrawableCount = 3;
+        return true;
+    }
+
     // Caller frees frame after we return
     virtual void renderFrame(AVFrame* frame) override
     { @autoreleasepool {
+#ifdef HAVE_PYROWAVE
+        waitForDecode(frame);
+#endif
+        if (m_RendererFailed) return;
         // Handle changes to the frame's colorspace from last time we rendered
         if (!updateColorSpaceForFrame(frame)) {
             // Trigger the main thread to recreate the decoder
@@ -662,6 +972,9 @@ public:
         int err;
 
         m_Window = params->window;
+        m_VrrEnabled = params->enableVrr && params->enableVsync && !params->testOnly;
+        m_FixedVsyncEnabled = params->enableVsync;
+        m_DisplayTiming = queryMacDisplayTiming(m_Window);
         m_FrameRateRange = CAFrameRateRangeMake(params->frameRate, params->frameRate, params->frameRate);
 
         id<MTLDevice> device = getMetalDevice();
@@ -673,6 +986,24 @@ public:
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Selected Metal device: %s",
                     device.name.UTF8String);
+
+        // Snapshot Cocoa/CoreGraphics display identity during initialization.
+        // The worker can then persist readiness history without touching a
+        // window or NSScreen from its background thread.
+        if (m_DisplayTiming.displayId != 0) {
+            CFUUIDRef displayUuid = CGDisplayCreateUUIDFromDisplayID(m_DisplayTiming.displayId);
+            if (displayUuid != nullptr) {
+                CFStringRef identifier = CFUUIDCreateString(kCFAllocatorDefault, displayUuid);
+                m_CalibrationIdentity = QString("metal:%1:display:%2:min-ns:%3:max-ns:%4:granularity-ns:%5")
+                    .arg(static_cast<qulonglong>(device.registryID))
+                    .arg(QString::fromNSString((NSString*)identifier))
+                    .arg(std::llround(m_DisplayTiming.minimumRefreshInterval * 1000000000))
+                    .arg(std::llround(m_DisplayTiming.maximumRefreshInterval * 1000000000))
+                    .arg(std::llround(m_DisplayTiming.displayUpdateGranularity * 1000000000));
+                CFRelease(identifier);
+                CFRelease(displayUuid);
+            }
+        }
 
         if (m_HwAccel && !checkDecoderCapabilities(device, params)) {
             return false;
@@ -692,11 +1023,9 @@ public:
         }
 
         // Create the Metal texture cache for our CVPixelBuffers
-        CFStringRef keys[1] = { kCVMetalTextureUsage };
-        NSUInteger values[1] = { MTLTextureUsageShaderRead };
-        auto cacheAttributes = CFDictionaryCreate(kCFAllocatorDefault, (const void**)keys, (const void**)values, 1, nullptr, nullptr);
-        err = CVMetalTextureCacheCreate(kCFAllocatorDefault, cacheAttributes, device, nullptr, &m_TextureCache);
-        CFRelease(cacheAttributes);
+        NSDictionary* cacheAttributes = @{ (id)kCVMetalTextureUsage: @(MTLTextureUsageShaderRead) };
+        err = CVMetalTextureCacheCreate(kCFAllocatorDefault, (CFDictionaryRef)cacheAttributes,
+                                       device, nullptr, &m_TextureCache);
 
         if (err != kCVReturnSuccess) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -739,7 +1068,35 @@ public:
             m_MetalLayer.wantsExtendedDynamicRangeContent = !!(params->videoFormat & VIDEO_FORMAT_MASK_10BIT);
 
             // Allow tearing if V-Sync is off (also requires direct display path)
-            m_MetalLayer.displaySyncEnabled = params->enableVsync;
+            m_MetalLayer.displaySyncEnabled = m_VrrEnabled || params->enableVsync;
+            m_MetalLayer.opaque = YES;
+            if (m_VrrEnabled) {
+                // A synchronized layer can retain both the displayed drawable
+                // and the submitted successor. Keep a third slot available for
+                // early preparation; two slots make nextDrawable wait for the
+                // compositor and turn that backpressure into missed VRR targets.
+                // The worker still prepares only one frame at a time and owns
+                // the submission deadline, so this is no extra playout queue.
+                m_MetalLayer.maximumDrawableCount = 3;
+                m_MetalLayer.allowsNextDrawableTimeout = YES;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Metal VRR layer: %.0fx%.0f pixels, bounds %.0fx%.0f, %lu drawables, transaction %d",
+                            m_MetalLayer.drawableSize.width, m_MetalLayer.drawableSize.height,
+                            m_MetalLayer.bounds.size.width, m_MetalLayer.bounds.size.height,
+                            (unsigned long)m_MetalLayer.maximumDrawableCount, m_MetalLayer.presentsWithTransaction);
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Metal VRR display: maximum %d Hz, interval %.3f-%.3f ms, granularity %.3f ms",
+                            m_DisplayTiming.maximumFramesPerSecond,
+                            m_DisplayTiming.minimumRefreshInterval * 1000,
+                            m_DisplayTiming.maximumRefreshInterval * 1000,
+                            m_DisplayTiming.displayUpdateGranularity * 1000);
+                const bool lowPower = NSProcessInfo.processInfo.lowPowerModeEnabled;
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Metal VRR power state: low power %d", lowPower);
+                if (lowPower) {
+                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                                "Low Power Mode may limit adaptive presentation despite the advertised display refresh range");
+                }
+            }
         }
 
         return true;
@@ -809,6 +1166,9 @@ public:
 
     void startDisplayLink()
     {
+        if (m_VrrEnabled) {
+            return; // The shared VRR worker owns cadence and drawable presentation.
+        }
         if (@available(macOS 14, *)) {
             if (m_MetalDisplayLink != nullptr || !m_MetalLayer.displaySyncEnabled || !isAppleSilicon()) {
                 return;
@@ -897,6 +1257,24 @@ public:
 
     bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info) override
     {
+        if (m_VrrEnabled && (info->stateChangeFlags & WINDOW_STATE_CHANGE_SIZE)) {
+            const auto timing = queryMacDisplayTiming(m_Window);
+            // Native Spaces exit and rate-range changes may arrive as size
+            // events. Keep eligibility and persisted readiness in one epoch.
+            if (!timing.nativeFullscreen || !timing.hasValidTiming() ||
+                    timing.maximumFramesPerSecond != m_DisplayTiming.maximumFramesPerSecond ||
+                    timing.displayId != m_DisplayTiming.displayId ||
+                    std::abs(timing.minimumRefreshInterval - m_DisplayTiming.minimumRefreshInterval) > 1e-9 ||
+                    std::abs(timing.maximumRefreshInterval - m_DisplayTiming.maximumRefreshInterval) > 1e-9 ||
+                    std::abs(timing.displayUpdateGranularity - m_DisplayTiming.displayUpdateGranularity) > 1e-9) {
+                return false;
+            }
+        }
+        if (m_VrrEnabled && (info->stateChangeFlags & WINDOW_STATE_CHANGE_DISPLAY)) {
+            // Recreate on any display change, even if the new screen has the
+            // same maximum Hz. Its variable range and drawable epoch may differ.
+            return false;
+        }
         auto unhandledStateFlags = info->stateChangeFlags;
 
         // We can always handle size changes
@@ -942,6 +1320,16 @@ private:
     AVBufferRef* m_HwContext;
     CAMetalLayer* m_MetalLayer;
     CAMetalDisplayLink* m_MetalDisplayLink API_AVAILABLE(macos(14.0));
+    bool m_VrrEnabled;
+    bool m_VrrSuspended;
+    bool m_FixedVsyncEnabled;
+    bool m_RendererFailed;
+    QString m_CalibrationIdentity;
+    MacDisplayTiming m_DisplayTiming;
+    id<CAMetalDrawable> m_PreparedDrawable;
+    VrrPresentFeedback m_PreparedFeedback;
+    uint64_t m_NextSubmissionId;
+    std::shared_ptr<MetalPresentationObservation> m_PresentationObservation;
     CAFrameRateRange m_FrameRateRange;
     AVFrame* m_LatestUnrenderedFrame;
     SDL_mutex* m_FrameLock;
@@ -956,6 +1344,9 @@ private:
     id<MTLLibrary> m_ShaderLibrary;
     id<MTLCommandQueue> m_CommandQueue;
     id<MTLTexture> m_SwMappingTextures[MAX_VIDEO_PLANES];
+#ifdef HAVE_PYROWAVE
+    std::unique_ptr<PyroWaveMetalPool> m_PyroWavePool;
+#endif
     SDL_MetalView m_MetalView;
     int m_LastFrameWidth;
     int m_LastFrameHeight;

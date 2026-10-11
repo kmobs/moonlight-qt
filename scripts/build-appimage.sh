@@ -1,4 +1,7 @@
 BUILD_CONFIG="release"
+BUILD_JOBS=${BUILD_JOBS:-$(python3 scripts/linux-build-budget.py --jobs)}
+[[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid BUILD_JOBS' >&2; exit 1; }
+export MAKEFLAGS="-j$BUILD_JOBS"
 
 fail()
 {
@@ -33,9 +36,11 @@ mkdir $DEPLOY_FOLDER
 mkdir $INSTALLER_FOLDER
 
 # Enable LTO for official builds
-export CFLAGS=-flto=auto
-export CXXFLAGS=-flto=auto
-export LDFLAGS=-flto=auto
+# Each make worker may link a separate target; keep LTO from spawning another
+# full CPU-sized pool inside every link. LTO remains enabled.
+export CFLAGS="-flto=1"
+export CXXFLAGS="-flto=1"
+export LDFLAGS="-flto=1"
 
 echo Configuring the project
 pushd $BUILD_FOLDER
@@ -46,12 +51,15 @@ pushd $BUILD_FOLDER
 # work even in X11. To avoid this, we will disable Wayland support for the AppImage.
 #
 # We disable DRM support because linuxdeploy doesn't bundle the appropriate libraries for Qt EGLFS.
-qmake6 $SOURCE_ROOT/moonlight-qt.pro CONFIG+=disable-wayland CONFIG+=disable-libdrm PREFIX=$DEPLOY_FOLDER/usr DEFINES+=APP_IMAGE || fail "Qmake failed!"
+compiler_args=()
+if [ -n "${CC:-}" ]; then compiler_args+=("QMAKE_CC=$CC"); fi
+if [ -n "${CXX:-}" ]; then compiler_args+=("QMAKE_CXX=$CXX"); fi
+qmake6 $SOURCE_ROOT/moonlight-qt.pro CONFIG+=disable-wayland CONFIG+=disable-libdrm PREFIX=$DEPLOY_FOLDER/usr DEFINES+=APP_IMAGE "${compiler_args[@]}" || fail "Qmake failed!"
 popd
 
 echo Compiling Moonlight in $BUILD_CONFIG configuration
 pushd $BUILD_FOLDER
-make -j$(nproc) $(echo "$BUILD_CONFIG" | tr '[:upper:]' '[:lower:]') || fail "Make failed!"
+make -j"$BUILD_JOBS" $(echo "$BUILD_CONFIG" | tr '[:upper:]' '[:lower:]') || fail "Make failed!"
 popd
 
 echo Deploying to staging directory

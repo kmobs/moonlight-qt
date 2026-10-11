@@ -68,6 +68,16 @@ if [ "$BUILD_CONFIG" == "Debug" ]; then EXTRA_ARGS="$EXTRA_ARGS -use-debug-libs"
 echo Extra deployment arguments: $EXTRA_ARGS
 macdeployqt $BUILD_FOLDER/app/Moonlight.app $EXTRA_ARGS -qmldir=$SOURCE_ROOT/app/gui -appstore-compliant || fail "macdeployqt failed!"
 
+# Apple bundle versions remain numeric; nightly identity and source are explicit.
+if [[ "$VERSION" =~ ^6\.[12]\.0-daily\.([1-9][0-9]*)$ ]]; then
+  NIGHTLY_SEQUENCE="${BASH_REMATCH[1]}"
+  NIGHTLY_SOURCE=$(git rev-parse HEAD) || fail "Could not resolve nightly source"
+  PLIST="$BUILD_FOLDER/app/Moonlight.app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 6.2.$NIGHTLY_SEQUENCE" "$PLIST" || fail "Could not set nightly bundle version"
+  /usr/libexec/PlistBuddy -c "Add :MoonlightNightlyVersion string $VERSION" "$PLIST" || fail "Could not set nightly identity"
+  /usr/libexec/PlistBuddy -c "Add :MoonlightSourceCommit string $NIGHTLY_SOURCE" "$PLIST" || fail "Could not set nightly source"
+fi
+
 echo Removing dSYM files from app bundle
 find $BUILD_FOLDER/app/Moonlight.app/ -name '*.dSYM' | xargs rm -rf
 
