@@ -658,6 +658,13 @@ NvHTTP::openConnection(QUrl baseUrl,
     // Run the request with a timeout if requested
     QEventLoop loop;
     QString headerError;
+    bool completeProbeBody = false;
+    if (command == "pyrowave-udp-probe") {
+        connect(reply, &QNetworkReply::readyRead, &loop, [&] {
+            completeProbeBody = PyroWaveUdp::completeCloseDelimitedResponse(*reply);
+            if (completeProbeBody) loop.quit();
+        });
+    }
     if (receiveHeaders) {
         connect(reply, &QNetworkReply::metaDataChanged, &loop, [&] {
             const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -678,7 +685,7 @@ NvHTTP::openConnection(QUrl baseUrl,
     loop.exec(QEventLoop::ExcludeUserInputEvents);
 
     // Abort the request if it timed out
-    if (!reply->isFinished())
+    if (!reply->isFinished() && !completeProbeBody)
     {
         if (logLevel >= NvLogLevel::NVLL_ERROR) {
             qWarning() << "Aborting timed out request for" << url.toString();
@@ -738,5 +745,8 @@ NvHTTP::openConnection(QUrl baseUrl,
         }
     }
 
+    // A complete close-delimited probe body may precede HTTP EOF on older
+    // handshake hosts. The caller reads/validates it and deletes the reply,
+    // closing that connection; all ordinary requests still require finished().
     return reply;
 }

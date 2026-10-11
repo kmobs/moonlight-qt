@@ -18,6 +18,14 @@ enum class TimingGraphDisplayKind { DisplayEvent, ConfirmedRefresh };
 struct TimingGraphInput {
     uint64_t submissionUs = 0, targetUs = 0, sourcePeriodUs = 0;
     uint64_t bufferUs = 0, requestedBufferUs = 0, toleranceUs = 0;
+    // Adaptive input coverage uses the controller's exact eligible observation,
+    // not GPU readiness sampled after queueing. These are diagnostics only.
+    int64_t producerRequiredUs = 0;
+    uint64_t inputTargetUs = 0, inputProbabilityPpm = 0, inputWindowUs = 0, inputToleranceUs = 0, inputVrrHeadroomUs = 0;
+    uint64_t inputSamples = 0, inputAbsorbed = 0, inputMissed = 0, trajectoryCarryUs = 0;
+    bool inputPercentileEnabled = false, producerEligible = false;
+    bool inputTargetValid = false, inputTargetCapped = false;
+
     uint64_t submissionId = 0, displayId = 0, displayUs = 0;
     uint64_t preparationReadyUs = 0;
     // Raw DXGI evidence remains separate from an actual display event. QPC
@@ -36,6 +44,14 @@ struct TimingGraphInput {
 struct TimingGraphPoint {
     uint64_t submissionUs = 0, targetUs = 0, targetIntervalUs = 0, submissionIntervalUs = 0;
     uint64_t sourcePeriodUs = 0, bufferUs = 0, requestedBufferUs = 0, toleranceUs = 0;
+    // Adaptive input coverage uses the controller's exact eligible observation,
+    // not GPU readiness sampled after queueing. These are diagnostics only.
+    int64_t producerRequiredUs = 0;
+    uint64_t inputTargetUs = 0, inputProbabilityPpm = 0, inputWindowUs = 0, inputToleranceUs = 0, inputVrrHeadroomUs = 0;
+    uint64_t inputSamples = 0, inputAbsorbed = 0, inputMissed = 0, trajectoryCarryUs = 0;
+    bool inputPercentileEnabled = false, producerEligible = false;
+    bool inputTargetValid = false, inputTargetCapped = false;
+
     uint64_t submissionId = 0, displayUs = 0, generation = 0;
     uint64_t preparationReadyUs = 0;
     TimingGraphDisplayKind displayKind = TimingGraphDisplayKind::DisplayEvent;
@@ -69,7 +85,7 @@ struct TimingGraphLayout {
     static constexpr int BufferLane = Lanes;
     static constexpr int Width = 800, Left = 76, RightMargin = 14;
     static constexpr int LaneTop = 32, LaneSpacing = 78, PlotOffset = 24, PlotHeight = 46;
-    static constexpr int Height = LaneTop + (Lanes + 1) * LaneSpacing + 98;
+    static constexpr int Height = LaneTop + (Lanes + 1) * LaneSpacing + 178;
     static constexpr double RadiusUs = 2000.0;
     // Deviations this small are not noticeable at typical VRR rates; they are
     // drawn on the reference line so only noticeable disturbances stand out.
@@ -88,19 +104,36 @@ enum class TimingGraphLane { Target, Submit, Display };
 struct BufferGraphSample {
     double networkUs = 0, decoderOutputUs = 0, decoderReadyUs = 0, bufferUs = 0;
     bool valid = false, networkValid = false, outputValid = false, readyValid = false;
-    bool absorbed() const { return readyValid && decoderReadyUs <= bufferUs; }
+    // Adaptive stage coverage honors the explicitly selected input allowance; legacy stays strict.
+    double bufferLimitUs = 0;
+    bool absorbed() const { return readyValid && decoderReadyUs <= bufferLimitUs; }
+    double producerUs = 0;
+    bool producerValid = false;
+    uint64_t producerHeadroomUs = 0, appliedBufferUs = 0;
+    bool producerAbsorbed() const { return producerValid && producerHeadroomUs <= appliedBufferUs; }
+    bool producerMissed() const { return producerValid && producerHeadroomUs > appliedBufferUs; }
 };
 
 inline BufferGraphSample bufferGraphSample(const TimingGraphPoint& p)
 {
     BufferGraphSample s;
+    // Applied delay and its allowance remain known even during a mapping reset.
+    s.bufferUs = double(p.bufferUs);
+    s.bufferLimitUs = s.bufferUs + (p.inputPercentileEnabled ? double(p.inputToleranceUs) : 0);
+    s.appliedBufferUs = p.bufferUs;
     if (!p.sourceTimingValid || !p.sourceTimeUs) return s;
     const auto relative = [&](uint64_t at) {
         const double raw = at >= p.sourceTimeUs ? double(at - p.sourceTimeUs) : -double(p.sourceTimeUs - at);
         return raw - double(p.cadenceRetimingUs);
     };
     s.valid = true;
-    s.bufferUs = double(p.bufferUs);
+    const uint64_t required = p.producerRequiredUs > 0 ? uint64_t(p.producerRequiredUs) : 0;
+    const uint64_t excess = required - std::min(required, p.inputToleranceUs);
+    s.producerHeadroomUs = excess - std::min(excess, p.inputVrrHeadroomUs);
+    // Keep the stored original requirement; plot the same free VRR credit
+    // used by the controller before comparing with actual B + tolerance.
+    s.producerUs = double(p.producerRequiredUs) - double(p.inputVrrHeadroomUs);
+    s.producerValid = p.inputPercentileEnabled && p.producerEligible;
     s.networkValid = p.networkReadyUs != 0;
     s.outputValid = p.decoderOutputUs != 0 && (!s.networkValid || p.decoderOutputUs >= p.networkReadyUs);
     s.readyValid = p.decoderReadyUs != 0 && s.outputValid && p.decoderReadyUs >= p.decoderOutputUs;
@@ -151,7 +184,10 @@ public:
         if (!at || at == m_LastAtUs) return;
         // Different tolerance means a different hitch definition; do not mix
         // counts from profiles or retain samples from a restarted local clock.
-        if (at < m_LastAtUs || p.toleranceUs != m_ToleranceUs) m_Buckets->fill({});
+        const uint64_t coverageTolerance = p.inputPercentileEnabled ? p.inputToleranceUs : 0;
+        if (at < m_LastAtUs || p.toleranceUs != m_ToleranceUs || coverageTolerance != m_CoverageToleranceUs)
+            m_Buckets->fill({});
+        m_CoverageToleranceUs = coverageTolerance;
         m_ToleranceUs = p.toleranceUs;
         m_LastAtUs = at;
         const uint64_t tick = at / BucketUs;
@@ -172,7 +208,7 @@ public:
         else {
             ++stats.missed;
             stats.worstExcessUs = std::max(stats.worstExcessUs,
-                uint64_t(std::ceil(s.decoderReadyUs - s.bufferUs)));
+                uint64_t(std::ceil(s.decoderReadyUs - s.bufferLimitUs)));
         }
     }
     BufferHitchStats snapshot(uint64_t atUs = 0) const {
@@ -193,7 +229,7 @@ private:
     struct Bucket { uint64_t tick = 0; BufferHitchStats stats; };
     std::unique_ptr<std::array<Bucket, Buckets>> m_Buckets =
         std::make_unique<std::array<Bucket, Buckets>>();
-    uint64_t m_LastAtUs = 0, m_ToleranceUs = 0;
+    uint64_t m_LastAtUs = 0, m_ToleranceUs = 0, m_CoverageToleranceUs = 0;
 };
 
 class TimingGraphHistory {
@@ -225,6 +261,16 @@ public:
             p.preparationReadyUs = in.preparationReadyUs;
             p.sourcePeriodUs = in.sourcePeriodUs; p.bufferUs = in.bufferUs;
             p.requestedBufferUs = in.requestedBufferUs;
+            p.producerRequiredUs = in.producerRequiredUs;
+            p.producerEligible = in.producerEligible;
+            p.inputPercentileEnabled = in.inputPercentileEnabled;
+            p.inputTargetUs = in.inputTargetUs; p.inputTargetValid = in.inputTargetValid;
+            p.inputTargetCapped = in.inputTargetCapped;
+            p.inputProbabilityPpm = in.inputProbabilityPpm; p.inputWindowUs = in.inputWindowUs;
+            p.inputToleranceUs = in.inputToleranceUs;
+            p.inputVrrHeadroomUs = in.inputVrrHeadroomUs;
+            p.inputSamples = in.inputSamples; p.inputAbsorbed = in.inputAbsorbed;
+            p.inputMissed = in.inputMissed; p.trajectoryCarryUs = in.trajectoryCarryUs;
             p.toleranceUs = in.toleranceUs;
             p.sourceTimeUs = in.sourceTimeUs; p.cadenceRetimingUs = in.cadenceRetimingUs;
             p.sourceTimingValid = in.sourceTimingValid;

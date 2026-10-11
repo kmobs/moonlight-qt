@@ -206,6 +206,12 @@ pyrowave_device_set_frame_contexts(pyrowave_device device, unsigned count);
 PYROWAVE_PUBLIC_API bool
 pyrowave_device_confirm_interop_support(pyrowave_device device);
 
+// Windows D3D11 decoder imports, for the selected R8/R16 plane format only.
+// Generic interop support above retains its broader consumer requirements.
+// On failure, reason receives a static diagnostic string when non-null.
+PYROWAVE_PUBLIC_API bool
+pyrowave_device_confirm_d3d11_interop_support(pyrowave_device device, VkFormat format, const char **reason);
+
 // All encoders and decoders must have been destroyed before destroying the device.
 PYROWAVE_PUBLIC_API void pyrowave_device_destroy(pyrowave_device device);
 ////

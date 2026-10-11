@@ -919,6 +919,19 @@ int main(int argc, char *argv[])
 
     // Apply the initial translation based on user preference
     StreamingPreferences::get()->retranslate();
+    // Read-only launch verification: resolve actual saved preferences, then exit
+    // before creating the window, computer manager or any streaming session.
+    if (qEnvironmentVariable("MOONLIGHT_VRR_REPORT_PROFILE") == "1") {
+        const auto* preferences = StreamingPreferences::get();
+        const auto options = preferences->vrrTimingOptions().resolved(preferences->vrrLatencyMode);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Effective VRR profile: mode=%d target_basis_points=%d smoothness=%.2f%% input_percentile_ppm=%llu history_seconds=%d adaptive=%d; session snapshot, changes apply to next stream",
+            preferences->vrrLatencyMode, options.targetHundredths, options.targetHundredths / 100.0,
+            static_cast<unsigned long long>(uint64_t(options.targetHundredths) * 100), options.historySeconds,
+            qEnvironmentVariable("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER") != "0");
+        return 0;
+    }
+
 
     // Trickily declare the translation for dialog buttons
     QCoreApplication::translate("QPlatformTheme", "&Yes");

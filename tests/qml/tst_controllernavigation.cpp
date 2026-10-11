@@ -129,6 +129,39 @@ private slots:
         QCOMPARE(window.keys[0].key, int(Qt::Key_Space));
         QCOMPARE(window.keys[1].key, int(Qt::Key_Space));
     }
+    void dpadOnePressOneRelease() {
+        navigation->setUiNavMode(true);
+        button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+        QCOMPARE(window.keys.size(), 0);
+        button(SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+        button(SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+        QCOMPARE(window.keys.size(), 1);
+        button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+        QCOMPARE(window.keys.size(), 2);
+        QCOMPARE(window.keys[0].key, int(Qt::Key_Left));
+        QCOMPARE(window.keys[1].key, int(Qt::Key_Left));
+        for (int i = 0; i < 10; ++i) {
+            button(SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+            button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+        }
+        QCOMPARE(window.keys.size(), 22);
+    }
+    void focusResetClosesPressAndDiscardsStrayRelease() {
+        navigation->setUiNavMode(true);
+        button(SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLER_BUTTON_DPAD_UP);
+        navigation->setUiNavMode(false);
+        navigation->notifyWindowFocus(false);
+        QCOMPARE(window.keys.size(), 2);
+        QCOMPARE(window.keys[1].type, QEvent::KeyRelease);
+        QCOMPARE(window.keys[1].key, int(Qt::Key_Tab));
+        QCOMPARE(window.keys[1].modifiers, Qt::KeyboardModifiers(Qt::ShiftModifier));
+        button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_DPAD_UP);
+        QCOMPARE(window.keys.size(), 2);
+        button(SDL_CONTROLLERBUTTONDOWN, SDL_CONTROLLER_BUTTON_DPAD_UP);
+        button(SDL_CONTROLLERBUTTONUP, SDL_CONTROLLER_BUTTON_DPAD_UP);
+        QCOMPARE(window.keys.size(), 4);
+        QCOMPARE(window.keys[2].key, int(Qt::Key_Up));
+    }
     void cleanupTestCase() {
         for (auto* joystick : virtualControllers) SDL_JoystickClose(joystick);
         navigation.reset();

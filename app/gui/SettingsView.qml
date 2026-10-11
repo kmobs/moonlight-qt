@@ -18,6 +18,18 @@ Flickable {
         id: calibrationHosts
         Component.onCompleted: initialize(ComputerManager)
     }
+    CalibrationHostSelection {
+        id: calibrationSelection
+        hosts: calibrationHosts.onlineHosts
+        testedUuid: calibrationDialog.testedHostUuid
+        onTestedHostUnavailable: {
+            calibrationDialog.hasStarted = false
+            if (PyroWaveCalibrator.running) {
+                calibrationDialog.stopRequested = true
+                PyroWaveCalibrator.cancel()
+            }
+        }
+    }
     objectName: qsTr("Settings")
 
     signal languageChanged()
@@ -921,7 +933,7 @@ Flickable {
                     property bool hasStarted: false
                     property bool stopRequested: false
                     readonly property int selectedTarget: targets[targetIndex].value
-                    readonly property string selectedHostUuid: calibrationHost.currentIndex >= 0 ? calibrationHosts.uuidAt(calibrationHost.currentIndex) : ""
+                    readonly property string selectedHostUuid: calibrationSelection.selectedUuid
                     readonly property bool resultsMatch: hasStarted && testedTarget === selectedTarget && testedHostUuid === selectedHostUuid
                     readonly property var targets: [
                         { text: qsTr("Minimum"), summary: qsTr("Half recommendation"), value: PyroWaveCalibrator.Minimum,
@@ -947,7 +959,6 @@ Flickable {
                     onAboutToShow: {
                         PyroWaveCalibrator.reset()
                         step = 0
-                        if (calibrationHost.count > 0 && calibrationHost.currentIndex < 0) calibrationHost.currentIndex = 0
                         decoderWasRunning = false
                         testFps = StreamingPreferences.fps
                         testedTarget = -1
@@ -989,7 +1000,7 @@ Flickable {
                     }
 
                     function testTarget() {
-                        if (PyroWaveCalibrator.running || calibrationHost.currentIndex < 0) return
+                        if (PyroWaveCalibrator.running || calibrationSelection.currentIndex < 0) return
                         testedTarget = selectedTarget
                         testedHostUuid = selectedHostUuid
                         hasStarted = true
@@ -1164,7 +1175,7 @@ Flickable {
                                 text: PyroWaveCalibrator.running ? (calibrationDialog.stopRequested ? qsTr("Stopping…") : qsTr("Stop test")) :
                                       calibrationDialog.step === 0 ? qsTr("Test bandwidth") : qsTr("Test decoder again")
                                 enabled: PyroWaveCalibrator.running ? !calibrationDialog.stopRequested :
-                                         calibrationDialog.step === 0 ? calibrationHost.currentIndex >= 0 : calibrationDialog.canContinue
+                                         calibrationDialog.step === 0 ? calibrationSelection.currentIndex >= 0 : calibrationDialog.canContinue
                                 implicitHeight: 44
                                 highlighted: calibrationDialog.step === 0 && !calibrationDialog.canContinue
                                 onClicked: {
@@ -1259,11 +1270,12 @@ Flickable {
                                         id: calibrationHost
                                         objectName: "pyrowaveCalibrationHost"
                                         Layout.fillWidth: true
-                                        model: calibrationHosts
+                                        model: calibrationSelection.hosts
                                         textRole: "name"
-                                        onCountChanged: { if (count > 0 && currentIndex < 0) currentIndex = 0 }
-                                        displayText: count > 0 ? currentText : qsTr("No hosts available")
-                                        enabled: !PyroWaveCalibrator.running
+                                        currentIndex: calibrationSelection.currentIndex
+                                        onActivated: calibrationSelection.select(index)
+                                        displayText: count > 0 ? currentText : qsTr("No online hosts available")
+                                        enabled: count > 0 && !PyroWaveCalibrator.running
                                         // Closed selectors use Tab for controller focus traversal.
                                         // An open popup owns arrow keys for selecting a host.
                                         KeyNavigation.backtab: calibrationCloseButton
@@ -1386,7 +1398,9 @@ Flickable {
                                                 Layout.minimumHeight: fontMetrics.height * 3
                                                 verticalAlignment: Text.AlignTop
                                                 wrapMode: Text.Wrap
-                                                text: !calibrationDialog.hasStarted ? qsTr("Ready to test your connection.") :
+                                                text: PyroWaveCalibrator.running && !calibrationSelection.testedHostAvailable ? qsTr("Host went offline. Stopping test…") :
+                                                      calibrationSelection.currentIndex < 0 ? qsTr("No online hosts available. Waiting for discovery.") :
+                                                      !calibrationDialog.hasStarted ? qsTr("Ready to test your connection.") :
                                                       !calibrationDialog.resultsMatch ? qsTr("Selection changed. Test bandwidth again to continue.") : PyroWaveCalibrator.message
                                             }
                                             Label {

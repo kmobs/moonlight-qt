@@ -44,22 +44,20 @@ export LDFLAGS="-flto=1"
 
 echo Configuring the project
 pushd $BUILD_FOLDER
-# Building with Wayland support will cause linuxdeploy to include libwayland-client.so in the AppImage.
-# Since we always use the host implementation of EGL, this can cause libEGL_mesa.so to fail to load due
-# to missing symbols from the host's version of libwayland-client.so that aren't present in the older
-# version of libwayland-client.so from our AppImage build environment. When this happens, EGL fails to
-# work even in X11. To avoid this, we will disable Wayland support for the AppImage.
-#
+# Native Wayland feedback requires Moonlight, SDL and matching Qt Wayland plugins.
+# Use host libwayland with host Mesa/EGL: an older bundled libwayland can hide
+# symbols required by the host Mesa implementation, breaking EGL even on X11.
 # We disable DRM support because linuxdeploy doesn't bundle the appropriate libraries for Qt EGLFS.
 compiler_args=()
 if [ -n "${CC:-}" ]; then compiler_args+=("QMAKE_CC=$CC"); fi
 if [ -n "${CXX:-}" ]; then compiler_args+=("QMAKE_CXX=$CXX"); fi
-qmake6 $SOURCE_ROOT/moonlight-qt.pro CONFIG+=disable-wayland CONFIG+=disable-libdrm PREFIX=$DEPLOY_FOLDER/usr DEFINES+=APP_IMAGE "${compiler_args[@]}" || fail "Qmake failed!"
+qmake6 $SOURCE_ROOT/moonlight-qt.pro CONFIG+=disable-libdrm PREFIX=$DEPLOY_FOLDER/usr DEFINES+=APP_IMAGE "${compiler_args[@]}" || fail "Qmake failed!"
 popd
 
 echo Compiling Moonlight in $BUILD_CONFIG configuration
 pushd $BUILD_FOLDER
 make -j"$BUILD_JOBS" $(echo "$BUILD_CONFIG" | tr '[:upper:]' '[:lower:]') || fail "Make failed!"
+grep -q -- '-DHAS_WAYLAND' app/Makefile.Release || fail "Native Wayland feedback was not compiled"
 popd
 
 echo Deploying to staging directory
@@ -69,12 +67,22 @@ popd
 
 export QML_SOURCES_PATHS=$SOURCE_ROOT/app/gui
 export QMAKE=qmake6
+export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
+export EXTRA_QT_MODULES='waylandclient;waylandcompositor'
 
 echo Creating AppImage
 pushd $INSTALLER_FOLDER
-VERSION=$VERSION $LINUXDEPLOY --appdir $DEPLOY_FOLDER \
+host_libraries=(--exclude-library='libwayland-*.so*' --exclude-library='libEGL*.so*' --exclude-library='libGLX_mesa.so*')
+# Deploy Qt before creating the image: the Qt plugin may copy dependencies even
+# when the main deployer excludes them. Remove only host ABI libraries in this
+# known staging directory, then maintain exclusions during final AppDir scanning.
+$LINUXDEPLOY --appdir $DEPLOY_FOLDER \
   --library=/usr/local/lib/libSDL3.so.0 \
-  --plugin qt --output appimage || fail "linuxdeploy failed!"
+  "${host_libraries[@]}" --plugin qt || fail "linuxdeploy Qt staging failed!"
+find "$DEPLOY_FOLDER/usr/lib" -maxdepth 1 \
+  \( -name 'libwayland-*.so*' -o -name 'libEGL*.so*' -o -name 'libGLX_mesa.so*' \) -delete
+VERSION=$VERSION $LINUXDEPLOY --appdir $DEPLOY_FOLDER \
+  "${host_libraries[@]}" --output appimage || fail "linuxdeploy AppImage creation failed!"
 popd
 
 echo Build successful

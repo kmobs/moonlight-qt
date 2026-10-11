@@ -40,6 +40,7 @@ VrrTimingParameters legacyPresetParameters(const VrrSessionConfig& session)
 {
     auto policy = vrrTimingParametersForSession(session);
     const int mode = session.latencyMode;
+    policy.playoutAbsorbedJitterRelease = 0;
     policy.playoutIntervalToleranceUs = 0;
     policy.latencyFixEnabled = session.latencyFix || mode != 0;
     policy.latencyFixAllRates = mode != 0;
@@ -6106,9 +6107,8 @@ void testPresetIntervalTolerances()
         controller.notePreparationDuration(1000, 0, 101000);
         controller.noteSubmission(true, false, decision.targetUs);
 
-        const uint64_t expected = mode == 0 ? 250 : 500;
-        expect(controller.intervalStats().toleranceUs == expected,
-               "Smooth must use 0.25 ms interval tolerance while other presets use 0.5 ms");
+        expect(controller.intervalStats().toleranceUs == 500,
+               "every preset, including Smooth (revision 3), must use 0.5 ms interval tolerance");
     }
 }
 

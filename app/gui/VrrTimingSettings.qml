@@ -16,7 +16,7 @@ GroupBox {
     signal toleranceEdited(int value)
     readonly property int presetIndex: bufferPerMille === 500 && targetHundredths === 9900 && historySeconds === 60 && toleranceUs === 500 ? 0 :
                                        bufferPerMille === 1000 && targetHundredths === 9950 && historySeconds === 120 && toleranceUs === 500 ? 1 :
-                                       bufferPerMille === 4000 && targetHundredths === 9995 && historySeconds === 300 && toleranceUs === 250 ? 2 : 3
+                                       bufferPerMille === 4000 && targetHundredths === 9995 && historySeconds === 300 && toleranceUs === 500 ? 2 : 3
 
     ColumnLayout {
         width: parent.width
@@ -110,10 +110,27 @@ GroupBox {
             from: 250; to: 2000; stepSize: 250
             value: root.toleranceUs
             editable: false
+            Component.onCompleted: {
+                // The style's text item can receive controller arrows even
+                // when editing is disabled. Reserve the entire key event.
+                contentItem.Keys.priority = Keys.BeforeItem
+                contentItem.Keys.leftPressed.connect(function(event) { tolerance.Keys.leftPressed(event) })
+                contentItem.Keys.rightPressed.connect(function(event) { tolerance.Keys.rightPressed(event) })
+                contentItem.Keys.released.connect(function(event) { tolerance.Keys.released(event) })
+            }
             textFromValue: function(value, locale) { return Number(value / 1000).toLocaleString(locale, 'f', 2) }
             onValueModified: root.toleranceEdited(value)
-            Keys.onLeftPressed: root.toleranceEdited(Math.max(from, value - stepSize))
-            Keys.onRightPressed: root.toleranceEdited(Math.min(to, value + stepSize))
+            Keys.onLeftPressed: function(event) {
+                event.accepted = true
+                root.toleranceEdited(Math.max(from, value - stepSize))
+            }
+            Keys.onRightPressed: function(event) {
+                event.accepted = true
+                root.toleranceEdited(Math.min(to, value + stepSize))
+            }
+            Keys.onReleased: function(event) {
+                if (event.key === Qt.Key_Left || event.key === Qt.Key_Right) event.accepted = true
+            }
             Accessible.name: qsTr("Interval tolerance in milliseconds")
         }
         Label {

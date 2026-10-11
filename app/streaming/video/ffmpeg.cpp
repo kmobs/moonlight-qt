@@ -1,5 +1,6 @@
 #include <Limelight.h>
 #include "ffmpeg.h"
+#include "performancestats.h"
 #include "videothreadpriority.h"
 #include "utils.h"
 #include "streaming/session.h"
@@ -1222,15 +1223,14 @@ void FFmpegVideoDecoder::finalizeActiveVideoStats()
     SDL_zero(m_ActiveWndVideoStats);
 }
 
-void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, int length)
+void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, int length, bool detailed)
 {
     int offset = 0;
     const char* codecString;
     int ret;
-    // Match the worker's deep-trace switch, including Settings-enabled tracing.
-    // SDL2-compat may cache an older environment from before the connection.
-    const bool advancedStats = qEnvironmentVariable("MOONLIGHT_VRR_DEEP_TRACE")
-        .startsWith(QLatin1Char('1'));
+    // Trace capture and overlay presentation are independent. The overlay keeps
+    // Moonlight's stats plus a short VRR summary; the log gets the breakdown.
+    const bool advancedStats = detailed;
 
     // Start with an empty string
     output[offset] = 0;
@@ -1393,16 +1393,22 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             snprintf(rttString, sizeof(rttString), "N/A");
         }
 
+        // The overlay keeps Moonlight's original rows; the log adds decoder skips.
+        char skipped[64] = "";
+        if (advancedStats) {
+            snprintf(skipped, sizeof(skipped), "Frames skipped before decoding: %.2f%%\n",
+                     (float)stats.decoderSkippedFrames / stats.totalFrames * 100);
+        }
         ret = snprintf(&output[offset],
                        length - offset,
                        "Frames dropped by your network connection: %.2f%%\n"
                        "Frames dropped by client pacing: %.2f%%\n"
-                       "Frames skipped before decoding: %.2f%%\n"
+                       "%s"
                        "Average network latency: %s\n"
                        "Average decoding time: %.2f ms (waiting for the decoder %.2f ms)\n",
                        (float)stats.networkDroppedFrames / stats.totalFrames * 100,
                        (float)stats.pacerDroppedFrames / stats.decodedFrames * 100,
-                       (float)stats.decoderSkippedFrames / stats.totalFrames * 100,
+                       skipped,
                        rttString,
                        (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames,
                        (double)(stats.totalDecodeQueueTimeUs / 1000.0) / stats.decodedFrames);
@@ -1425,26 +1431,47 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
         }
     }
 
-    if (stats.incomingTimingValid) {
-        const double smoothPercent = IncomingFrameTiming::smoothnessPercent(
-            stats.incomingTimingVarianceTicksSquared);
-        ret = snprintf(&output[offset], length - offset,
-                       "Incoming smoothness (host): %.2f%%\n", smoothPercent);
+    // Host cadence remains useful in the compact overlay as well as the log.
+    {
+        if (stats.incomingTimingValid) {
+            const double smoothPercent = IncomingFrameTiming::smoothnessPercent(
+                stats.incomingTimingVarianceTicksSquared);
+            ret = snprintf(&output[offset], length - offset,
+                           "Incoming smoothness (host): %.2f%%\n", smoothPercent);
+        }
+        else {
+            ret = snprintf(&output[offset], length - offset,
+                           "Incoming smoothness (host): N/A\n");
+        }
+        if (ret < 0 || ret >= length - offset) {
+            SDL_assert(false);
+            return;
+        }
+        offset += ret;
     }
-    else {
-        ret = snprintf(&output[offset], length - offset,
-                       "Incoming smoothness (host): N/A\n");
-    }
-    if (ret < 0 || ret >= length - offset) {
-        SDL_assert(false);
-        return;
-    }
-    offset += ret;
 
     if (stats.vrrTelemetryActive || stats.vrrEligibleFrames != 0 ||
             stats.vrrPacingDroppedFrames != 0 ||
             stats.vrrPresentFailedFrames != 0 ||
             stats.vrrPresentCancelledFrames != 0) {
+        if (!advancedStats) {
+            const auto& interval = stats.vrrReadiness.interval;
+            PerformanceStats::Snapshot vrr;
+            vrr.vrr = stats.vrrTelemetryActive;
+            vrr.adaptive = interval.inputPercentileEnabled;
+            vrr.atLimit = stats.vrrBufferAtLimit;
+            vrr.bufferUs = stats.vrrAppliedBufferUs;
+            vrr.targetPpm = stats.vrrOnTimeTargetPerMillion;
+            vrr.toleranceUs = interval.toleranceUs;
+            vrr.nowUs = LiGetMicroseconds();
+            vrr.input = interval.inputPercentile;
+            vrr.clientTimingValid = stats.vrrReadiness.intervalPolicy && interval.evaluatedUs;
+            vrr.clientTimingPercent = vrr.clientTimingValid ? interval.qualityPercent() : 0;
+            vrr.present = interval.present;
+            ret = snprintf(&output[offset], length - offset, "%s", PerformanceStats::formatVrr(vrr).c_str());
+            if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+            return;
+        }
         if (advancedStats && stats.vrrStateSequence && stats.vrrReadiness.intervalPolicy) {
             const auto& interval = stats.vrrReadiness.interval;
             const auto& update = interval.update;
@@ -1469,6 +1496,30 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             case Action::CurrentPressure:
                 reason = "Holding - current frame timing is outside the target";
                 break;
+            case Action::InputPercentileGrow:
+                reason = "Increasing - experimental input percentile needs headroom";
+                break;
+            case Action::InputPercentileRelease:
+                reason = "Shrinking - experimental input percentile needs less headroom";
+                break;
+            case Action::InputPercentileHold:
+                reason = "Steady - profile input percentile met";
+                break;
+            case Action::InputPercentileBackoff:
+                reason = "Shrinking slowly - recent input misses exceed profile allowance";
+                break;
+            case Action::InputPercentileMissHold:
+                snprintf(recovery, sizeof(recovery),
+                         "Paused shrinking - network/decode buffer miss; %.1f s remaining",
+                         update.holdRemainingUs / 1000000.0);
+                reason = recovery;
+                break;
+            case Action::InputPercentileUnknown:
+                reason = "Shrinking - obsolete input evidence expired (unknown workload)";
+                break;
+            case Action::AbsorbedJitterHold:
+                reason = "Holding - smaller buffer predicts input timing errors";
+                break;
             case Action::HistoryHold:
                 reason = "Holding - recent timing errors still affect the score";
                 break;
@@ -1485,7 +1536,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 reason = "Minimum - buffer is at its configured floor";
                 break;
             case Action::NotAbsorbable:
-                reason = "Holding - waiting for a stable workload before adjusting";
+                reason = interval.inputPercentileEnabled ?
+                    "Growth blocked - producer input not qualified; evidence still ages" :
+                    "Holding - waiting for a stable workload before adjusting";
                 break;
             case Action::Cooldown:
                 reason = "Holding - waiting between buffer increases";
@@ -1504,6 +1557,34 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                 stats.vrrTelemetryActive ? "Active" : "Inactive", reason);
             if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
             offset += ret;
+            if (interval.inputPercentileEnabled) {
+                const auto& input = interval.inputPercentile;
+                ret = snprintf(&output[offset], length - offset,
+                    "Adaptive buffer | profile %.2f%% frame-coverage percentile | target %.2f ms | %llu samples / %llu s%s%s\n"
+                    "Window measured frames %llu | absorbed %llu | missed %llu | interval severity score distinct\n"
+                    "Frame lateness %.2f ms | buffer target %.2f ms | tolerance %.2f ms | growth %s\n"
+                    "Release %.1f us/s | last-second inputs %llu / misses %llu | proposed misses %llu\n"
+                    "Network misses %llu | decode misses %llu (stage totals)\n",
+                    input.probabilityPpm / 10000.0, input.targetUs / 1000.0,
+                    static_cast<unsigned long long>(input.samples),
+                    static_cast<unsigned long long>(input.windowUs / 1000000),
+                    input.tailUncertain ? " | tail uncertain" : "",
+                    input.clipped ? " | capped" : "",
+                    static_cast<unsigned long long>(input.recentEligible),
+                    static_cast<unsigned long long>(input.recentAbsorbed),
+                    static_cast<unsigned long long>(input.recentMissed),
+                    input.lastInputRequiredUs / 1000.0, input.headroomTargetUnclippedUs / 1000.0, input.toleranceUs / 1000.0,
+                    input.growthBlocked ? "blocked: timing/capacity unqualified" :
+                        input.lastInputEligible ? "measured frame" : "no measured frame",
+                    input.effectiveFallRateMilliUsPerSecond / 1000.0,
+                    static_cast<unsigned long long>(input.recentReleaseSamples),
+                    static_cast<unsigned long long>(input.recentReleaseMisses),
+                    static_cast<unsigned long long>(input.recentProposedMisses),
+                    static_cast<unsigned long long>(input.cumulativeNetworkMisses),
+                    static_cast<unsigned long long>(input.cumulativeDecoderMisses));
+                if (ret < 0 || ret >= length - offset) { SDL_assert(false); return; }
+                offset += ret;
+            }
         }
         if (stats.vrrReadiness.samples == 0) {
             ret = snprintf(&output[offset],
@@ -1686,7 +1767,7 @@ void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
     if (stats.renderedFps > 0 || stats.renderedFrames != 0 ||
             stats.vrrTelemetryActive) {
         char videoStatsStr[4096];
-        stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
+        stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr), true);
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "\n%s\n------------------\n%s",

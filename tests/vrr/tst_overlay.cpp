@@ -1,5 +1,7 @@
+#include <QFile>
 #include "assertions.h"
 #include "overlaymanager.h"
+#include "performancestats.h"
 #include "../../app/streaming/video/clientpacingwarning.h"
 #include "../../app/streaming/video/pyrowave/pyrowavepacketlosswarning.h"
 #include <QCoreApplication>
@@ -33,7 +35,7 @@ public:
             minInkY.fill(std::numeric_limits<int>::max()); maxInkY.fill(-1);
             if (surface && surface->format->format == SDL_PIXELFORMAT_ARGB8888) {
                 // Cadence, clipped spikes, incoming stages and buffer inks.
-                const std::array<Uint32, 8> palette{
+                const std::array<Uint32, 10> palette{
                     SDL_MapRGBA(surface->format, 190, 198, 210, 255),
                     SDL_MapRGBA(surface->format, 65, 215, 250, 255),
                     SDL_MapRGBA(surface->format, 245, 110, 220, 255),
@@ -41,7 +43,9 @@ public:
                     SDL_MapRGBA(surface->format, 255, 185, 70, 255),
                     SDL_MapRGBA(surface->format, 160, 145, 255, 255),
                     SDL_MapRGBA(surface->format, 135, 145, 160, 255),
-                    SDL_MapRGBA(surface->format, 85, 225, 135, 255)};
+                    SDL_MapRGBA(surface->format, 85, 225, 135, 255),
+                    SDL_MapRGBA(surface->format, 145, 225, 180, 255),
+                    SDL_MapRGBA(surface->format, 245, 230, 90, 255)};
                 const double scale = manager.getOverlayFontSize(OverlayDebug) / 20.0;
                 const auto S = [scale](int v) { return int(std::lround(v * scale)); };
                 for (int y = 0; y < surface->h; ++y) {
@@ -88,8 +92,8 @@ public:
     unsigned calls = 0;
     std::string last;
     int height = 0, width = 0;
-    std::array<unsigned, 8> colors{};
-    std::array<std::array<unsigned, 8>, TimingGraphLayout::Lanes + 1> rowColors{};
+    std::array<unsigned, 10> colors{};
+    std::array<std::array<unsigned, 10>, TimingGraphLayout::Lanes + 1> rowColors{};
     std::array<int, TimingGraphLayout::Lanes + 1> minInkY{}, maxInkY{};
 };
 
@@ -187,6 +191,76 @@ static void testBufferCoverage()
     assert(!bufferGraphSample(p).valid);
     p.sourceTimingValid = true; p.sourceTimeUs = 0;
     assert(!bufferGraphSample(p).valid);
+}
+
+// Causal producer coverage is independent of raw queue/GPU-stage coverage.
+static void testAdaptiveProducerCoverage()
+{
+    TimingGraphHistory history;
+    TimingGraphInput in;
+    in.submitted=true; in.submissionUs=1020000; in.targetUs=1010000;
+    in.sourceTimingValid=true; in.sourceTimeUs=1000000; in.sourcePeriodUs=10000;
+    in.bufferUs=2500; in.requestedBufferUs=9000; in.toleranceUs=500;
+    in.networkReadyUs=1000500; in.decoderOutputUs=1008000; in.decoderReadyUs=1009000;
+    in.inputPercentileEnabled=true; in.producerEligible=true; in.producerRequiredUs=2000; in.inputToleranceUs=750;
+    in.inputTargetUs=1500; in.inputTargetValid=true; in.inputTargetCapped=true;
+    in.inputProbabilityPpm=995000; in.inputWindowUs=200000000;
+    in.inputSamples=301; in.inputAbsorbed=297; in.inputMissed=4; in.trajectoryCarryUs=6690;
+    history.record(in); TimingGraphSnapshot snapshot; history.copyTo(snapshot);
+    assert(snapshot.points.size()==1);
+    const auto& p=snapshot.points[0];
+    assert(p.producerRequiredUs==in.producerRequiredUs && p.producerEligible && p.inputPercentileEnabled);
+    assert(p.inputTargetUs==1500 && p.inputTargetUs!=p.bufferUs && p.inputTargetUs!=p.requestedBufferUs);
+    assert(p.inputTargetValid && p.inputTargetCapped && p.inputProbabilityPpm==995000 && p.inputWindowUs==200000000 && p.inputToleranceUs==750);
+    assert(p.inputSamples==301 && p.inputAbsorbed==297 && p.inputMissed==4 && p.trajectoryCarryUs==6690);
+    auto sample=bufferGraphSample(p);
+    assert(sample.producerAbsorbed() && !sample.producerMissed());
+    assert(sample.readyValid && !sample.absorbed()); // Own backlog may make the raw stage late.
+    assert(snapshot.hitches.missed==1 && snapshot.hitches.worstExcessUs==5750); // Legacy raw counter preserved.
+
+    for(int64_t required : {-100LL,3190LL,3250LL,3251LL}) {
+        auto point=p; point.producerRequiredUs=required;
+        point.targetUs=2000000; point.requestedBufferUs=30000; point.toleranceUs=1000;
+        sample=bufferGraphSample(point);
+        assert(sample.producerUs==double(required));
+        assert(sample.producerAbsorbed()==(required<=3250));
+        assert(sample.producerMissed()==(required>3250)); // 690us, exactly750us accepted,751us is the exact crossing.
+        point.decoderReadyUs=0; sample=bufferGraphSample(point);
+        assert(!sample.readyValid && sample.producerValid); // Unknown GPU completion is not unknown causal input.
+        assert(sample.producerMissed()==(required>3250));
+    }
+    // Producer eligibility is authoritative. Loss, overload, and controller reset
+    // arrive as ineligible, even if historical target/evidence fields remain valid.
+    for(int invalidReason=0;invalidReason<3;++invalidReason) {
+        auto point=p; point.producerEligible=false; point.producerRequiredUs=99999;
+        sample=bufferGraphSample(point);
+        assert(!sample.producerValid && !sample.producerAbsorbed() && !sample.producerMissed());
+        assert(sample.readyValid && !sample.absorbed());
+    }
+    auto zero=p;zero.inputToleranceUs=0;zero.producerRequiredUs=2501;
+    assert(bufferGraphSample(zero).producerMissed());
+    auto huge=p;huge.bufferUs=std::numeric_limits<uint64_t>::max();huge.inputToleranceUs=750;
+    huge.producerRequiredUs=std::numeric_limits<int64_t>::max();
+    assert(bufferGraphSample(huge).producerAbsorbed() && !bufferGraphSample(huge).producerMissed());
+
+    auto point=p; point.sourceTimingValid=false;
+    const auto invalidSource=bufferGraphSample(point);
+    assert(!invalidSource.valid && !invalidSource.producerValid && !invalidSource.producerMissed());
+    assert(invalidSource.bufferUs==2500 && invalidSource.bufferLimitUs==3250); // Known budget is not promoted into known timing.
+    point=p; point.sourceTimeUs=0; assert(!bufferGraphSample(point).producerValid);
+    point=p; point.inputPercentileEnabled=false; assert(!bufferGraphSample(point).producerValid);
+
+    // Legacy history keeps its exact raw threshold. Adaptive coverage adds
+    // tolerance, and a definition change clears incompatible rolling totals.
+    BufferHitchHistory raw;
+    point=p; point.inputPercentileEnabled=false; raw.record(point);
+    const auto legacy=raw.snapshot();
+    point.submissionUs+=10000; point.inputPercentileEnabled=true;
+    point.producerEligible=false; point.producerRequiredUs=-20000; raw.record(point);
+    const auto adaptive=raw.snapshot();
+    assert(legacy.missed==1 && legacy.measuredFrames==1 && legacy.worstExcessUs==6500);
+    assert(adaptive.missed==1 && adaptive.measuredFrames==1 && adaptive.worstExcessUs==5750);
+    assert(adaptive.observedFrames==1 && adaptive.unknown==legacy.unknown);
 }
 
 static void testBufferHitchHistory()
@@ -488,6 +562,7 @@ int main(int argc, char** argv)
     testLaneIntervals();
     testConfirmedDisplayRefresh();
     testBufferCoverage();
+    testAdaptiveProducerCoverage();
     testBufferHitchHistory();
     {
         PyroWavePacketLossWarning warning;
@@ -680,6 +755,36 @@ int main(int argc, char** argv)
             assert(incoming[3] > 0); // Exact decoder/buffer crossings have red X markers.
             for (int ink = 0; ink < 3; ++ink) assert(incoming[ink] == 0);
         }
+        const auto adaptiveGraph=[](int64_t producer,bool eligible,bool gpuKnown) {
+            TimingGraphSnapshot snapshot;
+            for(unsigned i=0;i<240;++i) {
+                TimingGraphPoint p;
+                p.sourceTimeUs=1000000+uint64_t(i)*10000; p.sourceTimingValid=true;
+                p.sourcePeriodUs=p.targetIntervalUs=p.submissionIntervalUs=10000;
+                p.submissionUs=p.targetUs=p.sourceTimeUs+10000;
+                p.bufferUs=2500; p.requestedBufferUs=9000;
+                p.networkReadyUs=p.sourceTimeUs+500; p.decoderOutputUs=p.sourceTimeUs+8000;
+                p.decoderReadyUs=gpuKnown?p.sourceTimeUs+9000:0;
+                p.inputPercentileEnabled=true; p.producerEligible=eligible; p.producerRequiredUs=producer; p.inputToleranceUs=750; p.toleranceUs=750;
+                p.inputTargetUs=1500; p.inputTargetValid=true; p.inputProbabilityPpm=995000; p.inputWindowUs=200000000;
+                snapshot.points.push_back(p);
+            }
+            return snapshot;
+        };
+        for(const auto scenario : {0,1,2,3}) {
+            const bool eligible=scenario!=3;
+            const auto name=std::string("Adaptive causal coverage ")+std::to_string(scenario);
+            manager.updateOverlayText(OverlayDebug,name.c_str(),adaptiveGraph(scenario==2?3251:scenario==1?3250:3190,eligible,scenario!=1));
+            replacement.awaitText(name.c_str());
+            std::lock_guard<std::mutex> guard(replacement.lock);
+            const auto& incoming=replacement.rowColors[TimingGraphLayout::BufferLane];
+            assert((incoming[3]>0)==(scenario==2)); // Raw late stage alone never paints a causal red X.
+            assert(incoming[6]>100); // Raw stage remains visible independently of causal coverage.
+            assert(incoming[7]>100); // Applied buffer stays readable even beneath dense exact-crossing markers.
+            assert((incoming[5]>100)==(eligible && scenario!=2)); // Dense red X marks cover the producer line only when every frame misses.
+            assert((incoming[8]>100)==(scenario!=2)); // B+T allowance band is independent of actual B.
+            assert(incoming[9]>100); // Learned quantile remains distinct from both B and B+T.
+        }
         int normalWidth, normalHeight;
         {
             std::lock_guard<std::mutex> guard(replacement.lock);
@@ -702,6 +807,102 @@ int main(int argc, char** argv)
         replacement.awaitSize(normalWidth);
         assert(manager.getOverlayFontSize(OverlayDebug) == 20);
         assert(replacement.height == normalHeight);
+        // The inherited VRR-room credit must match the controller, not just T.
+        for (const auto excess : {499, 500, 501}) {
+            auto credited = adaptiveGraph(2500 + 1000 + excess, true, true);
+            for (auto& point : credited.points) {
+                point.inputToleranceUs = 500;
+                point.inputVrrHeadroomUs = 1000;
+            }
+            const auto sample = bufferGraphSample(credited.points.back());
+            assert(sample.producerMissed() == (excess > 500));
+            assert(sample.producerUs == 2500 + excess);
+            const auto name = std::string("VRR-room coverage boundary ") + std::to_string(excess);
+            manager.updateOverlayText(OverlayDebug, name.c_str(), credited);
+            replacement.awaitText(name);
+            std::lock_guard<std::mutex> guard(replacement.lock);
+            assert((replacement.rowColors[TimingGraphLayout::BufferLane][3] > 0) == (excess > 500));
+        }
+        const auto previewFolder = qEnvironmentVariable("MOONLIGHT_READABILITY_PREVIEW_DIR");
+        for (const bool fourK : {false, true}) {
+            for (const bool graphOnly : {false, true}) {
+                const int width = fourK ? 3840 : 1280, height = fourK ? 2160 : 800;
+                // The normal overlay: Moonlight's stats, then the VRR summary.
+                const std::string moonlight = std::string("Video stream: ") +
+                    (fourK ? "3840x2160" : "1280x800") + " 110.00 FPS (Codec: PyroWave 10-bit HDR 4:4:4)\n"
+                    "Incoming frame rate from network: 110.00 FPS\n"
+                    "Decoding frame rate: 110.00 FPS\n"
+                    "Rendering frame rate: 110.00 FPS\n"
+                    "Host processing latency min/max/average: 1.0/3.2/1.8 ms\n"
+                    "Frames dropped by your network connection: 0.05%\n"
+                    "Frames dropped by client pacing: 0.00%\n"
+                    "Average network latency: 2 ms (variance: 1 ms)\n"
+                    "Average decoding time: 3.85 ms (waiting for the decoder 0.02 ms)\n"
+                    "Average frame queue delay: 6.42 ms\n"
+                    "Average rendering time (including monitor V-sync latency): 1.20 ms\n"
+                    "Incoming smoothness (host): 99.50%\n";
+                PerformanceStats::Snapshot summary;
+                summary.vrr = summary.adaptive = true; summary.bufferUs = 5700;
+                summary.targetPpm = 999500; summary.toleranceUs = 500;
+                summary.nowUs = 5000000; summary.input.samples = summary.input.recentEligible = 22000;
+                summary.input.recentMissed = 11; summary.input.targetUs = 5420; summary.input.windowUs = 300000000;
+                summary.input.tailUncertain = false;
+                auto coherent = adaptiveGraph(6959, true, true);
+                Vrr13::PresentTiming matchedDisplay;
+                BufferHitchHistory stageHistory;
+                uint64_t displayTime = 1000000 + 18 * 9091 + 10000;
+                for (size_t i = 0; i < coherent.points.size(); ++i) {
+                    auto& point = coherent.points[i];
+                    point.sourceTimeUs = 1000000 + i * 9091;
+                    point.sourcePeriodUs = point.targetIntervalUs = point.submissionIntervalUs = 9091;
+                    point.targetUs = point.submissionUs = point.sourceTimeUs + 10000;
+                    point.networkReadyUs = point.sourceTimeUs + 500;
+                    point.decoderOutputUs = point.sourceTimeUs + 8000;
+                    point.decoderReadyUs = point.sourceTimeUs + 9000;
+                    point.bufferUs = summary.bufferUs; point.inputTargetUs = summary.input.targetUs;
+                    point.toleranceUs = point.inputToleranceUs = summary.toleranceUs;
+                    point.inputVrrHeadroomUs = 760;
+                    point.inputProbabilityPpm = summary.targetPpm; point.inputWindowUs = summary.input.windowUs;
+                    point.inputSamples = summary.input.recentEligible;
+                    point.inputAbsorbed = summary.input.recentAbsorbed;
+                    point.inputMissed = summary.input.recentMissed;
+                    // Actual synthetic display identities drive both the plot
+                    // and the summary observer; neither uses input coverage.
+                    if (i >= 19) {
+                        displayTime += 9091;
+                        if (i == 40 || i == 80 || i == 120) displayTime += 501;
+                        if (i == 41 || i == 81 || i == 121) displayTime -= 501;
+                        point.displayUs = displayTime;
+                        matchedDisplay.observe({i + 1, point.submissionUs, displayTime, point.targetUs,
+                            i == 120 ? uint64_t(1) : uint64_t(0), point.submissionUs + 1500},
+                            {summary.toleranceUs, 8333, 9091, 0});
+                    }
+                    stageHistory.record(point);
+                }
+                summary.present = matchedDisplay.stats();
+                // 0.501 ms display-added steps count; within uncertainty they do not.
+                assert(summary.present.misses == 4);
+                summary.nowUs = coherent.points.back().submissionUs + 1500;
+                coherent.hitches = stageHistory.snapshot(summary.nowUs);
+                const auto text = moonlight + PerformanceStats::formatVrr(summary) + (graphOnly ? " " : "");
+                const auto name = std::string(fourK ? "4k" : "deck") + (graphOnly ? "-graph" : "-stats-graph");
+                if (!previewFolder.isEmpty()) qputenv("MOONLIGHT_OVERLAY_TEST_PREVIEW", qPrintable(previewFolder + "/" + QString::fromStdString(name) + ".bmp"));
+                manager.setOutputSize(width, height);
+                manager.setOverlayState(OverlayDebug, !graphOnly);
+                manager.updateOverlayText(OverlayDebug, text.c_str(), coherent);
+                replacement.awaitText(text);
+                std::lock_guard<std::mutex> guard(replacement.lock);
+                assert(replacement.width <= width && replacement.height <= height);
+                assert(replacement.height >= (fourK ? 678 : TimingGraphLayout::Height));
+                if (graphOnly) assert(replacement.height == (fourK ? 679 : TimingGraphLayout::Height));
+                else assert(replacement.height > (fourK ? 679 : TimingGraphLayout::Height));
+                std::cout << "Readability " << name << ": " << replacement.width << "x" << replacement.height
+                          << " fits " << width << "x" << height << "\n";
+            }
+        }
+        qunsetenv("MOONLIGHT_OVERLAY_TEST_PREVIEW");
+        manager.setOutputSize(1920, 1080);
+        manager.setOverlayState(OverlayDebug, true);
         // Variation within the flat zone is drawn on the reference line;
         // larger variation is drawn at its true height.
         const auto jitter = [](uint64_t amplitudeUs) {
@@ -765,6 +966,25 @@ int main(int argc, char** argv)
                 return replacement.height == TimingGraphLayout::Height && replacement.rowColors[2][2] > 100;
             }));
         }
+        // Export a graph-only adaptive software surface for inspection; this
+        // allocates SDL pixels only and never creates a native window/renderer.
+        const auto adaptivePreview=qEnvironmentVariable("MOONLIGHT_VRR_TEST_EXPORT_ADAPTIVE_GRAPH");
+        if(!adaptivePreview.isEmpty()) qputenv("MOONLIGHT_OVERLAY_TEST_PREVIEW",qPrintable(adaptivePreview));
+        {
+            std::lock_guard<std::mutex> guard(replacement.lock);
+            replacement.rowColors={};
+        }
+        auto adaptiveOnly=adaptiveGraph(3190,true,true);
+        for(auto& p:adaptiveOnly.points) {p.trajectoryCarryUs=4443;p.inputSamples=23142;p.inputAbsorbed=6200;p.inputMissed=123;}
+        manager.updateTimingGraph(std::move(adaptiveOnly));
+        {
+            std::unique_lock<std::mutex> guard(replacement.lock);
+            assert(replacement.ready.wait_for(guard,3s,[&] {
+                const auto& incoming=replacement.rowColors[TimingGraphLayout::BufferLane];
+                return replacement.height==TimingGraphLayout::Height && incoming[5]>100 && incoming[6]>100 && incoming[3]==0;
+            }));
+        }
+        if(!adaptivePreview.isEmpty()) {assert(QFile::exists(adaptivePreview));qunsetenv("MOONLIGHT_OVERLAY_TEST_PREVIEW");}
         // Stats text alone ignores graph snapshots while the graph is off.
         manager.setTimingGraphState(false);
         assert(!manager.isOverlayEnabled(OverlayDebug));

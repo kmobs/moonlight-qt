@@ -13,6 +13,7 @@ class VrrReplayConfigTest : public QObject
 private slots:
     void defaultsRoundTrip();
     void customToleranceRoundTrip();
+    void inputPercentileToleranceRoundTrip();
     void initialCalibrationPolicyRoundTrip();
     void windowedSmoothingPolicyRoundTrip();
     void judderReservePolicyRoundTrip();
@@ -199,6 +200,37 @@ void VrrReplayConfigTest::customToleranceRoundTrip()
     VrrTimingParameters restored;
     QVERIFY2(applyVrrReplayControllerSnapshot(historical, restored, error), qPrintable(error));
     QCOMPARE(restored.playoutIntervalToleranceUs, uint64_t(0));
+}
+
+void VrrReplayConfigTest::inputPercentileToleranceRoundTrip()
+{
+    VrrTimingParameters policy;
+    QString error;
+    QCOMPARE(policy.playoutInputPercentileToleranceUs, uint64_t(0));
+    for (int tolerance = 250; tolerance <= 2000; tolerance += 250) {
+        QVERIFY2(applyVrrReplayControllerSnapshot(
+            {{"playout_input_percentile_tolerance_us", tolerance}}, policy, error), qPrintable(error));
+        VrrTimingParameters restored;
+        const auto snapshot = vrrTimingParametersToJson(policy);
+        QCOMPARE(snapshot.value("playout_input_percentile_tolerance_us").toInt(), tolerance);
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+        QCOMPARE(restored.playoutInputPercentileToleranceUs, uint64_t(tolerance));
+    }
+    for (int tolerance : {1, 249, 251, 1999, 2001, 2250}) {
+        QVERIFY(!applyVrrReplayControllerSnapshot(
+            {{"playout_input_percentile_tolerance_us", tolerance}}, policy, error));
+        QCOMPARE(policy.playoutInputPercentileToleranceUs, uint64_t(2000));
+    }
+    auto historical = vrrTimingParametersToJson(policy);
+    historical.remove("playout_input_percentile_tolerance_us");
+    historical["playout_interval_tolerance_us"] = 750;
+    VrrTimingParameters restored;
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, restored, error), qPrintable(error));
+    QCOMPARE(restored.playoutIntervalToleranceUs, uint64_t(750));
+    QCOMPARE(restored.playoutInputPercentileToleranceUs, uint64_t(0));
+    QVERIFY2(applyVrrReplayControllerSnapshot(
+        {{"playout_input_percentile_tolerance_us", 0}}, policy, error), qPrintable(error));
+    QCOMPARE(policy.playoutInputPercentileToleranceUs, uint64_t(0));
 }
 
 void VrrReplayConfigTest::defaultsRoundTrip()

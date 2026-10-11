@@ -86,6 +86,13 @@ private:
     };
 
     struct FrameTelemetry {
+        int64_t trajectorySuccessorFrame = -1;
+        uint64_t trajectorySuccessorProof = 0;
+        bool trajectoryResyncDropped = false;
+        bool trajectoryResyncDeferred = false;
+        bool inputNetworkBufferMiss = false;
+        bool inputDecodeBufferMiss = false;
+        uint64_t inputBufferMissObservationUs = 0;
         bool preparedAhead = false;
         VrrPreparedFrame::Timing preparationStage;
         uint64_t decisionTimeUs = 0;
@@ -183,6 +190,8 @@ private:
     int run();
     bool dequeueFrame(QueuedFrame& frame, bool& queueDiscontinuity);
     bool hasQueuedFrame();
+    bool reserveReadySuccessor(bool preparedCurrent, QueuedFrame& frame,
+                               bool& queueDiscontinuity);
     void discardQueuedFrames(bool countDrops,
                              TraceDisposition disposition);
     uint32_t consumeWindowStateNotifications();

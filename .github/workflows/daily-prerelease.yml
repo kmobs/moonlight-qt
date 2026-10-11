@@ -38,6 +38,8 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests -p test_nightly_notes.py -v
       - name: Test release safeguards
         run: python3 -m unittest discover -s scripts/tests -p test_daily_release.py -v
+      - name: Test Windows NT-only PyroWave interoperability requirements
+        run: python3 -m unittest discover -s scripts/tests -p test_pyrowave_nt_handles.py -v
       - name: Skip unchanged source since last published nightly
         id: changes
         env:
@@ -69,9 +71,16 @@ jobs:
     with:
       ci_version: ${{ needs.prepare.outputs.ci_version }}
       source_ref: ${{ needs.prepare.outputs.source_sha }}
+  flatpak:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    uses: ./.github/workflows/build-flatpak.yml
+    with:
+      ci_version: ${{ needs.prepare.outputs.ci_version }}
+      source_ref: ${{ needs.prepare.outputs.source_sha }}
   publish:
-    needs: [prepare, windows, linux]
-    if: needs.prepare.outputs.should_release == 'true' && needs.prepare.result == 'success' && needs.windows.result == 'success' && needs.linux.result == 'success' && vars.DAILY_RELEASE_ENABLED == 'true' && vars.DAILY_RELEASE_SOURCE_BRANCH == 'master' && (github.event_name == 'schedule' || inputs.publish)
+    needs: [prepare, windows, linux, flatpak]
+    if: needs.prepare.outputs.should_release == 'true' && needs.prepare.result == 'success' && needs.windows.result == 'success' && needs.linux.result == 'success' && needs.flatpak.result == 'success' && vars.DAILY_RELEASE_ENABLED == 'true' && vars.DAILY_RELEASE_SOURCE_BRANCH == 'master' && (github.event_name == 'schedule' || inputs.publish)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -97,6 +106,10 @@ jobs:
         with:
           name: Moonlight-LinuxAppImage-${{ needs.prepare.outputs.ci_version }}
           path: release-assets
+      - uses: actions/download-artifact@v6
+        with:
+          name: Moonlight-Flatpak-${{ needs.prepare.outputs.ci_version }}
+          path: release-assets
       - name: Recheck remote history and verify exact assets
         run: |
           set -euo pipefail
@@ -111,7 +124,7 @@ jobs:
           current = module.next_version(subprocess.check_output(['git', 'tag', '--list'], text=True).splitlines())
           assert current == os.environ['CI_VERSION'], 'Tag history changed while building; rerun from scratch'
           assets = Path('release-assets')
-          expected = {f'MoonlightSetup-{current}.exe', f'MoonlightPortable-x64-{current}.zip', f'Moonlight-{current}.dmg', f'Moonlight-{current}-x86_64.AppImage'}
+          expected = {f'MoonlightSetup-{current}.exe', f'MoonlightPortable-x64-{current}.zip', f'Moonlight-{current}.dmg', f'Moonlight-{current}-x86_64.AppImage', f'Moonlight-{current}-x86_64.flatpak'}
           assert {p.name for p in assets.iterdir()} == expected, 'Unexpected or missing assets'
           assert all(p.is_file() and p.stat().st_size > 0 for p in assets.iterdir())
           PY
@@ -119,12 +132,8 @@ jobs:
             echo 'Release already exists; refusing to replace it' >&2
             exit 1
           fi
-          printf 'Daily Windows, universal macOS and Linux x86_64 AppImage prerelease. Windows packages are unsigned; macOS has no Developer ID signature or notarization. Source: `%s`.\n\nRequired Windows build/test/replay/version/package, macOS updater/timing/universal DMG and Linux updater/haptics/AppImage gates passed.\n\n' "$SOURCE_SHA" > release-notes.md
-          if [[ "$CI_VERSION" == 6.2.0-daily.* ]]; then
-            printf '**Version migration:** the fork app base is now 6.2.0; this does not claim full upstream feature parity. Windows retains monotonic ProductVersion 6.2.B. Clients from 6.1.0-daily.182 or earlier cannot detect this new tag family and must download this release manually once. The updated client recognizes both nightly families.\n\n' >> release-notes.md
-          fi
+          : > release-notes.md
           python3 scripts/nightly_notes.py --repo "$GH_REPO" --tag "$DAILY_TAG" --version "$CI_VERSION" --source "$SOURCE_SHA" --assets release-assets --notes release-notes.md
-          cat release-assets/SHA256SUMS >> release-notes.md
       - name: Create draft prerelease and upload unsigned packages
         run: |
           set -euo pipefail

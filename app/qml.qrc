@@ -5,6 +5,7 @@
         <file>gui/AppView.qml</file>
         <file>gui/SettingsView.qml</file>
         <file>gui/CalibrationButton.qml</file>
+        <file>gui/CalibrationHostSelection.qml</file>
         <file>gui/VrrTimingSettings.qml</file>
         <file>gui/PyroWavePacketSpeedSettings.qml</file>
         <file>gui/StreamSegue.qml</file>

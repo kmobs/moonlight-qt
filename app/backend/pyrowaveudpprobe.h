@@ -9,8 +9,13 @@
 #include <cstdint>
 
 class QUdpSocket;
+class QNetworkReply;
 
 namespace PyroWaveUdp {
+// Compatibility for handshake hosts that send complete XML but retain their
+// close-delimited HTTP connection. Never bypass explicit HTTP body framing.
+bool completeCloseDelimitedResponse(QNetworkReply& reply);
+
 // Opens an ephemeral receiver and returns the resolved remote address. Use that
 // same address for the HTTPS probe so its sender and receiver agree on family.
 QHostAddress bindReceiver(QUdpSocket& socket, const QString& hostname,

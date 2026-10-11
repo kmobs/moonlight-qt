@@ -15,6 +15,48 @@ def release(tag='daily-2026-10-10', **kwargs):
 
 
 class NightlyNotesTests(unittest.TestCase):
+    def test_moonlight_concise_collapsible_linked_commit_log(self):
+        repo = 'Nonary/moonlight-qt'
+        notes, data = n.make_notes(repo, 'v6.2.0-daily.183', '6.2.0-daily.183', B,
+                                  {'tag': 'v6.1.0-daily.182', 'source_commit': A},
+                                  [(B, 'fix(client): repair updates\n\nImplementation details')])
+        self.assertTrue(notes.startswith('This is a nightly release of Moonlight'))
+        self.assertIn('<details>\n<summary>Commit log</summary>', notes)
+        self.assertIn(f'- [{B[:12]}](https://github.com/{repo}/commit/{B}) fix(client): repair updates', notes)
+        self.assertIn(f'https://github.com/{repo}/compare/{A}...{B}', notes)
+        self.assertIn('/releases/tag/v6.1.0-daily.182', notes)
+        self.assertIn('Moonlight builds are unsigned', notes)
+        self.assertIn('unverified publisher', notes)
+        self.assertIn('not Developer ID signed or notarized', notes)
+        self.assertIn('false-positive antivirus alerts', notes)
+        self.assertNotIn('self-signed', notes)
+        self.assertNotIn('Implementation details', notes)
+        self.assertIn('download this update manually once', notes)
+        self.assertEqual(data['previous_source_commit'], A)
+        self.assertEqual(data['commits_total'], 1)
+        self.assertIn('flatpak install --user --reinstall ./Moonlight-6.2.0-daily.183-x86_64.flatpak', notes)
+        self.assertIn('flatpak run --user com.moonlight_stream.Moonlight//master', notes)
+        self.assertIn('chmod +x ./Moonlight-6.2.0-daily.183-x86_64.AppImage', notes)
+        self.assertIn('--appimage-extract-and-run', notes)
+
+    def test_package_metadata_lists_exact_source_and_hashes(self):
+        import tempfile
+        import hashlib
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'bundle.flatpak').write_bytes(b'flatpak')
+            (root / 'SHA256SUMS').write_text('ignored')
+            (root / 'nightly-metadata.json').write_text('ignored')
+            self.assertEqual(n.artifact_metadata(root, B), [dict(name='bundle.flatpak', source_commit=B,
+                              sha256=hashlib.sha256(b'flatpak').hexdigest())])
+
+    def test_moonlight_commit_subject_cannot_close_details(self):
+        notes, _ = n.make_notes('Nonary/moonlight-qt', 'v6.2.0-daily.184', '6.2.0-daily.184', B,
+                               {'tag': 'v6.2.0-daily.183', 'source_commit': A},
+                               [(B, 'fix: </details><script>unexpected</script>')])
+        self.assertEqual(notes.count('</details>'), 1)
+        self.assertNotIn('<script>', notes)
+
     def test_source_gate_first_changed_unchanged_and_invalid(self):
         self.assertTrue(n.has_source_changes(A, None))
         self.assertTrue(n.has_source_changes(B, {'source_commit': A}))

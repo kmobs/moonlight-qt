@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "presenttiming.h"
+#include "absorbedjitter.h"
+#include "inputpercentilebuffer.h"
 #include "cadencedetection.h"
 
 namespace Vrr13 {
@@ -22,16 +24,26 @@ public:
         uint64_t frame = 0, intended = 0, submitted = 0, deadline = 0, ready = 0, buffer = 0;
         bool valid = false, absorbable = false;
         uint64_t serialService = 0, decoderQueue = 0;
+        uint64_t inputSlot = 0;
+        int64_t inputRequired = 0;
+        bool inputValid = false;
     };
     // Observation only. This explains the request made after an outcome;
     // the controller applies that request to subsequent frames. In particular,
     // rejected growth is not retained as debt or fed back into demand().
     enum class Action : uint8_t {
         Learning, SequenceBreak, Grow, Capped, CurrentPressure, HistoryHold,
-        RecoveryHold, Release, Minimum, NotAbsorbable, Cooldown, NoFreshMiss, LimitChange
+        RecoveryHold, Release, Minimum, NotAbsorbable, Cooldown, NoFreshMiss, LimitChange, AbsorbedJitterHold, InputPercentileGrow, InputPercentileRelease, InputPercentileHold, InputPercentileUnknown, InputPercentileMissHold, InputPercentileBackoff
     };
     static const char* actionName(Action action) {
         switch (action) {
+        case Action::InputPercentileBackoff: return "input misses slow release";
+        case Action::InputPercentileMissHold: return "input buffer miss release pause";
+        case Action::InputPercentileGrow: return "input percentile rise";
+        case Action::InputPercentileRelease: return "input percentile release";
+        case Action::InputPercentileHold: return "input percentile target";
+        case Action::InputPercentileUnknown: return "expired unknown input release";
+        case Action::AbsorbedJitterHold: return "absorbed input jitter hold";
         case Action::Learning: return "learning";
         case Action::SequenceBreak: return "sequence break";
         case Action::Grow: return "late-work growth";
@@ -70,6 +82,11 @@ public:
         bool serviceOverloaded = false; // Qualified one-second workload, diagnostic only.
         bool initialCalibrationComplete = false;
         uint64_t calibrationCoverageUs = 0, calibrationSamples = 0;
+        uint64_t inputReleaseAllowed = 0, inputReleaseHeld = 0, inputReleaseUnknown = 0;
+        uint64_t inputEvidenceUs = 0, inputCandidateUs = 0;
+        double inputCandidateLoss = 0, inputCurrentLoss = 0;
+        bool inputPercentileEnabled = false;
+        InputPercentileBuffer::Stats inputPercentile;
         Update update;
         uint64_t lastGrowthAtUs = 0, lastGrowthUs = 0;
         uint64_t lastClippedAtUs = 0, lastClippedUs = 0;
@@ -102,7 +119,8 @@ public:
                  uint64_t holdRenewBelowTarget = 0,
                  bool perIntervalExcess = false,
                  bool averageBufferControl = false,
-                 bool historyDriven = false) {
+                 bool historyDriven = false,
+                 bool absorbedJitterRelease = false) {
         m_Stats.toleranceUs = toleranceUs;
         m_Stats.scoreWindowUs = scoreWindowUs;
         m_Stats.severityWeighted = severityWeighted;
@@ -144,6 +162,10 @@ public:
         if (beforeUs != boundedUs) update.action = Action::LimitChange;
         update.minimumUs = minimum;
         update.maximumUs = maximum;
+        if (absorbedJitterRelease) {
+            m_Input.observe(s.frame, s.submitted, s.inputSlot, s.inputRequired,
+                s.valid && s.absorbable && s.inputValid);
+        }
         m_Previous = s;
         m_HavePrevious = s.valid && s.submitted && s.intended;
         if (!adjacent) {
@@ -333,8 +355,26 @@ public:
             m_ReleaseFraction += std::min<uint64_t>(actual, 100000) * releaseRate;
             const auto release = m_ReleaseFraction / 1000000;
             m_ReleaseFraction %= 1000000;
-            m_Target -= std::min(m_Target - minimum, release);
-            update.action = m_Target == minimum ? Action::Minimum : Action::Release;
+            const auto candidate = m_Target - std::min(m_Target - minimum, release);
+            bool allowed = true;
+            if (absorbedJitterRelease && candidate < m_Target) {
+                m_Stats.inputCandidateUs = candidate;
+                m_Stats.inputEvidenceUs = m_Input.coverage();
+                if (m_Input.qualified(s.submitted)) {
+                    m_Stats.inputCurrentLoss = m_Input.loss(m_Target, toleranceUs);
+                    m_Stats.inputCandidateLoss = m_Input.loss(candidate, toleranceUs);
+                    // Existing loss is not new shrink risk. This permits equal-
+                    // risk release through a flat/constant-lateness region.
+                    allowed = m_Stats.inputCandidateLoss <=
+                        std::max(allowedLoss, m_Stats.inputCurrentLoss) + 1e-12;
+                    if (allowed) ++m_Stats.inputReleaseAllowed;
+                    else ++m_Stats.inputReleaseHeld;
+                } else ++m_Stats.inputReleaseUnknown;
+            }
+            if (allowed) m_Target = candidate;
+            // Do not bank rejected release into a later large downward step.
+            update.action = !allowed ? Action::AbsorbedJitterHold :
+                m_Target == minimum ? Action::Minimum : Action::Release;
         }
         else if (grow) {
             update.action = !delayedAbsorbable ? Action::NotAbsorbable :
@@ -361,6 +401,7 @@ public:
     }
     Stats stats() const { return m_Stats; }
     void breakSequence() {
+        m_Input.reset();
         m_Window = {}; m_First = m_ReleaseFraction = m_SequenceSamples = 0; m_HavePrevious = false;
         m_Stats.averageErrorUs = 0; m_Stats.averageValid = false;
         m_Stats.calibrationCoverageUs = m_Stats.calibrationSamples = 0;
@@ -401,6 +442,7 @@ private:
     // Keep the long score history off the controller's stack. The controller
     // is instantiated in several independent workers and test fixtures.
     std::vector<ScoreBucket> m_Score = std::vector<ScoreBucket>(MaximumScoreBuckets);
+    AbsorbedJitter m_Input;
     Sample m_Previous;
     Stats m_Stats;
     uint64_t m_Target = 0, m_First = 0, m_LastAttack = 0, m_LastPressure = 0, m_ReleaseFraction = 0;

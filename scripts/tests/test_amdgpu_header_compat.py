@@ -47,12 +47,16 @@ static_assert(!EXPECT_SUPPORTED, "Complete headers fail to enable the hold");
 
 @unittest.skipUnless(COMPILER, 'C++ compiler unavailable')
 class AmdgpuHeaderCompatibilityTests(unittest.TestCase):
-    def compile_header(self, header, expected, linux=True):
+    def compile_header(self, header, expected, linux=True, layout='drm/amdgpu_drm.h', shadow=None):
         with tempfile.TemporaryDirectory(prefix='amdgpu-header-') as directory:
             temp = Path(directory)
             if header is not None:
-                (temp / 'drm').mkdir()
-                (temp / 'drm/amdgpu_drm.h').write_text(header)
+                path = temp / layout
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(header)
+            if shadow is not None:
+                (temp / 'drm').mkdir(exist_ok=True)
+                (temp / 'drm/amdgpu_drm.h').write_text(shadow)
             (temp / 'fixture.cpp').write_text(SOURCE)
             result = subprocess.run([
                 COMPILER, '-std=c++17', '-fsyntax-only', '-nostdinc',
@@ -75,6 +79,20 @@ class AmdgpuHeaderCompatibilityTests(unittest.TestCase):
     def test_modern_header_compiles_all_context_operations(self):
         header = '\n'.join(f'#define {name} 1' for name in SYMBOLS) + MODERN_CONTEXT
         self.compile_header(header, True)
+    def test_modern_distribution_and_pkgconfig_header_layouts(self):
+        header = '\n'.join(f'#define {name} 1' for name in SYMBOLS) + MODERN_CONTEXT
+        for layout in ('libdrm/amdgpu_drm.h', 'amdgpu_drm.h'):
+            with self.subTest(layout=layout):
+                self.compile_header(header, True, layout=layout)
+    def test_incomplete_distribution_headers_keep_hold_disabled(self):
+        old = '\n'.join(f'#define {name} 1' for name in SYMBOLS[:4])
+        for layout in ('libdrm/amdgpu_drm.h', 'amdgpu_drm.h'):
+            with self.subTest(layout=layout):
+                self.compile_header(old, False, layout=layout)
+    def test_modern_libdrm_is_not_shadowed_by_old_kernel_uapi(self):
+        header = '\n'.join(f'#define {name} 1' for name in SYMBOLS) + MODERN_CONTEXT
+        old = '\n'.join(f'#define {name} 1' for name in SYMBOLS[:4])
+        self.compile_header(header, True, layout='libdrm/amdgpu_drm.h', shadow=old)
     def test_non_linux_keeps_hold_disabled_even_with_modern_header(self):
         header = '\n'.join(f'#define {name} 1' for name in SYMBOLS) + MODERN_CONTEXT
         self.compile_header(header, False, linux=False)

@@ -1,0 +1,150 @@
+name: Build - Linux Flatpak nightly
+permissions:
+  contents: read
+on:
+  workflow_call:
+    inputs:
+      ci_version:
+        required: true
+        type: string
+      source_ref:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: Exact nightly version
+        required: true
+        type: string
+      source_ref:
+        description: Exact full source commit
+        required: true
+        type: string
+jobs:
+  build:
+    timeout-minutes: 90
+    runs-on: ubuntu-22.04
+    env:
+      CI_VERSION: ${{ inputs.ci_version }}
+      CCACHE_DIR: ${{ github.workspace }}/.flatpak-builder/ccache
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          submodules: recursive
+      - name: Verify exact source and hosted runner
+        env:
+          EXPECTED_SOURCE: ${{ inputs.source_ref }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          source=$(git rev-parse HEAD)
+          [[ -z "$EXPECTED_SOURCE" || "$source" == "$EXPECTED_SOURCE" ]]
+          echo "SOURCE_SHA=$source" >> "$GITHUB_ENV"
+      - name: Install Flatpak build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak xvfb weston
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.flatpak.Builder org.kde.Sdk//6.10 org.kde.Platform//6.10
+      - name: Detect Flatpak build resources and SDK identity
+        id: flatpak-sdk
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_linux_build_budget.py
+          python3 scripts/linux-build-budget.py
+          { printf '%s\n' "$ImageOS" "$ImageVersion"; uname -m; flatpak --version; flatpak info --user --show-commit org.flatpak.Builder; flatpak info --user --show-commit org.kde.Sdk//6.10; flatpak info --user --show-commit org.kde.Platform//6.10; } > flatpak-sdk-fingerprint.txt
+          flatpak run --command=ccache org.kde.Sdk//6.10 --version
+          echo "abi=$(sha256sum flatpak-sdk-fingerprint.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Restore SDK and manifest keyed compiler cache
+        id: flatpak-ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .flatpak-builder/ccache
+          key: flatpak-ccache-v1-${{ runner.arch }}-${{ steps.flatpak-sdk.outputs.abi }}-${{ hashFiles('packaging/flatpak/**', 'app/deploy/linux/appimage/*.patch', '.github/workflows/build-release.yml') }}-${{ github.sha }}
+          restore-keys: |
+            flatpak-ccache-v1-${{ runner.arch }}-${{ steps.flatpak-sdk.outputs.abi }}-${{ hashFiles('packaging/flatpak/**', 'app/deploy/linux/appimage/*.patch', '.github/workflows/build-release.yml') }}-
+      - name: Pin manifest to release source and version
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path('packaging/flatpak/com.moonlight_stream.Moonlight.json')
+          manifest = json.loads(path.read_text())
+          module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
+          sdl = next(m for m in manifest['modules'] if m['name'] == 'SDL3')
+          sdl['build-options']['config-opts'].append('-DSDL_WAYLAND=ON')
+          module['sources'][0]['commit'] = os.environ['SOURCE_SHA']
+          import re
+          assert re.fullmatch(r'6\.[12]\.0-daily\.[1-9][0-9]*', os.environ['CI_VERSION'])
+          module['post-install'] = [
+              'python3 -m unittest discover -s scripts/tests -p test_amdgpu_header_compat.py',
+              'g++ -std=c++17 -fsyntax-only -Iapp/streaming scripts/linux-gpu-capability.cpp',
+              'mkdir -p build/nightly-tests-updates build/nightly-tests-haptics build/nightly-tests-feedback build/nightly-tests-present build/nightly-tests-gpu',
+              'cd build/nightly-tests-updates && qmake ../../tests/updates/updates.pro CONFIG+=release && make -j2 && ./tst_autoupdatechecker',
+              'cd build/nightly-tests-haptics && qmake ../../tests/haptics/haptics.pro CONFIG+=release && make -j2 && ./tst_dualsensehaptics',
+              'cd build/nightly-tests-feedback && qmake ../../tests/vrr/waylandfeedback.pro && make -j2 && ./tst_waylandfeedback',
+              'cd build/nightly-tests-present && qmake ../../tests/vrr/plvkpresentation.pro && make -j2 && ./tst_plvkpresentation',
+              'cd build/nightly-tests-gpu && qmake ../../tests/vrr/gpuperformancehold.pro && make -j2 && ./tst_gpuperformancehold',
+              'BUILD_JOBS=2 bash scripts/test-linux-integration.sh qmake',
+              'python3 scripts/verify-linux-features.py --root /app --qt-plugins "$(qmake -query QT_INSTALL_PLUGINS)"'
+          ]
+          module['sources'][1]['commands'] = ['echo ' + os.environ['CI_VERSION'] + ' > app/version.txt']
+          path.write_text(json.dumps(manifest, indent=4) + '\n')
+          PY
+      - name: Build Flatpak
+        run: |
+          dbus-run-session -- flatpak run --env=CCACHE_DIR="$CCACHE_DIR" --env=CCACHE_MAXSIZE=512M org.flatpak.Builder --user --force-clean --sandbox --ccache --jobs="$BUILD_JOBS" --rebuild-on-sdk-change \
+            --install-deps-from=flathub --repo=flatpak-repo flatpak-build \
+            packaging/flatpak/com.moonlight_stream.Moonlight.json
+          flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
+            flatpak-repo "Moonlight-$CI_VERSION-x86_64.flatpak" \
+            com.moonlight_stream.Moonlight master
+      - name: Verify exported source and Gamescope patch
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads(Path('flatpak-build/files/manifest.json').read_text())
+          modules = {m['name']: m for m in manifest['modules']}
+          assert modules['moonlight']['sources'][0]['commit'] == os.environ['SOURCE_SHA']
+          assert any(s['type'] == 'patch' and 'libplacebo-disable-internally-synchronized-queues.patch' in s['path'] for s in modules['libplacebo']['sources'])
+          PY
+      - name: Install exported bundle and verify isolated launch
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export FLATPAK_USER_DIR="$RUNNER_TEMP/nightly-flatpak-user"
+          dbus-run-session -- flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          dbus-run-session -- flatpak install --user -y flathub org.kde.Platform//6.10
+          dbus-run-session -- flatpak install --user --noninteractive -y "./Moonlight-$CI_VERSION-x86_64.flatpak"
+          flatpak info --user --show-ref com.moonlight_stream.Moonlight//master | grep -Fx app/com.moonlight_stream.Moonlight/x86_64/master
+          flatpak info --user --show-runtime com.moonlight_stream.Moonlight//master | grep -Fx org.kde.Platform/x86_64/6.10
+          installed=$(flatpak info --user --show-location com.moonlight_stream.Moonlight//master)
+          export INSTALLED_PATH="$installed"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads((Path(os.environ['INSTALLED_PATH']) / 'files/manifest.json').read_text())
+          module = next(m for m in manifest['modules'] if m['name'] == 'moonlight')
+          assert module['sources'][0]['commit'] == os.environ['SOURCE_SHA']
+          assert module['sources'][1]['commands'] == ['echo ' + os.environ['CI_VERSION'] + ' > app/version.txt']
+          assert (Path(os.environ['INSTALLED_PATH']) / 'files/bin/moonlight').is_file()
+          PY
+          dbus-run-session -- xvfb-run -a flatpak run --user --env=QT_QPA_PLATFORM=xcb com.moonlight_stream.Moonlight//master --version > installed-version.txt
+          grep -Fx "Moonlight $CI_VERSION" installed-version.txt
+          bash scripts/smoke-linux-wayland.sh flatpak run --user --env=QT_QPA_PLATFORM=wayland com.moonlight_stream.Moonlight//master --version > installed-wayland-version.txt
+          grep -Fx "Moonlight $CI_VERSION" installed-wayland-version.txt
+          echo 'Installed exported x86_64 bundle, source/version, runtime and sandboxed launch verified.'
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Moonlight-Flatpak-${{ env.CI_VERSION }}
+          path: Moonlight-${{ env.CI_VERSION }}-x86_64.flatpak
+          compression-level: 0
+          if-no-files-found: error
+      - name: Save verified Flatpak compiler cache
+        if: success() && (github.ref_name == github.event.repository.default_branch || (github.repository == 'Nonary/moonlight-qt' && github.event_name == 'workflow_dispatch' && github.ref_type == 'branch')) && steps.flatpak-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .flatpak-builder/ccache
+          key: ${{ steps.flatpak-ccache.outputs.cache-primary-key }}

@@ -88,6 +88,7 @@ private:
         uint64_t revision = 0;
         std::chrono::steady_clock::time_point queued;
         int fontSize = 0;
+        int outputWidth = 0, outputHeight = 0;
         SDL_Color color = {};
         char text[1024] = {};
 

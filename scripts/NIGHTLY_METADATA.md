@@ -32,6 +32,15 @@ First nightly notes explicitly claim no baseline or delta. Same-source nightlies
 Run focused offline checks with `python -m unittest discover -s scripts/tests -p test_nightly_notes.py -v`. No credential, signing, OS trust, release creation or network access is needed by these tests.
 # Unchanged-source policy
 
+Daily releases require Windows setup/portable, a universal macOS DMG, Linux
+x86_64 AppImage and Linux x86_64 Flatpak. Each package is built from the same
+exact source SHA. The optional `artifacts` metadata list records each package's
+name, source SHA and SHA256; SHA256SUMS also covers the metadata itself. A missing
+package may be completed by dispatching its source-pinned packaging workflow
+against the existing nightly source/version, verifying the installed bundle,
+and updating metadata/checksums without replacing existing binaries or tags.
+This completion does not allocate a duplicate-source nightly.
+
 Before allocating a build number or starting platform builds, the daily workflow
 compares its pinned source SHA with this repository's last successfully published
 nightly. Drafts, unpublished releases, stable releases and failed build runs do

@@ -38,6 +38,12 @@ struct VrrSessionConfig {
     // The IDs are persisted and therefore remain stable across label changes.
     int latencyMode = 0;
     VrrTimingOptions timingOptions;
+    // Experimental activation marker; zero keeps normal policy. The effective
+    // profile smoothness target supplies probability (never this marker value).
+    bool experimentalBoundedCatchup = false;
+    uint64_t experimentalInputPercentilePpm = 0;
+    uint64_t experimentalInputPercentileWindowUs = 60000000;
+    uint64_t experimentalInputPercentileRiseUsPerSecond = 1000;
     // Session-native A/B choice, recorded separately from controller timing.
     bool allowTearing = true;
     std::string calibrationKey;

@@ -4,6 +4,9 @@ CONFIG += ordered
 linkpolicy.file = $$PWD/linkpolicy.pro
 SUBDIRS += linkpolicy
 
+d3d11interop.file = $$PWD/d3d11interop.pro
+SUBDIRS += d3d11interop
+
 framing.file = $$PWD/framing.pro
 SUBDIRS += framing
 

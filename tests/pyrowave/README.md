@@ -16,8 +16,10 @@ socket for IPv4 and IPv6, a lost first token is retried, measured reception
 stops retries, cancellation sends no token, and invalid or unannounced source
 ports are rejected. A progressive HTTP fixture verifies that Qt delivers the
 port header while the body is still pending and completes that body only after
-the UDP token arrives. These loopback checks do not replace a live-host test
-through Windows Firewall.
+the UDP token arrives. Close-delimited response fixtures deliberately retain the HTTP connection after
+complete XML and verify early completion without consuming the body. Partial XML,
+trailing junk, HTTP errors, Content-Length and chunked framing reject the fallback.
+These loopback checks do not replace a live-host test through Windows Firewall.
 The Mac delayed-reader cases hold packets for 160 ms before reading, check
 that kernel timestamps retain the original spacing, and verify Qt's next
 datagram notification still works for IPv4 and IPv6. The link-policy suite

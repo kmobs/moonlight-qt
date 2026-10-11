@@ -93,6 +93,7 @@ def make_notes(repo, tag, version, source, previous, commits, ancestor=True):
                     commits_total=len(commits), commits_listed=len(commits))
     if repo == 'Nonary/moonlight-qt':
         metadata['windows_product_version'] = f'6.2.{seq}'
+        return moonlight_notes(repo, tag, version, previous, commits, compare, ancestor), metadata
     notes = [f'## Nightly changes ({version})', '', f'Source: [{source}](https://github.com/{repo}/commit/{source})', '']
     if first:
         notes += ['First published nightly: no previous successful nightly baseline exists. No commit delta is claimed.']
@@ -110,6 +111,43 @@ def make_notes(repo, tag, version, source, previous, commits, ancestor=True):
             fence = '`' * max(3, max((len(m[0]) for m in re.finditer(r'`+', message)), default=0) + 1)
             notes += ['', f'[{sha[:12]}](https://github.com/{repo}/commit/{sha})', fence + 'text', message.rstrip('\n'), fence]
     return '\n'.join(notes) + '\n', metadata
+
+
+def moonlight_notes(repo, tag, version, previous, commits, compare, ancestor):
+    import html
+    notes = ['This is a nightly release of Moonlight and contains several bug fixes and may contain new features. Check the commit log for more information.',
+             '', 'Moonlight builds are unsigned and may show an unverified publisher. macOS builds are not Developer ID signed or notarized. These nightly builds may trigger security warnings or false-positive antivirus alerts.']
+    if version.startswith('6.2.0-daily.'):
+        notes += ['', 'Windows, Mac and AppImage users of 6.1.0-daily.182 or earlier must download this update manually once; automatic nightly update notifications work after upgrading.']
+    notes += ['', f'[SHA256 checksums](https://github.com/{repo}/releases/download/{tag}/SHA256SUMS)',
+              '', '### Linux installation', '',
+              'Download either Linux x86_64 package below. For Flatpak, install Flatpak through your distribution\'s software manager first, then run:',
+              '', '```sh',
+              'flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo',
+              f'flatpak install --user --reinstall ./Moonlight-{version}-x86_64.flatpak',
+              'flatpak run --user com.moonlight_stream.Moonlight//master', '```', '',
+              'This nightly uses the `master` branch; the regular Flathub package uses `stable`. To update a Flatpak nightly, repeat the install command with the newer downloaded bundle. On Steam Deck, install in Desktop Mode and add this nightly branch to Steam.',
+              '', 'For AppImage:', '', '```sh',
+              f'chmod +x ./Moonlight-{version}-x86_64.AppImage',
+              f'./Moonlight-{version}-x86_64.AppImage', '```', '',
+              'If your distribution lacks FUSE support, launch the AppImage with `--appimage-extract-and-run`.',
+              '', '<details>', '<summary>Commit log</summary>', '']
+    if previous:
+        old_tag = previous['tag']
+        notes += [f'Changes since [{old_tag}](https://github.com/{repo}/releases/tag/{old_tag}) | [Compare]({compare})', '']
+        if not ancestor:
+            notes += ['Source history changed; this log lists newly reachable commits.', '']
+    else:
+        notes += ['First nightly release; no preceding nightly is available for comparison.', '']
+    for sha, message in commits:
+        exact_sha(sha)
+        subject = html.escape(message.splitlines()[0] if message.splitlines() else '(no commit subject)')
+        subject = subject.replace('\\', '\\\\').replace('[', '\\[').replace(']', '\\]')
+        notes += [f'- [{sha[:12]}](https://github.com/{repo}/commit/{sha}) {subject}']
+    if previous and not commits:
+        notes += ['No new commits in this comparison.']
+    notes += ['', '</details>']
+    return '\n'.join(notes) + '\n'
 
 
 def load_previous(repo):
@@ -153,6 +191,8 @@ def generate(repo, tag, version, source, assets, notes):
             commits.append((exact_sha(fields[index].strip()), fields[index + 1]))
     body, metadata = make_notes(repo, tag, version, source, previous, commits, ancestor)
     root = Path(assets)
+    if repo == 'Nonary/moonlight-qt':
+        metadata['artifacts'] = artifact_metadata(root, source)
     (root / 'nightly-metadata.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
     with Path(notes).open('a', encoding='utf-8') as output:
         output.write('\n' + body)
@@ -161,6 +201,14 @@ def generate(repo, tag, version, source, assets, notes):
     if any(not p.is_file() or p.is_symlink() or '\n' in p.name or '\r' in p.name for p in files):
         raise ValueError('Unsafe checksum input')
     (root / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in files), encoding='utf-8')
+
+
+def artifact_metadata(root, source):
+    source = exact_sha(source)
+    packages = sorted(p for p in Path(root).iterdir() if p.name not in ('nightly-metadata.json', 'SHA256SUMS'))
+    if any(not p.is_file() or p.is_symlink() for p in packages):
+        raise ValueError('Unsafe package metadata input')
+    return [dict(name=p.name, source_commit=source, sha256=hashlib.sha256(p.read_bytes()).hexdigest()) for p in packages]
 
 
 if __name__ == '__main__':

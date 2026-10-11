@@ -175,6 +175,32 @@ jobs:
           python tests/vrr/check_diagnostic_zip.py build/diagnostic-fixture.zip
           if ($LASTEXITCODE -ne 0) { throw "Diagnostic export ZIP validation failed" }
 
+      - name: Test integrated settings and handshake fixes (Windows x64)
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          QT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\bin
+          QML_IMPORT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\qml
+          QML2_IMPORT_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\qml
+          QT_PLUGIN_PATH: ${{ github.workspace }}\..\Qt\${{ matrix.qt_version }}\msvc2022_64\plugins
+          QT_QPA_PLATFORM: offscreen
+          QT_QUICK_BACKEND: software
+        run: |
+          $deploy = (Resolve-Path build/deploy-x64-release).Path
+          $env:Path = "$deploy;$env:QT_PATH;$env:Path"
+          foreach ($name in @('tst_calibrationhosts.exe', 'tst_toleranceinput.exe', 'tst_pyrowaveudpaddress.exe', 'tst_pyrowaved3d11interop.exe')) {
+            $test = @(Get-ChildItem build/tests-vrr -Recurse -Filter $name | Where-Object { $_.Directory.Name -eq 'release' })
+            if ($test.Count -ne 1) { throw "Missing or ambiguous integrated test $name" }
+            Write-Host "Running $name with SDK QML runtime $env:QML_IMPORT_PATH"
+            if ($name -in @('tst_calibrationhosts.exe', 'tst_toleranceinput.exe')) {
+              & $test[0].FullName -o "-,txt"
+            } else {
+              & $test[0].FullName
+            }
+            if ($LASTEXITCODE -ne 0) { throw "$name failed: $LASTEXITCODE" }
+          }
+
       - name: Test DualSense haptics (Windows x64)
         timeout-minutes: 2
         if: runner.os == 'Windows'

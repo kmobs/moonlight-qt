@@ -87,3 +87,11 @@ linux:packagesExist(wayland-client wayland-server) {
     gamescoperepaint.file = $$PWD/gamescoperepaint.pro
     SUBDIRS += gamescoperepaint
 }
+
+phasetrajectory.file = $$PWD/phasetrajectory.pro
+SUBDIRS += phasetrajectory
+inputpercentileintegration.file = $$PWD/inputpercentileintegration.pro
+SUBDIRS += inputpercentileintegration
+
+performancestats.file = $$PWD/performancestats.pro
+SUBDIRS += performancestats

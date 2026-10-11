@@ -271,6 +271,8 @@ bool validateTraceRowSyntax(const QList<QByteArray>& header,
                             QString& error)
 {
     static const QSet<QByteArray> signedColumns {
+        "trajectory_successor_frame",
+        "input_percentile_last_input_required_us",
         "frame",
         "display_refresh_hz",
         "stream_rate_hz",
@@ -8024,6 +8026,9 @@ int main(int argc, char* argv[])
     QCommandLineOption exactOption(
         "require-exact-baseline",
         "Fail unless the trace sequence is complete and an unmodified configuration exactly reproduces all controller decision fields, submissions, tear classes, and raster-envelope classes");
+    QCommandLineOption restoredStartSeedOption(
+        "recorded-start-delay-seed-us",
+        "Explicitly restore an externally corroborated startup seed omitted by an older trace writer; retain every original decision audit and label the reconstructed input in fidelity", "us");
     QCommandLineOption controllerReadyOption(
         "require-controller-ready",
         "Fail unless the capture passes every controller-replay readiness gate");
@@ -8062,6 +8067,7 @@ int main(int argc, char* argv[])
     parser.addOption(outputOption);
     parser.addOption(timelineOption);
     parser.addOption(exactOption);
+    parser.addOption(restoredStartSeedOption);
     parser.addOption(controllerReadyOption);
     parser.addOption(diagnosticCaptureReadyOption);
     parser.addOption(rasterReadyOption);
@@ -8116,6 +8122,15 @@ int main(int argc, char* argv[])
         std::fprintf(stderr,
                      "--require-exact-baseline cannot be used with candidate overrides\n");
         return 2;
+    }
+    uint64_t restoredStartSeedUs = 0;
+    if (parser.isSet(restoredStartSeedOption)) {
+        bool seedOk = false;
+        restoredStartSeedUs = parser.value(restoredStartSeedOption).toULongLong(&seedOk);
+        if (!seedOk || restoredStartSeedUs > uint64_t(std::numeric_limits<qint64>::max())) {
+            std::fprintf(stderr, "--recorded-start-delay-seed-us must be a nonnegative integer within signed 64-bit range\n");
+            return 2;
+        }
     }
     int displayOverrideHz = 0;
     int streamOverrideFps = 0;
@@ -8276,6 +8291,8 @@ int main(int argc, char* argv[])
             if (parser.isSet(streamOption)) arguments << "--stream-fps" << parser.value(streamOption);
             if (parser.isSet(latchOption)) arguments << "--no-latch";
             if (parser.isSet(compareOption)) arguments << "--compare" << parser.value(compareOption);
+            if (parser.isSet(restoredStartSeedOption))
+                arguments << "--recorded-start-delay-seed-us" << parser.value(restoredStartSeedOption);
             if (parser.isSet(controllerReadyOption))
                 arguments << "--require-controller-ready";
             if (parser.isSet(diagnosticCaptureReadyOption))
@@ -8657,6 +8674,7 @@ int main(int argc, char* argv[])
     VrrSessionConfig capturedConfig;
     VrrSessionConfig simulatedConfig;
     VrrTimingParameters capturedParameters;
+    uint64_t serializedStartSeedUs = 0;
     QMap<int, QByteArray> capturedParameterValues;
     std::unique_ptr<VrrTimingController> referenceController;
     std::unique_ptr<VrrTimingController> simulatedController;
@@ -11870,6 +11888,14 @@ int main(int argc, char* argv[])
                     return 1;
                 }
             }
+            serializedStartSeedUs = capturedParameters.playoutDelayStartSeedUs;
+            if (parser.isSet(restoredStartSeedOption)) {
+                capturedParameters.playoutDelayStartSeedUs = restoredStartSeedUs;
+                std::fprintf(stderr,
+                    "Startup input reconstructed explicitly: serialized start-delay seed=%llu us, restored=%llu us; original decision audits remain active\n",
+                    (unsigned long long)serializedStartSeedUs,
+                    (unsigned long long)restoredStartSeedUs);
+            }
             capturedConfig.latencyFix = capturedParameters.latencyFixEnabled != 0 &&
                 capturedParameters.latencyFixAllRates == 0;
             capturedConfig.latencyMode = capturedParameters.latencyFixAllRates != 0 ?
@@ -13243,6 +13269,32 @@ int main(int argc, char* argv[])
             referenceController->schedule(frame, decisionUs);
         const VrrTimingDecision simulatedDecision =
             simulatedController->schedule(frame, simulatedDecisionUs);
+        if (traceHeader.contains("trajectory_resync_dropped")) {
+            const bool resyncDrop=optionalUnsignedField(fields,traceHeader.indexOf("trajectory_resync_dropped"))!=0;
+            const bool resyncDeferred=optionalUnsignedField(fields,traceHeader.indexOf("trajectory_resync_deferred"))!=0;
+            if ((resyncDrop && resyncDeferred) || ((resyncDrop || resyncDeferred) && !referenceDecision.trajectory.resyncRecommended) ||
+                (resyncDrop && disposition!="stale")) ++metrics.invalidControllerLifecycleRows;
+            const int64_t successorFrame=optionalSignedField(fields,traceHeader.indexOf("trajectory_successor_frame"));
+            const uint64_t successorProof=optionalUnsignedField(fields,traceHeader.indexOf("trajectory_successor_proof"));
+            if(resyncDrop && (successorFrame<=frameNumber || (successorProof!=1 && successorProof!=2)))
+                ++metrics.invalidControllerLifecycleRows;
+            // This validates the recorded reservation contract, not physical GPU completion.
+            if(resyncDrop) {referenceController->noteTrajectoryResyncDrop();simulatedController->noteTrajectoryResyncDrop();}
+            if(resyncDeferred) {referenceController->noteTrajectoryDeferred();simulatedController->noteTrajectoryDeferred();}
+        }
+        if (traceHeader.contains("input_buffer_miss_observation_us")) {
+            const uint64_t missAtUs = optionalUnsignedField(fields,
+                traceHeader.indexOf("input_buffer_miss_observation_us"));
+            const bool networkMiss = optionalUnsignedField(fields,
+                traceHeader.indexOf("input_network_buffer_miss")) != 0;
+            const bool decoderMiss = optionalUnsignedField(fields,
+                traceHeader.indexOf("input_decode_buffer_miss")) != 0;
+            if (missAtUs && (networkMiss || decoderMiss)) {
+                referenceController->noteInputBufferMiss(missAtUs, networkMiss, decoderMiss);
+                simulatedController->noteInputBufferMiss(missAtUs, networkMiss, decoderMiss);
+            }
+        }
+
         timelineDetails.simulatedSourcePeriodUs =
             simulatedDecision.sourcePeriodUs;
         timelineDetails.simulatedReadyOffsetUs =
@@ -13334,6 +13386,25 @@ int main(int argc, char* argv[])
                 ++metrics.invalidControllerLifecycleRows;
             }
         };
+        if (traceHeader.contains("trajectory_target_us")) {
+            auditBufferField("trajectory_nominal_us",referenceDecision.trajectory.nominalUs);
+            auditBufferField("trajectory_existing_us",referenceDecision.trajectory.existingUs);
+            auditBufferField("trajectory_target_us",referenceDecision.trajectory.targetUs);
+            auditBufferField("trajectory_added_us",referenceDecision.trajectory.addedUs);
+            auditBufferField("trajectory_carry_us",referenceDecision.trajectory.carryUs);
+            auditBufferField("trajectory_minimum_interval_us",referenceDecision.trajectory.minimumIntervalUs);
+            auditBufferField("trajectory_physical_period_us",referenceDecision.trajectory.physicalPeriodUs);
+            auditBufferField("trajectory_allowance_us",referenceDecision.trajectory.allowanceUs);
+            auditBufferField("trajectory_intended_interval_us",referenceDecision.trajectory.intendedIntervalUs);
+            auditBufferField("trajectory_plans",referenceDecision.trajectory.plans);
+            auditBufferField("trajectory_limited",referenceDecision.trajectory.limited);
+            auditBufferField("trajectory_resets",referenceDecision.trajectory.resets);
+            auditBufferField("trajectory_resync_drops",referenceDecision.trajectory.resyncDrops);
+            auditBufferField("trajectory_deferred",referenceDecision.trajectory.deferred);
+            auditBufferField("trajectory_continuity",referenceDecision.trajectory.continuity);
+            auditBufferField("trajectory_no_headroom",referenceDecision.trajectory.noHeadroom);
+            auditBufferField("trajectory_resync_recommended",referenceDecision.trajectory.resyncRecommended);
+        }
         if (traceHeader.contains("buffer_cap_us")) {
             auditBufferField("buffer_cap_us", referenceDecision.playoutDelayMaximumUs);
             auditBufferField("buffer_queue_limit_us", referenceDecision.playoutQueueLimitUs);
@@ -13360,6 +13431,67 @@ int main(int argc, char* argv[])
             auditBufferField("buffer_clipped_increase_us", update.clippedIncreaseUs);
             auditBufferField("buffer_hold_remaining_us", update.holdRemainingUs);
             auditBufferField("buffer_cooldown_remaining_us", update.cooldownRemainingUs);
+            if (traceHeader.contains("input_release_allowed")) {
+                const auto stats = referenceController->intervalStats();
+                auditBufferField("input_release_allowed", stats.inputReleaseAllowed);
+                auditBufferField("input_release_held", stats.inputReleaseHeld);
+                auditBufferField("input_release_unknown", stats.inputReleaseUnknown);
+                auditBufferField("input_evidence_us", stats.inputEvidenceUs);
+                auditBufferField("input_candidate_us", stats.inputCandidateUs);
+                auditBufferField("input_candidate_loss_per_million", uint64_t(stats.inputCandidateLoss * 1000000));
+                auditBufferField("input_current_loss_per_million", uint64_t(stats.inputCurrentLoss * 1000000));
+            }
+            if (traceHeader.contains("input_percentile_target_us")) {
+                const auto stats = referenceController->intervalStats().inputPercentile;
+                auditBufferField("input_percentile_target_us", stats.targetUs);
+                auditBufferField("input_percentile_current_us", stats.currentUs);
+                auditBufferField("input_percentile_samples", stats.samples);
+                auditBufferField("input_percentile_window_us", stats.windowUs);
+                auditBufferField("input_percentile_probability_ppm", stats.probabilityPpm);
+                auditBufferField("input_percentile_tail_uncertain", stats.tailUncertain);
+                auditBufferField("input_percentile_evidence_valid", stats.evidenceValid);
+                auditBufferField("input_percentile_clipped", stats.clipped);
+                auditBufferField("input_percentile_expired_unknown", stats.expiredUnknown);
+                auditBufferField("input_percentile_history_truncated", stats.historyTruncated);
+                auditBufferField("input_percentile_eligible", stats.eligible);
+                auditBufferField("input_percentile_ineligible", stats.ineligible);
+                auditBufferField("input_percentile_absorbed", stats.absorbed);
+                auditBufferField("input_percentile_missed", stats.missed);
+                auditBufferField("input_percentile_raises", stats.raises);
+                auditBufferField("input_percentile_lowers", stats.lowers);
+                auditBufferField("input_percentile_unknown_release", stats.unknownRelease);
+                auditBufferField("input_percentile_epoch_resets", stats.epochResets);
+                if (traceHeader.contains("input_percentile_recent_eligible")) {
+                    auditBufferField("input_percentile_recent_eligible", stats.recentEligible);
+                    auditBufferField("input_percentile_recent_absorbed", stats.recentAbsorbed);
+                    auditBufferField("input_percentile_recent_missed", stats.recentMissed);
+                }
+                if (traceHeader.contains("input_percentile_release_factor_ppm")) {
+                    auditBufferField("input_percentile_release_samples", stats.recentReleaseSamples);
+                    auditBufferField("input_percentile_release_misses", stats.recentReleaseMisses);
+                    auditBufferField("input_percentile_release_factor_ppm", stats.releaseFactorPpm);
+                    auditBufferField("input_percentile_effective_fall_rate_us_per_second", stats.effectiveFallRateUsPerSecond);
+                    auditBufferField("input_percentile_proposed_misses", stats.recentProposedMisses);
+                    auditBufferField("input_percentile_effective_fall_rate_milli_us_per_second", stats.effectiveFallRateMilliUsPerSecond);
+                }
+                if (traceHeader.contains("input_percentile_hold_until_us")) {
+                    auditBufferField("input_percentile_hold_until_us", stats.holdUntilUs);
+                    auditBufferField("input_percentile_hold_remaining_us", stats.holdRemainingUs);
+                    auditBufferField("input_percentile_last_buffer_miss_us", stats.lastBufferMissUs);
+                    auditBufferField("input_percentile_last_network_miss_us", stats.lastNetworkMissUs);
+                    auditBufferField("input_percentile_last_decoder_miss_us", stats.lastDecoderMissUs);
+                    auditBufferField("input_percentile_network_misses", stats.cumulativeNetworkMisses);
+                    auditBufferField("input_percentile_decoder_misses", stats.cumulativeDecoderMisses);
+                }
+                if (traceHeader.contains("input_percentile_growth_blocked")) {
+                    auditBufferField("input_percentile_last_input_eligible", stats.lastInputEligible);
+                    auditBufferField("input_percentile_last_input_observation_us", stats.lastInputObservationUs);
+                    auditBufferField("input_percentile_growth_blocked", stats.growthBlocked);
+                    const int column = traceHeader.indexOf("input_percentile_last_input_required_us");
+                    if (column < 0 || optionalSignedField(fields, column) != stats.lastInputRequiredUs)
+                        ++metrics.invalidControllerLifecycleRows;
+                }
+            }
             if (traceHeader.contains("buffer_calibration_complete")) {
                 const auto stats = referenceController->intervalStats();
                 auditBufferField("buffer_calibration_complete", stats.initialCalibrationComplete);
@@ -15121,6 +15253,19 @@ int main(int argc, char* argv[])
         capturedConfig.allowAdditionalQueuedFrame,
         capturedConfig.allowTearing, simulatedCanLatch, capturedParameters.playoutResponsiveBuffer,
         scenario);
+    QJsonObject startupInput;
+    startupInput["externally_reconstructed"] = parser.isSet(restoredStartSeedOption);
+    startupInput["serialized_start_delay_seed_us"] = static_cast<qint64>(serializedStartSeedUs);
+    startupInput["effective_start_delay_seed_us"] = static_cast<qint64>(capturedParameters.playoutDelayStartSeedUs);
+    startupInput["restoration_option"] = parser.isSet(restoredStartSeedOption) ?
+        QStringLiteral("--recorded-start-delay-seed-us") : QString();
+    startupInput["scope"] = "explicit startup parameter restoration only; every original decision audit remains active";
+    QJsonObject fidelityWithStartup = summary.value("fidelity").toObject();
+    fidelityWithStartup["startup_input"] = startupInput;
+    if (parser.isSet(restoredStartSeedOption))
+        fidelityWithStartup["baseline_scope"] = fidelityWithStartup.value("baseline_scope").toString() +
+            QStringLiteral("; startup seed reconstructed from explicit external input");
+    summary["fidelity"] = fidelityWithStartup;
     bool comparisonCompatible = true;
     if (parser.isSet(compareOption)) {
         QFile baselineFile(parser.value(compareOption));

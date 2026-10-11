@@ -269,6 +269,7 @@ HEADERS += \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
+    gui/onlinecomputerentries.h \
     gui/appmodel.h \
     streaming/video/decoder.h \
     streaming/vrrratepolicy.h \
@@ -312,6 +313,9 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
@@ -730,3 +734,6 @@ PE_VERSION = $$(MOONLIGHT_PE_VERSION)
 DEFINES += VERSION_STR=\\\"$$MOONLIGHT_VERSION\\\"
 
 SOURCES += $$PWD/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp
+
+# Compact presentation-only stats formatter.
+HEADERS += streaming/video/performancestats.h

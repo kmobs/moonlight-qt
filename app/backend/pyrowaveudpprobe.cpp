@@ -1,6 +1,8 @@
 #include "pyrowaveudpprobe.h"
 
 #include <QEventLoop>
+#include <QNetworkReply>
+#include <QXmlStreamReader>
 #include <QHostInfo>
 #include <QTimer>
 #include <QUdpSocket>
@@ -56,6 +58,31 @@ QHostAddress resolveHost(const QString& hostname, const std::atomic<bool>& cance
     throw std::runtime_error(QString("Could not resolve PyroWave UDP host '%1': %2")
                              .arg(hostname, result.errorString()).toStdString());
 }
+}
+
+bool PyroWaveUdp::completeCloseDelimitedResponse(QNetworkReply& reply)
+{
+    const int status = reply.attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (status != 200 || reply.error() != QNetworkReply::NoError ||
+        reply.hasRawHeader("Content-Length") || reply.hasRawHeader("Transfer-Encoding") ||
+        reply.rawHeader("Connection").trimmed().toLower() != "close" ||
+        !reply.hasRawHeader("X-PyroWave-Udp-Port") ||
+        reply.bytesAvailable() == 0 || reply.bytesAvailable() > 4096) return false;
+
+    // Peek leaves the body intact for NvHTTP's normal status/count validation.
+    // Parsing the entire bounded document rejects partial XML and trailing junk.
+    QXmlStreamReader xml(reply.peek(4096));
+    if (!xml.readNextStartElement() || xml.name() != QStringLiteral("root") ||
+        xml.attributes().value("status_code") != QStringLiteral("200")) return false;
+    bool expected = false, sent = false, elapsed = false;
+    while (xml.readNextStartElement()) {
+        expected |= xml.name() == QStringLiteral("expected");
+        sent |= xml.name() == QStringLiteral("sent");
+        elapsed |= xml.name() == QStringLiteral("elapsedMs");
+        xml.skipCurrentElement();
+    }
+    while (!xml.atEnd()) xml.readNext();
+    return !xml.hasError() && expected && sent && elapsed;
 }
 
 QHostAddress PyroWaveUdp::bindReceiver(QUdpSocket& socket, const QString& hostname,

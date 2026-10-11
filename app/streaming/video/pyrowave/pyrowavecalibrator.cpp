@@ -255,7 +255,11 @@ struct Renderer {
                 0, 0, nullptr, nullptr,
                 reinterpret_cast<const pyrowave_luid*>(&description.AdapterLuid),
                 &decodeDevice) == PYROWAVE_SUCCESS;
-            const bool interop = compatible && pyrowave_device_confirm_interop_support(decodeDevice);
+            // Adapter selection accepts a usable plane family. Each SDR/HDR
+            // FormatTester then validates its actual format in Decoder::initialize.
+            const bool interop = compatible &&
+                (pyrowave_device_confirm_d3d11_interop_support(decodeDevice, VK_FORMAT_R8_UNORM, nullptr) ||
+                 pyrowave_device_confirm_d3d11_interop_support(decodeDevice, VK_FORMAT_R16_UNORM, nullptr));
             if (decodeDevice) pyrowave_device_destroy(decodeDevice);
             if (!interop) {
                 device.Reset();

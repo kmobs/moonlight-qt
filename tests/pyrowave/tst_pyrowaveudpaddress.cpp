@@ -149,6 +149,53 @@ static void progressiveHeaders()
     std::puts("Progressive port headers precede UDP handshake and final body PASS");
 }
 
+static void closeDelimitedResponse()
+{
+    const QByteArray body("<root status_code=\"200\"><expected>819</expected><sent>819</sent><elapsedMs>2000</elapsedMs></root>");
+    for (int variant = 0; variant < 6; ++variant) {
+        QTcpServer server;
+        require(server.listen(QHostAddress::LocalHost, 0), "Could not open close-delimited fixture");
+        bool wrote = false;
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [&] {
+            auto* connection = server.nextPendingConnection();
+            QObject::connect(connection, &QTcpSocket::readyRead, &server, [&, connection] {
+                connection->readAll();
+                if (wrote) return;
+                wrote = true;
+                QByteArray headers = variant == 5 ? "HTTP/1.1 400 Bad Request\r\n" : "HTTP/1.1 200 OK\r\n";
+                headers += "Connection: close\r\nX-PyroWave-Udp-Port: 12345\r\n";
+                if (variant == 2) headers += "Content-Length: 1000\r\n";
+                if (variant == 3) headers += "Transfer-Encoding: chunked\r\n";
+                connection->write(headers + "\r\n" + (variant == 3 ? "100\r\n" : "") + body.left(40));
+                // Deliberately keep the socket open after the final XML byte.
+                QTimer::singleShot(50, &server, [&, connection] {
+                    if (variant != 1) connection->write(body.mid(40) + (variant == 4 ? "junk" : ""));
+                });
+            });
+        });
+        QNetworkAccessManager network;
+        auto* reply = network.get(QNetworkRequest(QUrl(QString("http://127.0.0.1:%1/probe").arg(server.serverPort()))));
+        bool accepted = false;
+        bool acceptedPartial = false;
+        QEventLoop loop;
+        QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&] {
+            if (PyroWaveUdp::completeCloseDelimitedResponse(*reply)) {
+                accepted = true;
+                acceptedPartial = reply->bytesAvailable() < body.size();
+                loop.quit();
+            }
+        });
+        QTimer::singleShot(250, &loop, &QEventLoop::quit);
+        loop.exec();
+        require(accepted == (variant == 0) && !acceptedPartial,
+                "Close-delimited completion accepted a partial, invalid or explicitly framed response");
+        if (accepted) require(!reply->isFinished() && reply->readAll() == body,
+                              "Completion consumed the response or waited for HTTP EOF");
+        delete reply;
+    }
+    std::puts("Complete close-delimited XML without EOF; partial/framed/invalid/error rejection PASS");
+}
+
 static void hostFixture(const QString& executable)
 {
     QProcess fixture;
@@ -281,6 +328,7 @@ int main(int argc, char** argv)
         handshake(QAbstractSocket::IPv4Protocol);
         handshake(QAbstractSocket::IPv6Protocol);
         progressiveHeaders();
+        closeDelimitedResponse();
         std::atomic<bool> cancelled(true);
         QUdpSocket stopped;
         QElapsedTimer time;

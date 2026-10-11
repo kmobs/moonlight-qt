@@ -129,7 +129,7 @@ private:
     bool ensureVrrSourceRetentionSlot();
     bool vrrSourceFrameBusy(const pl_frame& frame) const;
     void retireCompletedVrrSourceFrames();
-    void retainVrrSourceFrame(pl_frame& frame);
+    void retainVrrSourceFrame(pl_frame& frame, AVFrame* owner = nullptr);
     void releaseAllVrrSourceFrames();
 #endif
 
@@ -257,9 +257,12 @@ private:
         int64_t pts;
         uint64_t outputUs;
         uint64_t lastBusyUs;
+        // Pool-backed PyroWave frames have no libplacebo AVFrame mapping.
+        AVFrame* poolOwner;
     };
     std::deque<RetainedSource> m_VrrRetainedSourceFrames;
     bool m_VrrCurrentSourceRetained = false;
+    bool m_LoggedPyroWaveRenderFormat = false;
     uint64_t m_VrrRetainedSourceFrameTotal = 0;
     uint64_t m_VrrSourceRetirementWaits = 0;
     uint64_t m_VrrSourceRetirementWaitUs = 0;

@@ -35,6 +35,11 @@ public:
         return m_Complete && m_Succeeded && !cancelled();
     }
 
+    bool readyForPresentation() {
+        QMutexLocker lock(&m_Lock);
+        return m_Complete && m_Succeeded && !cancelled();
+    }
+
     void complete(bool succeeded)
     {
         QMutexLocker lock(&m_Lock);

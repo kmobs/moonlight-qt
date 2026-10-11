@@ -8,6 +8,10 @@ contains(CONFIG, tests) {
     SUBDIRS += vrr
     SUBDIRS += haptics
     SUBDIRS += pyrowave
+    toleranceInput.file = $$PWD/input/tolerance.pro
+    SUBDIRS += toleranceInput
+    calibrationHosts.file = $$PWD/qml/calibration-hosts.pro
+    SUBDIRS += calibrationHosts
     macx {
         controllerNavigation.file = $$PWD/qml/controller-navigation.pro
         SUBDIRS += controllerNavigation

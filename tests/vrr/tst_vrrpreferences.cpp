@@ -72,17 +72,21 @@ private slots:
         for (int mode : {0, 1, 2}) {
             prefs->applyVrrPreset(mode);
             QCOMPARE(prefs->vrrTargetHundredths(), mode == 2 ? 9900 : mode == 1 ? 9950 : 9995);
+            QCOMPARE(prefs->vrrToleranceUs(), 500);
             prefs->save();
             prefs->reload();
             QCOMPARE(prefs->vrrTargetHundredths(), mode == 2 ? 9900 : mode == 1 ? 9950 : 9995);
+            QCOMPARE(prefs->vrrToleranceUs(), 500);
         }
     }
     void oldSavedPresetsMigrateOnce()
     {
         auto* prefs = StreamingPreferences::get();
-        for (int revision : {0, 1}) for (int mode : {0, 1, 2}) {
+        for (int revision : {0, 1, 2}) for (int mode : {0, 1, 2}) {
             QSettings().clear();
-            const VrrTimingOptions oldPreset = revision == 1 ?
+            const VrrTimingOptions oldPreset = revision == 2 ?
+                (mode == 2 ? VrrTimingOptions{500, 9900, 60, 500} : mode == 0 ?
+                 VrrTimingOptions{4000, 9995, 300, 250} : VrrTimingOptions{1000, 9950, 120, 500}) : revision == 1 ?
                 (mode == 2 ? VrrTimingOptions{500, 9500, 60, 500} : mode == 0 ?
                  VrrTimingOptions{4000, 9900, 300, 250} : VrrTimingOptions{1000, 9750, 120, 500}) :
                 (mode == 2 ? VrrTimingOptions{500, 9900, 60, 500} : mode == 0 ?
@@ -96,7 +100,7 @@ private slots:
             QCOMPARE(prefs->vrrHistorySeconds(), expected.historySeconds);
             QCOMPARE(prefs->vrrToleranceUs(), expected.toleranceUs);
             QCOMPARE(QSettings().value("vrrtargethundredths").toInt(), expected.targetHundredths);
-            QCOMPARE(QSettings().value("vrrtimingpresetrevision").toInt(), 2);
+            QCOMPARE(QSettings().value("vrrtimingpresetrevision").toInt(), 3);
 
             // Explicitly choosing the former target after migration is custom.
             prefs->setVrrTargetHundredths(oldPreset.targetHundredths);
@@ -108,8 +112,10 @@ private slots:
     void customizedLegacyPresetsStayUnchanged()
     {
         auto* prefs = StreamingPreferences::get();
-        for (int revision : {0, 1}) for (int mode : {0, 1, 2}) {
-            const VrrTimingOptions oldPreset = revision == 1 ?
+        for (int revision : {0, 1, 2}) for (int mode : {0, 1, 2}) {
+            const VrrTimingOptions oldPreset = revision == 2 ?
+                (mode == 2 ? VrrTimingOptions{500, 9900, 60, 500} : mode == 0 ?
+                 VrrTimingOptions{4000, 9995, 300, 250} : VrrTimingOptions{1000, 9950, 120, 500}) : revision == 1 ?
                 (mode == 2 ? VrrTimingOptions{500, 9500, 60, 500} : mode == 0 ?
                  VrrTimingOptions{4000, 9900, 300, 250} : VrrTimingOptions{1000, 9750, 120, 500}) :
                 (mode == 2 ? VrrTimingOptions{500, 9900, 60, 500} : mode == 0 ?
@@ -165,6 +171,38 @@ private slots:
         QCOMPARE(prefs->vrrBufferPerMille(), 500);
         QCOMPARE(prefs->vrrTargetHundredths(), 9900);
         QCOMPARE(prefs->vrrHistorySeconds(), 60);
+        QCOMPARE(prefs->vrrToleranceUs(), 500);
+    }
+    void adaptiveTargetUsesPersistentProfileValues()
+    {
+        auto* prefs = StreamingPreferences::get();
+        for (int target : {9900, 9950, 9999, -1, 10000}) {
+            QSettings().clear();
+            prefs->reload();
+            prefs->setVrrTargetHundredths(target);
+            prefs->setVrrHistorySeconds(200);
+            const int expected = std::clamp(target, 9000, 9999);
+            prefs->save();
+            prefs->applyVrrPreset(0);
+            prefs->reload();
+            QCOMPARE(prefs->vrrTargetHundredths(), expected);
+            QCOMPARE(QSettings().value("vrrtargethundredths").toInt(), expected);
+            QCOMPARE(prefs->vrrHistorySeconds(), 200);
+            QCOMPARE(QSettings().value("vrrhistoryseconds").toInt(), 200);
+        }
+    }
+    void smoothToleranceCustomRoundTrip()
+    {
+        auto* prefs = StreamingPreferences::get();
+        prefs->applyVrrPreset(0);
+        QCOMPARE(prefs->vrrToleranceUs(), 500);
+        prefs->setVrrToleranceUs(250);
+        prefs->save();
+        prefs->reload();
+        QCOMPARE(prefs->vrrToleranceUs(), 250);
+        prefs->applyVrrPreset(0);
+        prefs->save();
+        prefs->reload();
         QCOMPARE(prefs->vrrToleranceUs(), 500);
     }
     void invalidSavedValues()
