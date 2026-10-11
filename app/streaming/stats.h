@@ -79,10 +79,12 @@ class Stats
 	void LogGlobalVideoStats();
 	void RenderGraphs();
     void DrawPlotLarge(int index);
+    BandwidthTracker& GetBandwidthTracker();
 
     // submitters for various types of data
     void SubmitVideoBytesAndReassemblyTime(PDECODE_UNIT decodeUnit, uint32_t droppedFrames);
     void SubmitDecodeTimeUs(uint64_t decodeUs);
+    void SubmitDecodeTimeUs(uint64_t decodeUs, double memAllocated, double mmeMax);
     void SubmitDroppedFrame(int count);
     void SubmitDecoderDroppedFrame();
     void SubmitAvgQueueSize(float avgQueueSize);

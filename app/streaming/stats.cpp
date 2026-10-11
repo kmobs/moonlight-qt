@@ -1,5 +1,6 @@
 #include "stats.h"
 
+#include "streaming/session.h"
 #include "streaming/video/ffmpeg-renderers/framepacing/framepacer.h"
 #ifndef IMGUI_DISABLE
 #include "imgui.h"
@@ -83,25 +84,11 @@ void Stats::sampleRtpStats()
         return;
     }
 
-    // XXX: this is not the right way to have a 1-second interval
     m_ActiveWndVideoStats.expectedVideoPackets += uint32_t(current.packetCountVideoExpected - m_LastRtpVideoStats.packetCountVideoExpected);
     m_ActiveWndVideoStats.recoveredVideoPackets += uint32_t(current.packetCountFecRecovered - m_LastRtpVideoStats.packetCountFecRecovered);
     m_ActiveWndVideoStats.unrecoveredVideoPackets += uint32_t(current.packetCountFecFailed - m_LastRtpVideoStats.packetCountFecFailed);
     m_ActiveWndVideoStats.receivedVideoPackets += current.packetCountVideoReceived - m_LastRtpVideoStats.packetCountVideoReceived;
     m_ActiveWndVideoStats.lostVideoPackets += current.packetCountLostVideo - m_LastRtpVideoStats.packetCountLostVideo;
-
-    float pps = 0.0f;
-    float lps = 0.0f;
-    if (current.packetCountVideoReceived > m_LastRtpVideoStats.packetCountVideoReceived) {
-        pps = (float)current.packetCountVideoReceived - m_LastRtpVideoStats.packetCountVideoReceived;
-    }
-    if (current.packetCountLostVideo > m_LastRtpVideoStats.packetCountLostVideo) {
-        lps = (float)current.packetCountLostVideo - m_LastRtpVideoStats.packetCountLostVideo;
-    }
-    ImGuiPlots::instance().observeFloat(PLOT_PACKETS, pps);
-    if (pps > 0.0) {
-        ImGuiPlots::instance().observeFloat(PLOT_PACKETS_LOST, (lps / (pps + lps)) * 100.0);
-    }
 
     m_LastRtpVideoStats = current;
 }
@@ -251,12 +238,39 @@ void Stats::SubmitVideoBytesAndReassemblyTime(PDECODE_UNIT decodeUnit, uint32_t 
 #endif
 }
 
+BandwidthTracker& Stats::GetBandwidthTracker()
+{
+    return m_bwTracker;
+}
+
 // Time in milliseconds we spent decoding one frame, it is added up to later be divided by decodedFrames
 void Stats::SubmitDecodeTimeUs(uint64_t decodeUs)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_ActiveWndVideoStats.totalDecodeTimeUs += decodeUs;
     m_ActiveWndVideoStats.decodedFrames++;
+
+#ifndef IMGUI_DISABLE
+    DevUISettings::instance().UpdateMetrics([=](DevUIMetrics& metrics) {
+        metrics.decodeTimeMs.add((float)decodeUs / 1000.0f);
+    });
+#endif
+}
+
+// Decode + GPU memory stats
+void Stats::SubmitDecodeTimeUs(uint64_t decodeUs, double memAllocated, double memMax)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_ActiveWndVideoStats.totalDecodeTimeUs += decodeUs;
+    m_ActiveWndVideoStats.decodedFrames++;
+
+#ifndef IMGUI_DISABLE
+    DevUISettings::instance().UpdateMetrics([=](DevUIMetrics& metrics) {
+        metrics.decodeTimeMs.add((float)decodeUs / 1000.0f);
+        metrics.memAllocated = memAllocated;
+        metrics.memMax = memMax;
+    });
+#endif
 }
 
 void Stats::SubmitDroppedFrame(int count)
@@ -409,6 +423,16 @@ void Stats::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.recoveredPps = (double) dst.recoveredVideoPackets / timeDiffSecs;
     dst.partialAcceptedPps = (double) dst.partialFramesAccepted / timeDiffSecs;
     dst.partialRejectedPps = (double) dst.partialFramesRejected / timeDiffSecs;
+
+#ifndef IMGUI_DISABLE
+    DevUISettings::instance().UpdateMetrics([&](DevUIMetrics& metrics) {
+        metrics.videoPps.add(dst.videoPps);
+        metrics.lostPps.add(dst.lostPps);
+        metrics.recoveredPps.add(dst.recoveredPps);
+        metrics.partialAcceptedPps.add(dst.partialAcceptedPps);
+        metrics.partialRejectedPps.add(dst.partialRejectedPps);
+    });
+#endif
 }
 
 void Stats::formatVideoStats(VIDEO_STATS& stats, char* output, size_t length)
@@ -540,7 +564,7 @@ void Stats::formatVideoStats(VIDEO_STATS& stats, char* output, size_t length)
                            "display-locked",
                        stats.presentMode == StreamingPreferences::PRESENT_VRR      ? "VRR" :
                        stats.presentMode == StreamingPreferences::PRESENT_FIXED    ? "fixed vsync" :
-                       stats.presentMode == StreamingPreferences::PRESENT_NO_VSYNC ? "no vsync" :
+                       stats.presentMode == StreamingPreferences::PRESENT_NO_VSYNC ? "no vsync/latent sync" :
                                                                                      "-");
         if (ret < 0 || (size_t) ret >= (length - offset)) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Error: Stats::formatVideoStats length overflow");
@@ -823,14 +847,14 @@ void Stats::RenderGraphs()
     }
 
     // extra 3rd row
-    ImGui::Dummy(ImVec2(1.0f, itemSpacingY));
-    const int row3[2] = {PLOT_PACKETS, PLOT_PACKETS_LOST};
-    for (int c = 0; c < 2; ++c) {
-        if (c > 0) {
-            ImGui::SameLine(0.0f, itemSpacingX);
-        }
-        draw_plot(row3[c], graphW, graphH);
-    }
+    // ImGui::Dummy(ImVec2(1.0f, itemSpacingY));
+    // const int row3[2] = {PLOT_PACKETS, PLOT_PACKETS_LOST};
+    // for (int c = 0; c < 2; ++c) {
+    //     if (c > 0) {
+    //         ImGui::SameLine(0.0f, itemSpacingX);
+    //     }
+    //     draw_plot(row3[c], graphW, graphH);
+    // }
 
     ImGui::End();
 

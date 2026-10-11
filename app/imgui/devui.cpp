@@ -427,7 +427,7 @@ void DevUISettings::Render()
                 "Auto",
                 "Fixed Vsync",
                 "VRR",
-                "No Vsync"};
+                "No Vsync/Latent Sync"};
             configChanged |=
                 ImGui::Combo("Present mode", &cfg.presentMode, presentModeItems, IM_ARRAYSIZE(presentModeItems));
 
@@ -594,6 +594,14 @@ void DevUISettings::Render()
             if (metrics.videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
                 ImGui::SetNextItemOpen(true, ImGuiCond_Once);
                 if (ImGui::CollapsingHeader("PyroWave")) {
+                    ImGui::Text("Decode time: %.2f/%.2f/%.2f ms", metrics.decodeTimeMs.min, metrics.decodeTimeMs.max, metrics.decodeTimeMs.avg());
+                    ImGui::SameLine();
+                    ImGui::Text("GPU mem: %.1f MB", metrics.memAllocated);
+                    ImGui::Text("Packets/sec: %.0f (%.1f Mbps)",
+                        metrics.videoPps.last, Stats::instance().GetBandwidthTracker().GetAverageMbps());
+                    ImGui::Text("Lost: %.1f/s Recovered: %.1f Degraded: %.1f",
+                        metrics.lostPps.last, metrics.recoveredPps.last, metrics.partialAcceptedPps.last);
+
                     ImGui::SetNextItemWidth(-ImGui::GetContentRegionAvail().x * 0.5f);
                     static const char* pwHighPrecisionItems[] = {"Default", "High Precision"};
                     configChanged |=
@@ -648,51 +656,7 @@ void DevUISettings::Render()
                     configChanged = true;
                 }
 
-                // This turned out less useful than I hoped
-                // DrawFrameTimingBar("Frame",
-                //                     metrics.renderLoopWaitFrameMs.last,
-                //                     DevUIColors.colors.preWait,
-                //                     metrics.renderLoopRenderMs.last,
-                //                     DevUIColors.colors.render,
-                //                     metrics.renderLoopWaitBeforePresentMs.last,
-                //                     DevUIColors.colors.waitPresent,
-                //                     metrics.renderLoopWaitPostMs.last,
-                //                     DevUIColors.colors.waitEnd);
-
-                ImGui::Text("Render total         %.3f ms", metrics.renderLoopTotalMs.last);
-                // ImGui::Text("  waitGPU            %.3f ms", metrics.renderLoopWaitGPUMs.last);
-                ImGui::TextColored(DevUIColors.colors.preWait,
-                                    "  waitFrame          %.3f ms",
-                                    metrics.renderLoopWaitFrameMs.last);
-                ImGui::SameLine();
-                HelpMarker(
-                    "Time spent waiting for a new frame to arrive from the host, if necessary. Optimal value is anything "
-                    "above 0, meaning the frame queue is running at 1.0 and not adding latency."
-                );
-                ImGui::TextColored(DevUIColors.colors.render,
-                                    "  render             %.3f ms",
-                                    metrics.renderLoopRenderMs.last);
-                ImGui::SameLine();
-                HelpMarker(
-                    "Time spent drawing everything in the frame: the host's video frame, stat overlays, graphs, this UI. "
-                    "Typical value: < 1ms "
-                );
-                ImGui::TextColored(DevUIColors.colors.waitPresent,
-                                    "  waitPresent        %.3f ms",
-                                    metrics.renderLoopWaitBeforePresentMs.last);
-                ImGui::SameLine();
-                HelpMarker(
-                    "Time spent waiting to align with the vblank interval. A very accurate sleep is performed so that "
-                    "Present is called shortly before the vblank."
-                );
-                ImGui::TextColored(DevUIColors.colors.waitEnd,
-                                    "  waitEnd            %.3f ms",
-                                    metrics.renderLoopWaitPostMs.last);
-                ImGui::SameLine();
-                HelpMarker(
-                    "Typical value: most of 1 frame\n\nTime spent waiting to obtain the next frame's drawable texture from "
-                    "the GPU. This delay is the main driver of frame pacing."
-                );
+                DrawFrameTimingBar("Frame", metrics);
 
                 switch (metrics.presentMode) {
                     case StreamingPreferences::PRESENT_AUTO:  // won't happen
@@ -716,11 +680,12 @@ void DevUISettings::Render()
                         );
                         break;
                     case StreamingPreferences::PRESENT_NO_VSYNC:
-                        ImGui::Text("Mode:                No Vsync");
+                        ImGui::Text("Mode:                No Vsync/Latent Sync");
                         ImGui::SameLine();
                         HelpMarker(
-                            "With vsync disabled, frames are presented with no regard to timing. Screen tearing and "
-                            "stuttering will occur, but this mode should have the lowest latency."
+                            "This is an experimental mode. When vsync is disabled, we try to wait and send presents as close as possible to the display refresh.\n\n"
+                            "If done perfectly, it is possible to avoid screen tearing while also having very low latency. This technique was pioneered by SpecialK and is used in Moonlight for Xbox.\n\n"
+                            "This is not good enough on macOS so you should not use this mode unless you need the absolute lowest latency over all else."
                         );
                         break;
                 }
@@ -781,15 +746,7 @@ void DevUISettings::ResetCounters()
     });
 }
 
-void DevUISettings::DrawFrameTimingBar(const char* label,
-                                       float waitFrameMs,
-                                       const ImVec4& preWait4,
-                                       float renderMs,
-                                       const ImVec4& render4,
-                                       float waitPresentMs,
-                                       const ImVec4& waitPresent4,
-                                       float waitEndMs,
-                                       const ImVec4& waitEnd4)
+void DevUISettings::DrawFrameTimingBar(const char* label, DevUIMetrics& metrics)
 {
     const ImGuiStyle& style = ImGui::GetStyle();
 
@@ -797,6 +754,11 @@ void DevUISettings::DrawFrameTimingBar(const char* label,
     if (size.x <= 0.0f) {
         size.x = ImGui::GetContentRegionAvail().x;
     }
+
+    float waitFrameMs = metrics.renderLoopWaitFrameMs.last;
+    float renderMs = metrics.renderLoopRenderMs.last;
+    float waitPresentMs = metrics.renderLoopWaitBeforePresentMs.last;
+    float waitEndMs = metrics.renderLoopWaitPostMs.last;
 
     const float totalMs = waitFrameMs + renderMs + waitPresentMs + waitEndMs;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -808,10 +770,10 @@ void DevUISettings::DrawFrameTimingBar(const char* label,
     const ImU32 bgColor = ImGui::GetColorU32(ImGuiCol_FrameBg);
     const ImU32 borderColor = ImGui::GetColorU32(ImGuiCol_Border);
     const ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
-    const ImU32 preWait = ImGui::GetColorU32(preWait4);
-    const ImU32 render = ImGui::GetColorU32(render4);
-    const ImU32 waitPresent = ImGui::GetColorU32(waitPresent4);
-    const ImU32 waitEnd = ImGui::GetColorU32(waitEnd4);
+    const ImU32 preWait = ImGui::GetColorU32(DevUIColors.colors.preWait);
+    const ImU32 render = ImGui::GetColorU32(DevUIColors.colors.render);
+    const ImU32 waitPresent = ImGui::GetColorU32(DevUIColors.colors.waitPresent);
+    const ImU32 waitEnd = ImGui::GetColorU32(DevUIColors.colors.waitEnd);
 
     const float rounding = style.FrameRounding;
 
@@ -862,8 +824,7 @@ void DevUISettings::DrawFrameTimingBar(const char* label,
 
     if (label && label[0] != '\0') {
         char overlay[128];
-        std::snprintf(overlay,
-                      sizeof(overlay),
+        std::snprintf(overlay, sizeof(overlay),
                       "%s  %.2f / %.2f / %.2f / %.2fms",
                       label,
                       waitFrameMs,
@@ -878,6 +839,17 @@ void DevUISettings::DrawFrameTimingBar(const char* label,
     }
 
     ImGui::Dummy(barSize);
+
+    if (ImGui::BeginItemTooltip()) {
+        ImGui::Text("Render total  %.3f ms", totalMs);
+        ImGui::TextColored(DevUIColors.colors.preWait,     "  waitFrame   %.3f ms", waitFrameMs);
+        ImGui::TextColored(DevUIColors.colors.render,      "  render      %.3f ms", renderMs);
+        if (metrics.presentMode == StreamingPreferences::PRESENT_NO_VSYNC) {
+            ImGui::TextColored(DevUIColors.colors.waitPresent, "  waitPresent %.3f ms", waitPresentMs);
+        }
+        ImGui::TextColored(DevUIColors.colors.waitEnd,     "  waitNext    %.3f ms", waitEndMs);
+        ImGui::EndTooltip();
+    }
 }
 
 // Colors

@@ -108,6 +108,13 @@ struct DevUIMetrics {
     RunningStat renderLoopWaitBeforePresentMs = {};
     RunningStat frametimeClientMs = {};
     RunningStat frametimeHostMs = {};
+    RunningStat decodeTimeMs = {};
+    // XXX just store total
+    RunningStat videoPps = {};
+    RunningStat lostPps = {};
+    RunningStat recoveredPps = {};
+    RunningStat partialAcceptedPps = {};
+    RunningStat partialRejectedPps = {};
     int totalFrames = 0;
     int networkDroppedFrames = 0;
     int pacerDroppedFrames = 0;
@@ -133,6 +140,8 @@ struct DevUIMetrics {
     float referenceWhite = 203.0f;
     float minNits = 0.0f;
     float maxNits = 0.0f;
+    double memAllocated = 0.0;
+    double memMax = 0.0;
 #endif
 
     // video
@@ -177,6 +186,13 @@ struct DevUIMetrics {
         renderLoopWaitBeforePresentMs.reset();
         frametimeClientMs.reset();
         frametimeHostMs.reset();
+        decodeTimeMs.reset();
+        videoPps.reset();
+        lostPps.reset();
+        recoveredPps.reset();
+        partialAcceptedPps.reset();
+        partialRejectedPps.reset();
+
         presentLateMs.reset();
         presentDelayMs.reset();
         presentIntervalMs.reset();
@@ -217,6 +233,7 @@ class DevUISettings
 
     template<typename Fn> void UpdateMetrics(Fn&& cb)
     {
+        if (!IsVisible()) return;
         std::lock_guard<std::mutex> lock(m_Mutex);
         cb(m_Metrics);
     }
@@ -232,15 +249,7 @@ class DevUISettings
     DevUISettings(const DevUISettings&) = delete;
     DevUISettings& operator=(const DevUISettings&) = delete;
 
-    void DrawFrameTimingBar(const char* label,
-                            float waitFrameMs,
-                            const ImVec4& preWait4,
-                            float renderMs,
-                            const ImVec4& render4,
-                            float waitPresentMs,
-                            const ImVec4& waitPresent4,
-                            float waitEndMs,
-                            const ImVec4& waitEnd);
+    void DrawFrameTimingBar(const char* label, DevUIMetrics& metrics);
     void DrawCornerText(const char* text, float scaling = 3.0f);
 
     mutable std::mutex m_Mutex;

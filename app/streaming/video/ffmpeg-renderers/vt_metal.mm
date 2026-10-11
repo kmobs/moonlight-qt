@@ -467,13 +467,12 @@ public:
         SDL_assert(planes == 2 || planes == 3);
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Metal color pipeline: source=%s, %d-bit %d-plane, range=%s, colorspace=%d, transfer=%d, sampleScale=%.0f, EDR=%d, referenceWhite=%.2f, headroom=%.2f, maxNits=%.2f",
+                    "Metal color pipeline: source=%s, %d-bit %d-plane, range=%s, colorspace=%d, transfer=%d, sampleScale=%.0f, referenceWhite=%.2f, headroom=%.2f, maxNits=%.2f",
                     m_FrameSource == FrameSource::MetalTextures ? "PyroWave" :
                         frame->format == AV_PIX_FMT_VIDEOTOOLBOX ? "VideoToolbox" : "software",
                     getFrameBitsPerChannel(frame), planes,
                     isFrameFullRange(frame) ? "full" : "limited", colorspace, frame->color_trc,
                     double(paramBuffer.bitnessScaleFactor),
-                    newPixelFormat == MTLPixelFormatRGBA16Float,
                     m_ReferenceWhite, m_CurrentEDR.load(), m_MaxNits);
 
         NSError* error = nil;

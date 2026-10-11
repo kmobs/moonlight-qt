@@ -93,16 +93,27 @@ struct PyroWaveVideoDecoder::Impl {
             return false;
         }
 
-        // Obtain more accurate GPU timing. This is called once for each of the two decode phases
-        // dequant, and idwt, so we add them.
-        if (device->handle) {
-            double elapsed = 0.0;
-            pyrowave_device_report_performance_stats(device->handle, [](void *userdata, double val) {
-                *static_cast<double *>(userdata) += val;
-            }, &elapsed, true);
+        if (overlayAttached) {
+            // Obtain more accurate GPU timing. This is called once for each of the two decode phases
+            // dequant, and idwt, so we add them.
+            if (device->handle) {
+                double elapsed = 0.0;
+                pyrowave_device_report_performance_stats(device->handle, [](void *userdata, double val) {
+                    *static_cast<double *>(userdata) += val;
+                }, &elapsed, true);
 
-            uint64_t elapsedUs = (uint64_t)(elapsed * 1000);
-            Stats::instance().SubmitDecodeTimeUs(elapsedUs);
+                uint64_t elapsedUs = (uint64_t)(elapsed * 1000);
+
+                // Also collect memory usage info
+                double memAllocated = 0.0;
+                double memMax = 0.0;
+                if (@available(macOS 10.15, iOS 16.0, tvOS 16.0, *)) {
+                    memAllocated = double(device->handle->mtl.currentAllocatedSize) / (1024.0 * 1024.0);
+                    memMax =  double(device->handle->mtl.recommendedMaxWorkingSetSize) / (1024.0 * 1024.0);
+                }
+
+                Stats::instance().SubmitDecodeTimeUs(elapsedUs, memAllocated, memMax);
+            }
         }
 
         return true;
