@@ -1,3 +1,8 @@
+#include "streaming/input/dualsensehaptics.h"
+#include "streaming/input/steamcontroller/steamcontrollerhost.h"
+#include <QNetworkInterface>
+#include <QSysInfo>
+#include <QDir>
 #include "session.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
@@ -61,7 +66,19 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clRumbleTriggers,
     Session::clSetMotionEventState,
     Session::clSetControllerLED,
-    Session::clSetAdaptiveTriggers
+    Session::clSetAdaptiveTriggers,
+#if (defined(Q_OS_LINUX) || defined(Q_OS_WIN)) && SDL_VERSION_ATLEAST(2, 24, 0)
+    DualSenseHaptics::receive,
+#else
+    nullptr,
+#endif
+#if STEAM_CONTROLLER_LI_EXTENSIONS
+    // Steam Controller (2026) haptic and settings relays, delivered straight to the driver's
+    // registry (not through the SDL event queue: haptics are latency sensitive and the driver
+    // has its own writer thread).
+    SteamControllerHost::clSteamHaptic,
+    SteamControllerHost::clSteamSettings,
+#endif
 };
 
 Session* Session::s_ActiveSession;
@@ -2165,6 +2182,9 @@ void Session::exec()
             case SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS:
                 m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
                                                     (DualSenseOutputReport *)event.user.data2);
+                break;
+            case SDL_CODE_STEAM_CONTROLLER_LINK:
+                m_InputHandler->handleSteamControllerEvent(&event.user);
                 break;
             case SDL_CODE_SET_WINDOW_MODE:
                 setWindowMode((uint32_t)(uintptr_t)event.user.data1);

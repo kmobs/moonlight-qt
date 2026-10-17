@@ -197,6 +197,13 @@ SOURCES += \
     settings/streamingpreferences.cpp \
     streaming/input/abstouch.cpp \
     streaming/input/gamepad.cpp \
+    streaming/input/dualsensehaptics.cpp \
+    streaming/input/dualsensehid.cpp \
+    streaming/input/steamcontroller/steamcontrollerattributes.cpp \
+    streaming/input/steamcontroller/steamcontrollercore.cpp \
+    streaming/input/steamcontroller/steamcontrollerlink.cpp \
+    streaming/input/steamcontroller/steamcontrollerhost.cpp \
+    streaming/input/steamcontroller/steamcontrollersdl.cpp \
     streaming/input/input.cpp \
     streaming/input/keyboard.cpp \
     streaming/input/mouse.cpp \
@@ -222,6 +229,18 @@ SOURCES += \
     streaming/stats.cpp
 
 HEADERS += \
+    streaming/video/videothreadpriority.h \
+    streaming/video/timinggraph.h \
+    streaming/input/dualsensehid.h \
+    streaming/input/steamcontroller/steamcontrollerprotocol.h \
+    streaming/input/steamcontroller/steamcontrollerattributes.h \
+    streaming/input/steamcontroller/steamcontrollercore.h \
+    streaming/input/steamcontroller/steamcontrollerlink.h \
+    streaming/input/steamcontroller/steamcontrollerhost.h \
+    streaming/input/steamcontroller/steamcontrollersdl.h \
+    streaming/input/gamepadstickmerge.h \
+    streaming/input/dualsensetriggers.h \
+    ../third-party/saxense/packet.h \
     SDL_compat.h \
     backend/nvaddress.h \
     backend/nvapp.h \
