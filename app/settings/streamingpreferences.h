@@ -152,6 +152,15 @@ public:
     };
     Q_ENUM(PresentMode)
 
+    // What the Steam Controller (2026)'s four grip buttons become on the host
+    enum SteamControllerGrips
+    {
+        SCG_PADDLES,   // Xbox Elite paddles 1-4 (R4, L4, R5, L5)
+        SCG_DS4,       // DualShock extras: L4 Share, R4 touchpad click, L5 L3, R5 R3
+        SCG_OFF,
+    };
+    Q_ENUM(SteamControllerGrips);
+
     Q_PROPERTY(int width MEMBER width NOTIFY displayModeChanged)
     Q_PROPERTY(int height MEMBER height NOTIFY displayModeChanged)
     Q_PROPERTY(int fps MEMBER fps NOTIFY displayModeChanged)
@@ -195,6 +204,12 @@ public:
     Q_PROPERTY(PresentMode presentMode MEMBER presentMode NOTIFY presentModeChanged)
     Q_PROPERTY(bool showPerformanceGraphs MEMBER showPerformanceGraphs NOTIFY showPerformanceGraphsChanged)
     Q_PROPERTY(int vtMetalFramesInFlight MEMBER vtMetalFramesInFlight NOTIFY vtMetalFramesInFlightChanged)
+    Q_PROPERTY(bool steamControllerDriver MEMBER steamControllerDriver NOTIFY steamControllerChanged)
+    Q_PROPERTY(bool steamControllerMotion MEMBER steamControllerMotion NOTIFY steamControllerChanged)
+    Q_PROPERTY(bool steamControllerSplitPads MEMBER steamControllerSplitPads NOTIFY steamControllerChanged)
+    Q_PROPERTY(SteamControllerGrips steamControllerGrips MEMBER steamControllerGrips NOTIFY steamControllerChanged)
+    Q_PROPERTY(int steamControllerRumbleHold MEMBER steamControllerRumbleHold NOTIFY steamControllerChanged)
+    Q_PROPERTY(bool steamControllerStickStretch MEMBER steamControllerStickStretch NOTIFY steamControllerChanged)
 
     Q_INVOKABLE bool retranslate();
 
@@ -243,6 +258,13 @@ public:
     PresentMode presentMode;
     bool showPerformanceGraphs;
     int vtMetalFramesInFlight;
+    // Steam Controller (2026) over USB cable / wireless puck (app/streaming/input/steamcontroller)
+    bool steamControllerDriver;
+    bool steamControllerMotion;
+    bool steamControllerSplitPads;
+    SteamControllerGrips steamControllerGrips;
+    int steamControllerRumbleHold;   // ms a host rumble is held without a refresh; 0 = unlimited
+    bool steamControllerStickStretch;
 
 signals:
     void displayModeChanged();
@@ -278,6 +300,7 @@ signals:
     void reverseScrollDirectionChanged();
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
+    void steamControllerChanged();
     void keepAwakeChanged();
     void languageChanged();
     void rendererSelectionChanged();
