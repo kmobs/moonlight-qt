@@ -1049,6 +1049,39 @@ static void testBle()
     check(reservedSet, "the reserved host setting ids are exactly {9, 48, 71, 49, 52, 53}");
 }
 
+// Reconnecting a slot must discard the old generation's output retry timer,
+// including when a stop was still waiting for a successful HID transfer.
+static void testReconnectOutputSchedule()
+{
+    for (uint16_t product : {PRODUCT_WIRED, PRODUCT_PUCK, PRODUCT_BLE}) {
+        FakeTransport io;
+        io.add("retry", product, product == PRODUCT_PUCK ? 2 : 0, VENDOR_USAGE_PAGE);
+        Events events;
+        SteamControllerConfig config;
+        SteamControllerManager manager(io, config, 500, &events);
+        run(manager);
+        auto link = manager.links()[0];
+        auto device = io.state("retry");
+        input(*link, state(0x45)); run(manager);
+        const int oldGeneration = link->generation();
+        device->failWrite = true;
+        link->rumble(0, 0, g_Now); run(manager);
+        check(link->queuedOutputs() == 1, "failed stop waits for its retry deadline");
+        input(*link, {IN_WIRELESS_EVENT, 1});
+        input(*link, state(0x45));
+        check(link->generation() != oldGeneration && link->queuedOutputs() == 0,
+              "reconnect retires the failed stop's generation and queue");
+        device->failWrite = false;
+        device->writes.clear();
+        auto fresh = pulse(0, 1);
+        link->steamHaptic(fresh.data(), (int)fresh.size(), g_Now);
+        run(manager);
+        check(device->writes.size() == 1 && device->writes[0] == fresh,
+              "new generation's first feedback is sent without the retired retry delay");
+        manager.stop(g_Now);
+    }
+}
+
 // The three Bluetooth LE haptic knobs (ported from the Android BLE driver): off by default, and
 // never applied to a USB or puck link in the same session.
 static void testBleHapticKnobs()
@@ -1196,6 +1229,54 @@ static void testBleHapticKnobs()
     }
 }
 
+static void testSamePathCollections()
+{
+    // Linux hidraw: SDL3's hidapi lists the Bluetooth LE controller's one node once per top-level
+    // collection (keyboard, mouse, vendor), same path, keyboard first. The vendor entry must win
+    // without the keyboard entry's failed probe rejecting the path.
+    FakeTransport io;
+    io.add("ble/hidraw13", PRODUCT_BLE, -1, 0x0001);
+    io.add("ble/hidraw13", PRODUCT_BLE, -1, 0x0001);
+    io.add("ble/hidraw13", PRODUCT_BLE, -1, VENDOR_USAGE_PAGE);
+    io.probeFails = {"ble/hidraw13"};   // the bare GET_REPORT does not answer on this stack
+    // A wired node whose only entry is not the vendor collection and does not answer: rejected, and said so.
+    io.add("usb/mouse-only", PRODUCT_WIRED, 0, 0x0001);
+    io.probeFails.push_back("usb/mouse-only");
+    g_Log.clear();
+    Events events;
+    SteamControllerManager manager(io, SteamControllerConfig{}, 500, &events);
+    run(manager);
+    auto links = manager.links();
+    int bleOpens = 0;
+    for (const auto& p : io.opened) if (p == "ble/hidraw13") bleOpens++;
+    check(links.size() == 1 && links[0]->isBle() && bleOpens == 1
+          && has(logLine("opened ble/hidraw13"), "usage page 0xff00; usage page 0xff00) as Bluetooth LE slot 0"),
+          "a node listed once per collection is opened once, by its vendor collection entry, whatever is listed first");
+    check(!logLine("usb/mouse-only (product 0x1302, interface 0, usage page 0x0001) did not answer a feature report 1 read").empty()
+          && io.state("usb/mouse-only")->gets == 1,
+          "a probed path that does not answer is rejected with a log line and not probed again this pass");
+    manager.service(SteamControllerManager::RESCAN_MS);
+    check(io.state("usb/mouse-only")->gets == 1 && manager.links().size() == 1, "a rejected path stays rejected while it is still enumerated");
+    manager.stop(SteamControllerManager::RESCAN_MS);
+
+#if defined(__linux__)
+    // Linux only: a Bluetooth LE node with no vendor collection entry and an unanswered probe is
+    // still the controller (one hidraw per controller) and is kept, with a warning.
+    FakeTransport io2;
+    io2.add("ble/hidraw14", PRODUCT_BLE, -1, 0x0001);
+    io2.probeFails = {"ble/hidraw14"};
+    g_Log.clear();
+    Events events2;
+    SteamControllerManager manager2(io2, SteamControllerConfig{}, 500, &events2);
+    run(manager2);
+    check(manager2.links().size() == 1 && manager2.links()[0]->isBle()
+          && has(logLine("opened ble/hidraw14"), "Bluetooth LE node, feature report 1 read unanswered) as Bluetooth LE slot 0")
+          && !logLine("kept as the Bluetooth LE controller's only hidraw node").empty(),
+          "Linux keeps a Bluetooth LE node whose probe is unanswered, and says so");
+    manager2.stop(0);
+#endif
+}
+
 int main()
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1210,6 +1291,8 @@ int main()
         testHostFeedbackGeneration();
         testBle();
         testBleHapticKnobs();
+        testReconnectOutputSchedule();
+        testSamePathCollections();
     }
     catch (const std::exception& ex) {
         printf("FAIL exception: %s\n", ex.what());
