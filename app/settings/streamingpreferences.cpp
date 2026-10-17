@@ -50,6 +50,12 @@
 #define SER_REVERSESCROLL "reversescroll"
 #define SER_SWAPFACEBUTTONS "swapfacebuttons"
 #define SER_CAPTURESYSKEYS "capturesyskeys"
+#define SER_STEAMCONTROLLERDRIVER "steamcontrollerdriver"
+#define SER_STEAMCONTROLLERMOTION "steamcontrollermotion"
+#define SER_STEAMCONTROLLERSPLITPADS "steamcontrollersplitpads"
+#define SER_STEAMCONTROLLERGRIPS "steamcontrollergrips"
+#define SER_STEAMCONTROLLERRUMBLEHOLD "steamcontrollerrumblehold"
+#define SER_STEAMCONTROLLERSTICKSTRETCH "steamcontrollerstickstretch"
 #define SER_KEEPAWAKE "keepawake"
 #define SER_LANGUAGE "language"
 #define SER_AUDIO_RENDERER "audioRenderer"
@@ -159,6 +165,13 @@ void StreamingPreferences::reload()
     enableHdr = settings.value(SER_HDR, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,
                                                          static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
+    steamControllerDriver = settings.value(SER_STEAMCONTROLLERDRIVER, true).toBool();
+    steamControllerMotion = settings.value(SER_STEAMCONTROLLERMOTION, true).toBool();
+    steamControllerSplitPads = settings.value(SER_STEAMCONTROLLERSPLITPADS, true).toBool();
+    steamControllerGrips = static_cast<SteamControllerGrips>(settings.value(SER_STEAMCONTROLLERGRIPS,
+                                                             static_cast<int>(SteamControllerGrips::SCG_PADDLES)).toInt());
+    steamControllerRumbleHold = qMax(0, settings.value(SER_STEAMCONTROLLERRUMBLEHOLD, 500).toInt());
+    steamControllerStickStretch = settings.value(SER_STEAMCONTROLLERSTICKSTRETCH, false).toBool();
     audioConfig = static_cast<AudioConfig>(settings.value(SER_AUDIOCFG,
                                                   static_cast<int>(AudioConfig::AC_STEREO)).toInt());
     videoCodecConfig = static_cast<VideoCodecConfig>(settings.value(SER_VIDEOCFG,
@@ -398,6 +411,12 @@ void StreamingPreferences::save()
     settings.setValue(SER_FRAMEPRESENTMODE, static_cast<int>(presentMode));
     settings.setValue(SER_SHOWPERFORMANCEGRAPHS, showPerformanceGraphs);
     settings.setValue(SER_VTMETALFRAMESINFLIGHT, vtMetalFramesInFlight);
+    settings.setValue(SER_STEAMCONTROLLERDRIVER, steamControllerDriver);
+    settings.setValue(SER_STEAMCONTROLLERMOTION, steamControllerMotion);
+    settings.setValue(SER_STEAMCONTROLLERSPLITPADS, steamControllerSplitPads);
+    settings.setValue(SER_STEAMCONTROLLERGRIPS, static_cast<int>(steamControllerGrips));
+    settings.setValue(SER_STEAMCONTROLLERRUMBLEHOLD, steamControllerRumbleHold);
+    settings.setValue(SER_STEAMCONTROLLERSTICKSTRETCH, steamControllerStickStretch);
 }
 
 int StreamingPreferences::getDefaultBitrate(int width, int height, int fps, bool yuv444)
