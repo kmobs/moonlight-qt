@@ -9,11 +9,36 @@ on:
       ci_version:
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: Optional CI version suffix to use in artifact names
+        required: false
+        default: ''
+        type: string
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      ci_version: ${{ steps.set-ci-version.outputs.ci_version }}
+    steps:
+      - name: Set CI version
+        id: set-ci-version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.ci_version }}" ]; then
+            CI_VERSION="${{ inputs.ci_version }}"
+          else
+            CI_VERSION=`echo ${GITHUB_SHA} | cut -c1-6`
+          fi
+
+          echo "ci_version=${CI_VERSION}" >> "${GITHUB_OUTPUT}"
+
   build:
+    needs: setup
     env:
-      CI_VERSION: ${{ inputs.ci_version }}
+      CI_VERSION: ${{ needs.setup.outputs.ci_version }}
     strategy:
       fail-fast: false
       matrix:
