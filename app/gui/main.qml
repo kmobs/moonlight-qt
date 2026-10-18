@@ -3,6 +3,7 @@ import QtQuick.Controls 2.2
 import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
 import QtQuick.Controls.Material 2.2
+import Qt.labs.settings 1.1
 
 import ComputerManager 1.0
 import AutoUpdateChecker 1.0
@@ -12,6 +13,7 @@ import SdlGamepadKeyNavigation 1.0
 
 ApplicationWindow {
     property bool pollingActive: false
+    property bool windowGeometryReady: false
 
     // Set by SettingsView to force the back operation to pop all
     // pages except the initial view. This is required when doing
@@ -21,6 +23,35 @@ ApplicationWindow {
     id: window
     width: 1280
     height: 600
+
+    Settings {
+        id: windowSettings
+        property bool hasWindowGeometry: false
+        property int windowX: 0
+        property int windowY: 0
+        property int windowWidth: 1280
+        property int windowHeight: 600
+    }
+
+    Timer {
+        id: windowGeometryReadyTimer
+        interval: 0
+        repeat: false
+        onTriggered: windowGeometryReady = true
+    }
+
+    function saveWindowGeometry()
+    {
+        if (window.visibility !== Window.Windowed) {
+            return
+        }
+
+        windowSettings.hasWindowGeometry = true
+        windowSettings.windowX = window.x
+        windowSettings.windowY = window.y
+        windowSettings.windowWidth = window.width
+        windowSettings.windowHeight = window.height
+    }
 
     // This function runs prior to creation of the initial StackView item
     function doEarlyInit() {
@@ -35,6 +66,13 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        if (windowSettings.hasWindowGeometry) {
+            window.x = windowSettings.windowX
+            window.y = windowSettings.windowY
+            window.width = windowSettings.windowWidth
+            window.height = windowSettings.windowHeight
+        }
+
         // Show the window according to the user's preferences
         if (SystemProperties.hasDesktopEnvironment) {
             if (StreamingPreferences.uiDisplayMode == StreamingPreferences.UI_MAXIMIZED) {
@@ -46,9 +84,12 @@ ApplicationWindow {
             else {
                 window.show()
             }
-        } else {
+        }
+        else {
             window.showFullScreen()
         }
+
+        windowGeometryReadyTimer.start()
 
         // Display any modal dialogs for configuration warnings
         if (runConfigChecks) {
@@ -62,6 +103,12 @@ ApplicationWindow {
             SystemProperties.startAsyncLoad()
         }
     }
+
+    onXChanged: if (windowGeometryReady) saveWindowGeometry()
+    onYChanged: if (windowGeometryReady) saveWindowGeometry()
+    onWidthChanged: if (windowGeometryReady) saveWindowGeometry()
+    onHeightChanged: if (windowGeometryReady) saveWindowGeometry()
+    onClosing: saveWindowGeometry()
 
     function hasHardwareAccelerationChanged() {
         if (!SystemProperties.hasHardwareAcceleration && StreamingPreferences.videoDecoderSelection !== StreamingPreferences.VDS_FORCE_SOFTWARE) {
