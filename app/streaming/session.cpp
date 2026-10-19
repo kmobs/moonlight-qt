@@ -2473,6 +2473,10 @@ DispatchDeferredCleanup:
     // routinely maximize the streaming window simply to view the stream
     // in a larger window, but they don't necessarily want the UI in such
     // a large window.
+    // On macOS, changing Qt window minimization state while SDL tears down its
+    // NSWindow can trigger unstable AppKit window/KVO behavior during order-out.
+    // Skip this best-effort state propagation on Darwin to keep teardown stable.
+#ifndef Q_OS_DARWIN
     if (!m_IsFullScreen && m_QtWindow != nullptr && m_Window != nullptr) {
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
         if (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_MINIMIZED) {
@@ -2490,6 +2494,7 @@ DispatchDeferredCleanup:
         }
 #endif
     }
+    #endif
 
     // This must be called after the decoder is deleted, because
     // the renderer may want to interact with the window
