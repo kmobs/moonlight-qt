@@ -5,7 +5,6 @@
 #include "settings/mappingmanager.h"
 #include "utils.h"
 #include "imgui/gamepadmenu.h"
-#include "streaming/input/gamepadstickmerge.h"
 #include "streaming/input/steamcontroller/steamcontrollerhost.h"
 
 #include <QtMath>

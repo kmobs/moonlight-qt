@@ -235,7 +235,6 @@ HEADERS += \
     streaming/input/steamcontroller/steamcontrollerlink.h \
     streaming/input/steamcontroller/steamcontrollerhost.h \
     streaming/input/steamcontroller/steamcontrollersdl.h \
-    streaming/input/gamepadstickmerge.h \
     streaming/input/dualsensetriggers.h \
     ../third-party/saxense/packet.h \
     SDL_compat.h \
