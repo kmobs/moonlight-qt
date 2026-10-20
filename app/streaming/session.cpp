@@ -1,4 +1,3 @@
-#include "streaming/input/dualsensehaptics.h"
 #include "streaming/input/steamcontroller/steamcontrollerhost.h"
 #include <QNetworkInterface>
 #include <QSysInfo>
@@ -67,11 +66,6 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clSetMotionEventState,
     Session::clSetControllerLED,
     Session::clSetAdaptiveTriggers,
-#if (defined(Q_OS_LINUX) || defined(Q_OS_WIN)) && SDL_VERSION_ATLEAST(2, 24, 0)
-    DualSenseHaptics::receive,
-#else
-    nullptr,
-#endif
 #if STEAM_CONTROLLER_LI_EXTENSIONS
     // Steam Controller (2026) haptic and settings relays, delivered straight to the driver's
     // registry (not through the SDL event queue: haptics are latency sensitive and the driver

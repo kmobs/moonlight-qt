@@ -197,8 +197,6 @@ SOURCES += \
     settings/streamingpreferences.cpp \
     streaming/input/abstouch.cpp \
     streaming/input/gamepad.cpp \
-    streaming/input/dualsensehaptics.cpp \
-    streaming/input/dualsensehid.cpp \
     streaming/input/steamcontroller/steamcontrollerattributes.cpp \
     streaming/input/steamcontroller/steamcontrollercore.cpp \
     streaming/input/steamcontroller/steamcontrollerlink.cpp \
@@ -231,7 +229,6 @@ SOURCES += \
 HEADERS += \
     streaming/video/videothreadpriority.h \
     streaming/video/timinggraph.h \
-    streaming/input/dualsensehid.h \
     streaming/input/steamcontroller/steamcontrollerprotocol.h \
     streaming/input/steamcontroller/steamcontrollerattributes.h \
     streaming/input/steamcontroller/steamcontrollercore.h \

@@ -2,7 +2,6 @@
 #include "SDL_compat.h"
 #include "streaming/session.h"
 #include "settings/mappingmanager.h"
-#include "streaming/input/dualsensehaptics.h"
 #include "streaming/input/steamcontroller/steamcontrollerhost.h"
 #include "path.h"
 #include "utils.h"
