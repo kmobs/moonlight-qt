@@ -1369,6 +1369,14 @@ private:
                 !m_Session->m_UnexpectedTermination &&
                 m_Session->m_Preferences->quitAppAfter;
 
+        // Notify the UI
+        if (shouldQuit) {
+            emit m_Session->quitStarting();
+        }
+        else {
+            emit m_Session->sessionFinished(m_Session->m_PortTestResults);
+        }
+
         // The video decoder must already be destroyed, since it could
         // try to interact with APIs that can only be called between
         // LiStartConnection() and LiStopConnection().
@@ -1376,15 +1384,6 @@ private:
 
         // Finish cleanup of the connection state
         LiStopConnection();
-
-        // Notify the UI after teardown is complete so it doesn't race with
-        // the connection shutdown work still running on this thread.
-        if (shouldQuit) {
-            emit m_Session->quitStarting();
-        }
-        else {
-            emit m_Session->sessionFinished(m_Session->m_PortTestResults);
-        }
 
         // Perform a best-effort app quit
         if (shouldQuit) {
