@@ -41,6 +41,7 @@
 #include <QGuiApplication>
 #include <QCursor>
 #include <QScreen>
+#include <QTimer>
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QQuickOpenGLUtils>
@@ -2507,37 +2508,38 @@ DispatchDeferredCleanup:
     }
     #endif
 
-    // On macOS, force the streaming window into a stable visible state before
-    // destruction to avoid AppKit order-out crashes when tearing down a
-    // minimized/fullscreen NSWindow via SDL.
-#ifdef Q_OS_DARWIN
-    if (m_Window != nullptr) {
-        Uint32 windowFlags = SDL_GetWindowFlags(m_Window);
-
-        if (windowFlags & SDL_WINDOW_FULLSCREEN) {
-            SDL_SetWindowFullscreen(m_Window, 0);
-        }
-
-        if (windowFlags & SDL_WINDOW_MINIMIZED) {
-            SDL_RestoreWindow(m_Window);
-        }
-
-        SDL_HideWindow(m_Window);
-
-        // Flush pending window lifecycle events before destroy.
-        SDL_PumpEvents();
-    }
-#endif
-
     // This must be called after the decoder is deleted, because
-    // the renderer may want to interact with the window
+    // the renderer may want to interact with the window.
+    // On macOS, defer destruction to the next Qt event-loop iteration to
+    // avoid tearing down the SDL/NSWindow while AppKit is still processing
+    // key-equivalent/menu events from the stream window.
+#ifdef Q_OS_DARWIN
+    SDL_Window* windowToDestroy = m_Window;
+    m_Window = nullptr;
+
+    if (windowToDestroy != nullptr) {
+        SDL_HideWindow(windowToDestroy);
+
+        QObject* appObj = QCoreApplication::instance();
+        if (appObj != nullptr) {
+            QTimer::singleShot(0, appObj, [windowToDestroy]() {
+                SDL_DestroyWindow(windowToDestroy);
+                SDL_QuitSubSystem(SDL_INIT_VIDEO);
+            });
+        }
+        else {
+            SDL_DestroyWindow(windowToDestroy);
+            SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        }
+    }
+#else
     SDL_DestroyWindow(m_Window);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+#endif
 
     if (iconSurface != nullptr) {
         SDL_FreeSurface(iconSurface);
     }
-
-    SDL_QuitSubSystem(SDL_INIT_VIDEO);
 
     // Cleanup can take a while, so dispatch it to a worker thread.
     // When it is complete, it will release our s_ActiveSessionSemaphore
