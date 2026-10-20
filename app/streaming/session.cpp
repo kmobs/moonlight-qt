@@ -66,6 +66,7 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clSetMotionEventState,
     Session::clSetControllerLED,
     Session::clSetAdaptiveTriggers,
+    nullptr,
 #if STEAM_CONTROLLER_LI_EXTENSIONS
     // Steam Controller (2026) haptic and settings relays, delivered straight to the driver's
     // registry (not through the SDL event queue: haptics are latency sensitive and the driver

@@ -17,7 +17,7 @@
 #include <memory>
 
 // SDL_USEREVENT code for link arrival/removal (the other SDL_CODE_* live in session.cpp).
-#define SDL_CODE_STEAM_CONTROLLER_LINK 106
+#define SDL_CODE_STEAM_CONTROLLER_LINK 107
 
 class SteamControllerHost : public SteamControllerLink::Listener {
 public:
