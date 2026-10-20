@@ -2507,6 +2507,28 @@ DispatchDeferredCleanup:
     }
     #endif
 
+    // On macOS, force the streaming window into a stable visible state before
+    // destruction to avoid AppKit order-out crashes when tearing down a
+    // minimized/fullscreen NSWindow via SDL.
+#ifdef Q_OS_DARWIN
+    if (m_Window != nullptr) {
+        Uint32 windowFlags = SDL_GetWindowFlags(m_Window);
+
+        if (windowFlags & SDL_WINDOW_FULLSCREEN) {
+            SDL_SetWindowFullscreen(m_Window, 0);
+        }
+
+        if (windowFlags & SDL_WINDOW_MINIMIZED) {
+            SDL_RestoreWindow(m_Window);
+        }
+
+        SDL_HideWindow(m_Window);
+
+        // Flush pending window lifecycle events before destroy.
+        SDL_PumpEvents();
+    }
+#endif
+
     // This must be called after the decoder is deleted, because
     // the renderer may want to interact with the window
     SDL_DestroyWindow(m_Window);
