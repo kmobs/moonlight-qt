@@ -595,6 +595,7 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_MouseEmulationRefCount(0),
       m_FlushingWindowEventsRef(0),
       m_ShouldExit(false),
+    m_ConnectionStopped(false),
       m_AsyncConnectionSuccess(false),
       m_PortTestResults(0),
       m_OpusDecoder(nullptr),
@@ -1374,8 +1375,12 @@ private:
         // LiStartConnection() and LiStopConnection().
         SDL_assert(m_Session->m_VideoDecoder == nullptr);
 
-        // Finish cleanup of the connection state
-        LiStopConnection();
+        // Finish cleanup of the connection state unless it already ran
+        // during main-thread teardown.
+        if (!m_Session->m_ConnectionStopped) {
+            LiStopConnection();
+            m_Session->m_ConnectionStopped = true;
+        }
 
         // Notify the UI after teardown is complete so it doesn't race with
         // the connection shutdown work still running on this thread.
@@ -2465,6 +2470,12 @@ DispatchDeferredCleanup:
     delete m_VideoDecoder;
     m_VideoDecoder = nullptr;
     SDL_UnlockMutex(m_DecoderLock);
+
+    // Stop the connection before destroying the SDL window. If we crash in
+    // platform window teardown, deferred cleanup won't run, which can leave
+    // Sunshine thinking the app is still active.
+    LiStopConnection();
+    m_ConnectionStopped = true;
 
     // Propagate state changes from the SDL window back to the Qt window
     //

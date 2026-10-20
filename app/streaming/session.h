@@ -290,6 +290,7 @@ private:
     int m_FlushingWindowEventsRef;
     QStringList m_LaunchWarnings;
     bool m_ShouldExit;
+    bool m_ConnectionStopped;
 
     bool m_AsyncConnectionSuccess;
     int m_PortTestResults;
